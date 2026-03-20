@@ -17,8 +17,27 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from importlib import resources
 from pathlib import Path
 from typing import Any
+
+__all__ = [
+    "STATE_INITIALIZED", "STATE_PLANNED", "STATE_CRITIQUED", "STATE_EVALUATED",
+    "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
+    "TERMINAL_STATES", "FLAG_BLOCKING_STATUSES", "MOCK_ENV_VAR",
+    "CliError", "CommandResult", "WorkerResult",
+    "slugify", "compute_plan_delta_percent", "normalize_flag_record",
+    "unresolved_significant_flags", "flag_weight",
+    "update_flags_after_critique", "update_flags_after_integrate",
+    "compute_recurring_critiques", "build_evaluation",
+    "infer_next_steps", "require_state",
+    "handle_init", "handle_plan", "handle_critique", "handle_evaluate",
+    "handle_integrate", "handle_gate", "handle_execute", "handle_review",
+    "handle_status", "handle_audit", "handle_list", "handle_override",
+    "handle_setup",
+    "load_flag_registry", "save_flag_registry",
+    "plans_root", "main", "cli_entry",
+]
 
 
 STATE_INITIALIZED = "initialized"
@@ -1848,9 +1867,49 @@ def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     raise CliError("invalid_override", f"Unknown override action: {action}")
 
 
+def bundled_agents_md() -> str:
+    """Return the contents of the bundled AGENTS.md file."""
+    return resources.files("megaplan").joinpath("data", "AGENTS.md").read_text(encoding="utf-8")
+
+
+def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
+    target_dir = Path(args.target_dir).resolve() if args.target_dir else Path.cwd()
+    target = target_dir / "AGENTS.md"
+    content = bundled_agents_md()
+    if target.exists() and not args.force:
+        existing = target.read_text(encoding="utf-8")
+        if "megaplan" in existing.lower():
+            return {
+                "success": True,
+                "step": "setup",
+                "summary": f"AGENTS.md already contains megaplan instructions at {target}",
+                "skipped": True,
+            }
+        # Append to existing AGENTS.md
+        with open(target, "a", encoding="utf-8") as f:
+            f.write("\n\n" + content)
+        return {
+            "success": True,
+            "step": "setup",
+            "summary": f"Appended megaplan instructions to existing {target}",
+            "file": str(target),
+        }
+    atomic_write_text(target, content)
+    return {
+        "success": True,
+        "step": "setup",
+        "summary": f"Created {target}",
+        "file": str(target),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Megaplan orchestration CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser("setup", help="Install AGENTS.md into a project")
+    setup_parser.add_argument("--target-dir", help="Directory to install into (default: cwd)")
+    setup_parser.add_argument("--force", action="store_true", help="Overwrite existing AGENTS.md")
 
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("--project-dir", required=True)
@@ -1886,9 +1945,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cli_entry() -> None:
+    """Entry point for the `megaplan` console script."""
+    sys.exit(main())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        if args.command == "setup":
+            response = handle_setup(args)
+            return render_response(response)
+    except CliError as error:
+        return error_response(error)
     root = Path.cwd()
     ensure_runtime_layout(root)
     try:

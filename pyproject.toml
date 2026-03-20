@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "megaplan"
+version = "0.1.0"
+description = "Stateful orchestration CLI for high-rigor AI planning loops"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Peter O'Malley" },
+]
+keywords = ["ai", "planning", "orchestration", "claude", "codex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+megaplan = "megaplan.cli:cli_entry"
+
+[tool.hatch.build.targets.wheel]
+packages = ["megaplan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

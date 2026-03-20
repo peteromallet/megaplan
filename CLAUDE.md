@@ -1,6 +1,15 @@
 # Local Guidance
 
-The repository includes `megaplan.py`, a stateful orchestration CLI for high-rigor planning loops between Claude Code and Codex.
+This repository is the source for **megaplan**, a pip-installable CLI for high-rigor planning loops between AI agents (Claude Code, Codex, etc.).
+
+## Development
+
+- Source: `megaplan/cli.py`
+- Tests: `tests/test_megaplan.py`
+- Install in dev mode: `pip install -e .`
+- Run tests: `pytest`
+
+## Using megaplan
 
 Suggest the megaplan workflow when:
 - The task is high-risk, ambiguous, or multi-stage.
@@ -8,3 +17,8 @@ Suggest the megaplan workflow when:
 - The work should be gated before execution instead of going straight into edits.
 
 Use the `.claude/skills/megaplan.md` skill when the user explicitly asks for the megaplan flow or when the task clearly matches that workflow.
+
+## For end users
+
+After `pip install megaplan`, run `megaplan setup` in a project to install
+AGENTS.md — this tells any AI agent how to use megaplan automatically.

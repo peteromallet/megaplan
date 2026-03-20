@@ -7,6 +7,7 @@ from typing import Callable
 import pytest
 
 import megaplan
+import megaplan.cli
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -62,7 +63,7 @@ def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture
 
     monkeypatch.setenv(megaplan.MOCK_ENV_VAR, "1")
     monkeypatch.setattr(
-        megaplan.shutil,
+        megaplan.cli.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
