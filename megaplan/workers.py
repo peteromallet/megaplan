@@ -17,6 +17,20 @@ from pathlib import Path
 from typing import Any
 
 from megaplan.schemas import SCHEMAS  # noqa: F401
+from megaplan._core import (
+    CliError,
+    MOCK_ENV_VAR,
+    read_json,
+    json_dump,
+    now_utc,
+    schemas_root,
+    latest_plan_meta_path,
+    DEFAULT_AGENT_ROUTING,
+    KNOWN_AGENTS,
+    load_config,
+    detect_available_agents,
+)
+from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
 WORKER_TIMEOUT_SECONDS = 3600
@@ -49,9 +63,6 @@ def run_command(
     stdin_text: str | None = None,
     timeout: int | None = WORKER_TIMEOUT_SECONDS,
 ) -> CommandResult:
-    # Import here to avoid circular dependency
-    from megaplan.cli import CliError
-
     started = time.monotonic()
     try:
         process = subprocess.run(
@@ -101,8 +112,6 @@ def extract_session_id(raw: str) -> str | None:
 
 
 def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    from megaplan.cli import CliError
-
     try:
         envelope = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -131,8 +140,6 @@ def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def parse_json_file(path: Path) -> dict[str, Any]:
-    from megaplan.cli import CliError, read_json
-
     try:
         payload = read_json(path)
     except FileNotFoundError as exc:
@@ -145,8 +152,6 @@ def parse_json_file(path: Path) -> dict[str, Any]:
 
 
 def validate_payload(step: str, payload: dict[str, Any]) -> None:
-    from megaplan.cli import CliError
-
     def require_keys(keys: list[str]) -> None:
         missing = [key for key in keys if key not in payload]
         if missing:
@@ -167,10 +172,6 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
 
 
 def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> WorkerResult:
-    from megaplan.cli import (
-        json_dump, read_json, latest_plan_meta_path,
-    )
-
     iteration = state["iteration"] or 1
     if step == "clarify":
         payload = {
@@ -291,7 +292,6 @@ def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> Work
         payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
         return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
-    from megaplan.cli import CliError
     raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
 
 
@@ -308,8 +308,6 @@ def session_key_for(step: str, agent: str) -> str:
 
 
 def persist_session(state: dict[str, Any], step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
-    from megaplan.cli import now_utc
-
     if not session_id:
         return
     key = session_key_for(step, agent)
@@ -323,11 +321,7 @@ def persist_session(state: dict[str, Any], step: str, agent: str, session_id: st
 
 
 def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
-    from megaplan.cli import (
-        CliError, MOCK_ENV_VAR, read_json, schemas_root,
-    )
-    from megaplan.prompts import create_claude_prompt
-    import megaplan.cli as _cli
+    import megaplan.cli as _cli  # deferred: tests monkeypatch _cli.mock_worker_output
 
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
@@ -377,11 +371,7 @@ def run_codex_step(
     fresh: bool = False,
     json_trace: bool = False,
 ) -> WorkerResult:
-    from megaplan.cli import (
-        CliError, MOCK_ENV_VAR, schemas_root,
-    )
-    from megaplan.prompts import create_codex_prompt
-    import megaplan.cli as _cli
+    import megaplan.cli as _cli  # deferred: tests monkeypatch _cli.mock_worker_output
 
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
@@ -461,11 +451,6 @@ def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None
     persistent session (break continuity) or --ephemeral for a truly one-off
     call with no session saved.
     """
-    from megaplan.cli import (
-        CliError, DEFAULT_AGENT_ROUTING, KNOWN_AGENTS,
-        load_config, detect_available_agents,
-    )
-
     explicit = args.agent
     if explicit:
         if not shutil.which(explicit):

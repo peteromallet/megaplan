@@ -7,13 +7,19 @@ from pathlib import Path
 from typing import Any
 
 from megaplan.schemas import SCHEMAS  # noqa: F401 — re-export not needed, just for type safety
-
-# Lazy imports to avoid circular dependencies — these are resolved at call time
-# inside build_evaluation().  The module-level constants and pure functions do
-# not depend on cli.py.
-
-ROBUSTNESS_SKIP_THRESHOLDS = {"light": 4.0, "standard": 2.0, "thorough": 1.0}
-ROBUSTNESS_STAGNATION_FACTORS = {"light": 0.8, "standard": 0.9, "thorough": 0.95}
+from megaplan._core import (
+    current_iteration_artifact,
+    read_json,
+    normalize_text,
+    load_flag_registry,
+    unresolved_significant_flags,
+    configured_robustness,
+    scope_creep_flags,
+    latest_plan_path,
+    FLAG_BLOCKING_STATUSES,
+    ROBUSTNESS_SKIP_THRESHOLDS,
+    ROBUSTNESS_STAGNATION_FACTORS,
+)
 
 
 def flag_weight(flag: dict[str, Any]) -> float:
@@ -49,9 +55,6 @@ def compute_plan_delta_percent(previous_text: str | None, current_text: str) -> 
 
 
 def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
-    # Import here to avoid circular dependency
-    from megaplan.cli import current_iteration_artifact, read_json, normalize_text
-
     if iteration < 2:
         return []
     previous = read_json(current_iteration_artifact(plan_dir, "critique", iteration - 1))
@@ -208,12 +211,6 @@ _EVALUATION_DECISION_TABLE: list[
 
 
 def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
-    # Import here to avoid circular dependency
-    from megaplan.cli import (
-        load_flag_registry, unresolved_significant_flags, configured_robustness,
-        scope_creep_flags, latest_plan_path, FLAG_BLOCKING_STATUSES,
-    )
-
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)

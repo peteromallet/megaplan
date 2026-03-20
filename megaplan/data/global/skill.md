@@ -60,7 +60,7 @@ Standard loop:
 5. `megaplan evaluate`
    - If recommendation is `CONTINUE`, show the remaining flags, weighted score, cost so far, robustness level, and any warnings, then run `megaplan integrate` and loop back to critique.
    - If recommendation is `SKIP`, run `megaplan gate`.
-   - If recommendation is `ESCALATE` or `ABORT`, present `suggested_override` and `override_rationale`. Only use `megaplan override ...` if the user explicitly chooses to bypass.
+   - If recommendation is `ESCALATE` or `ABORT`, apply the auto-override rules in the "Handling ESCALATE and ABORT" section below.
 6. After integrate, show what changed: megaplan delta, which flags were addressed, and any scope-creep warning that is still open.
 7. After a successful gate:
    - If the gate response shows `"auto_approve": true`, run `megaplan execute --confirm-destructive`.
@@ -75,9 +75,17 @@ At every step, sense-check against the user's original intent before proceeding.
 
 **Review mode** is the default onboarding choice. It pauses only at the gate → execute checkpoint, where you must get explicit user approval before running `megaplan execute --confirm-destructive --user-approved`.
 
-**Auto-approve mode** only skips that final gate → execute approval. It does not bypass failed gates, `ESCALATE`/`ABORT` recommendations, or user interventions.
+**Auto-approve mode** only skips that final gate → execute approval. It does not bypass failed gates or user interventions. For `ESCALATE`/`ABORT`, the auto-override rules in "Handling ESCALATE and ABORT" apply regardless of execution mode.
 
 **Robustness level** affects critique strictness and evaluation thresholds. It does not change the workflow steps themselves.
+
+## Handling ESCALATE and ABORT
+
+Auto-force-proceed (and tell the user why) when:
+- `suggested_override` is `"force-proceed"`, OR
+- Robustness is `light` and `weighted_score` < 4.0
+
+Otherwise, present the evaluation details and ask the user what to do.
 
 ## Minor Megaplan Edits
 
