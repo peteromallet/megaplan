@@ -14,7 +14,7 @@ from typing import Any
 
 # Import shared utilities from _core — these were previously defined here.
 from megaplan._core import (  # noqa: F401
-    PlanStage, PlanState, PlanConfig, PlanMeta, FlagRecord,
+    PlanState, PlanConfig, PlanMeta, FlagRecord,
     STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED, STATE_EVALUATED,
     STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, FLAG_BLOCKING_STATUSES, MOCK_ENV_VAR,
@@ -43,17 +43,6 @@ from megaplan.evaluation import (  # noqa: F401
     flag_weight,
     compute_plan_delta_percent,
     compute_recurring_critiques,
-    _EVALUATION_DECISION_TABLE,
-    _is_over_budget,
-    _is_all_flags_resolved,
-    _is_low_weight_trending_down,
-    _is_stagnant_with_unresolved,
-    _is_stagnant_all_addressed,
-    _is_first_iteration_with_flags,
-    _has_recurring_critiques,
-    _is_score_stagnating,
-    _is_score_improving,
-    _is_max_iterations_with_unresolved,
 )
 from megaplan.workers import (  # noqa: F401
     CommandResult,
@@ -75,19 +64,10 @@ from megaplan.workers import (  # noqa: F401
 from megaplan.prompts import (  # noqa: F401
     create_claude_prompt,
     create_codex_prompt,
-    _clarify_prompt,
-    _plan_prompt,
-    _integrate_prompt,
-    _critique_prompt,
-    _execute_prompt,
-    _review_claude_prompt,
-    _review_codex_prompt,
-    _CLAUDE_PROMPT_BUILDERS,
-    _CODEX_PROMPT_BUILDERS,
 )
 
 __all__ = [
-    "PlanStage", "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
+    "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
     "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED", "STATE_EVALUATED",
     "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
     "TERMINAL_STATES", "FLAG_BLOCKING_STATUSES", "MOCK_ENV_VAR",
@@ -130,7 +110,7 @@ def error_response(error: CliError) -> int:
     return render_response(payload, exit_code=error.exit_code)
 
 
-def append_history(state: dict[str, Any], entry: dict[str, Any]) -> None:
+def append_history(state: PlanState, entry: dict[str, Any]) -> None:
     state.setdefault("history", []).append(entry)
     state.setdefault("meta", {}).setdefault("total_cost_usd", 0.0)
     state["meta"]["total_cost_usd"] = round(
@@ -194,7 +174,7 @@ def attach_agent_fallback(response: dict[str, Any], args: argparse.Namespace) ->
         response["agent_fallback"] = args._agent_fallback
 
 
-def infer_next_steps(state: dict[str, Any]) -> list[str]:
+def infer_next_steps(state: PlanState) -> list[str]:
     current = state.get("current_state")
     if current == STATE_INITIALIZED:
         return ["clarify"]
@@ -222,7 +202,7 @@ def infer_next_steps(state: dict[str, Any]) -> list[str]:
     return []
 
 
-def require_state(state: dict[str, Any], step: str, allowed: set[str]) -> None:
+def require_state(state: PlanState, step: str, allowed: set[str]) -> None:
     current = state.get("current_state")
     if current not in allowed:
         raise CliError(
@@ -318,7 +298,7 @@ def store_raw_worker_output(plan_dir: Path, step: str, iteration: int, content: 
 
 def record_step_failure(
     plan_dir: Path,
-    state: dict[str, Any],
+    state: PlanState,
     *,
     step: str,
     iteration: int,
@@ -678,7 +658,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def run_gate_checks(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+def run_gate_checks(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     project_dir = Path(state["config"]["project_dir"])
     meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)

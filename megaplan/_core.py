@@ -17,7 +17,6 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
@@ -28,37 +27,25 @@ from megaplan.schemas import SCHEMAS, strict_schema  # noqa: F401
 # Type definitions
 # ---------------------------------------------------------------------------
 
-class PlanStage(str, Enum):
-    INITIALIZED = "initialized"
-    CLARIFIED = "clarified"
-    PLANNED = "planned"
-    CRITIQUED = "critiqued"
-    EVALUATED = "evaluated"
-    GATED = "gated"
-    EXECUTED = "executed"
-    DONE = "done"
-    ABORTED = "aborted"
-
-
-# Backward-compatible aliases
-STATE_INITIALIZED = PlanStage.INITIALIZED
-STATE_CLARIFIED = PlanStage.CLARIFIED
-STATE_PLANNED = PlanStage.PLANNED
-STATE_CRITIQUED = PlanStage.CRITIQUED
-STATE_EVALUATED = PlanStage.EVALUATED
-STATE_GATED = PlanStage.GATED
-STATE_EXECUTED = PlanStage.EXECUTED
-STATE_DONE = PlanStage.DONE
-STATE_ABORTED = PlanStage.ABORTED
+STATE_INITIALIZED = "initialized"
+STATE_CLARIFIED = "clarified"
+STATE_PLANNED = "planned"
+STATE_CRITIQUED = "critiqued"
+STATE_EVALUATED = "evaluated"
+STATE_GATED = "gated"
+STATE_EXECUTED = "executed"
+STATE_DONE = "done"
+STATE_ABORTED = "aborted"
 TERMINAL_STATES = {STATE_DONE, STATE_ABORTED}
 
 
-class PlanConfig(TypedDict):
+class PlanConfig(TypedDict, total=False):
     max_iterations: int
     budget_usd: float
     project_dir: str
     auto_approve: bool
     robustness: str
+    agents: dict[str, str]
 
 
 class PlanMeta(TypedDict, total=False):
@@ -72,7 +59,7 @@ class PlanMeta(TypedDict, total=False):
     user_approved_gate: bool
 
 
-class PlanState(TypedDict, total=False):
+class PlanState(TypedDict):
     name: str
     idea: str
     current_state: str
@@ -319,27 +306,27 @@ def resolve_plan_dir(root: Path, requested_name: str | None) -> Path:
     )
 
 
-def load_plan(root: Path, requested_name: str | None) -> tuple[Path, dict[str, Any]]:
+def load_plan(root: Path, requested_name: str | None) -> tuple[Path, PlanState]:
     plan_dir = resolve_plan_dir(root, requested_name)
     return plan_dir, read_json(plan_dir / "state.json")
 
 
-def save_state(plan_dir: Path, state: dict[str, Any]) -> None:
+def save_state(plan_dir: Path, state: PlanState) -> None:
     atomic_write_json(plan_dir / "state.json", state)
 
 
-def latest_plan_record(state: dict[str, Any]) -> dict[str, Any]:
+def latest_plan_record(state: PlanState) -> dict[str, Any]:
     plan_versions = state.get("plan_versions", [])
     if not plan_versions:
         raise CliError("missing_plan_version", "No plan version exists yet")
     return plan_versions[-1]
 
 
-def latest_plan_path(plan_dir: Path, state: dict[str, Any]) -> Path:
+def latest_plan_path(plan_dir: Path, state: PlanState) -> Path:
     return plan_dir / latest_plan_record(state)["file"]
 
 
-def latest_plan_meta_path(plan_dir: Path, state: dict[str, Any]) -> Path:
+def latest_plan_meta_path(plan_dir: Path, state: PlanState) -> Path:
     record = latest_plan_record(state)
     meta_name = record["file"].replace(".md", ".meta.json")
     return plan_dir / meta_name
@@ -360,7 +347,7 @@ def save_flag_registry(plan_dir: Path, data: dict[str, Any]) -> None:
     atomic_write_json(plan_dir / "faults.json", data)
 
 
-def unresolved_significant_flags(flag_registry: dict[str, Any]) -> list[dict[str, Any]]:
+def unresolved_significant_flags(flag_registry: dict[str, Any]) -> list[FlagRecord]:
     return [
         flag
         for flag in flag_registry.get("flags", [])
@@ -368,7 +355,7 @@ def unresolved_significant_flags(flag_registry: dict[str, Any]) -> list[dict[str
     ]
 
 
-def is_scope_creep_flag(flag: dict[str, Any]) -> bool:
+def is_scope_creep_flag(flag: FlagRecord) -> bool:
     text = f"{flag.get('concern', '')} {flag.get('evidence', '')}".lower()
     return any(term in text for term in SCOPE_CREEP_TERMS)
 
@@ -377,7 +364,7 @@ def scope_creep_flags(
     flag_registry: dict[str, Any],
     *,
     statuses: set[str] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[FlagRecord]:
     matches = []
     for flag in flag_registry.get("flags", []):
         if statuses is not None and flag.get("status") not in statuses:
@@ -391,7 +378,7 @@ def scope_creep_flags(
 # Robustness helpers
 # ---------------------------------------------------------------------------
 
-def configured_robustness(state: dict[str, Any]) -> str:
+def configured_robustness(state: PlanState) -> str:
     robustness = state.get("config", {}).get("robustness", "standard")
     if robustness not in ROBUSTNESS_LEVELS:
         return "standard"
@@ -410,7 +397,7 @@ def robustness_critique_instruction(robustness: str) -> str:
 # Intent / notes block for prompts
 # ---------------------------------------------------------------------------
 
-def intent_and_notes_block(state: dict[str, Any]) -> str:
+def intent_and_notes_block(state: PlanState) -> str:
     sections = []
     clarification = state.get("clarification", {})
     if clarification.get("intent_summary"):

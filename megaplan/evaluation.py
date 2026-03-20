@@ -8,6 +8,8 @@ from typing import Any
 
 from megaplan.schemas import SCHEMAS  # noqa: F401 — re-export not needed, just for type safety
 from megaplan._core import (
+    PlanState,
+    FlagRecord,
     current_iteration_artifact,
     read_json,
     normalize_text,
@@ -22,7 +24,7 @@ from megaplan._core import (
 )
 
 
-def flag_weight(flag: dict[str, Any]) -> float:
+def flag_weight(flag: FlagRecord) -> float:
     """Weight a flag for evaluation scoring. Higher = more blocking."""
     category = flag.get("category", "other")
     concern = flag.get("concern", "").lower()
@@ -210,7 +212,7 @@ _EVALUATION_DECISION_TABLE: list[
 ]
 
 
-def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
