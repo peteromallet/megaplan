@@ -794,297 +794,334 @@ def scope_creep_flags(
     return matches
 
 
-def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
+def _clarify_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     notes = state.get("meta", {}).get("notes", [])
     notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
-    latest_plan = ""
-    latest_meta: dict[str, Any] = {}
-    if state.get("plan_versions"):
-        latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-        latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    flag_registry = load_flag_registry(plan_dir)
+    return textwrap.dedent(
+        f"""
+        You are a planning assistant. The user has proposed the following idea:
 
-    if step == "clarify":
-        return textwrap.dedent(
+        Idea:
+        {state['idea']}
+
+        Project directory:
+        {project_dir}
+
+        User notes:
+        {notes_block}
+
+        Requirements:
+        - Read the project directory to understand the codebase.
+        - Restate the idea in your own words as a precise intent summary.
+        - Identify ambiguities, underspecified aspects, or implicit assumptions.
+        - For each ambiguity, produce a question that, if answered, would materially change the implementation plan.
+        - Propose a refined version of the idea that resolves obvious ambiguities.
+        - Do NOT plan the implementation - only clarify the intent.
+        """
+    ).strip()
+
+
+def _plan_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    notes = state.get("meta", {}).get("notes", [])
+    notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
+    clarification = state.get("clarification", {})
+    refined = clarification.get("refined_idea", "")
+    intent = clarification.get("intent_summary", "")
+    if refined:
+        clarify_block = textwrap.dedent(
             f"""
-            You are a planning assistant. The user has proposed the following idea:
+            Refined idea (from clarification):
+            {refined}
 
+            Intent summary:
+            {intent}
+
+            Original idea (for reference):
+            {state['idea']}
+            """
+        ).strip()
+    else:
+        clarify_block = textwrap.dedent(
+            f"""
             Idea:
             {state['idea']}
-
-            Project directory:
-            {project_dir}
-
-            User notes:
-            {notes_block}
-
-            Requirements:
-            - Read the project directory to understand the codebase.
-            - Restate the idea in your own words as a precise intent summary.
-            - Identify ambiguities, underspecified aspects, or implicit assumptions.
-            - For each ambiguity, produce a question that, if answered, would materially change the implementation plan.
-            - Propose a refined version of the idea that resolves obvious ambiguities.
-            - Do NOT plan the implementation - only clarify the intent.
             """
         ).strip()
+    return textwrap.dedent(
+        f"""
+        You are creating an implementation plan for the following idea.
 
-    if step == "plan":
-        clarification = state.get("clarification", {})
-        refined = clarification.get("refined_idea", "")
-        intent = clarification.get("intent_summary", "")
-        clarify_block = ""
-        if refined:
-            clarify_block = textwrap.dedent(
-                f"""
-                Refined idea (from clarification):
-                {refined}
+        {clarify_block}
 
-                Intent summary:
-                {intent}
+        Project directory:
+        {project_dir}
 
-                Original idea (for reference):
-                {state['idea']}
-                """
-            ).strip()
-        else:
-            clarify_block = textwrap.dedent(
-                f"""
-                Idea:
-                {state['idea']}
-                """
-            ).strip()
-        return textwrap.dedent(
-            f"""
-            You are creating an implementation plan for the following idea.
+        User notes:
+        {notes_block}
 
-            {clarify_block}
-
-            Project directory:
-            {project_dir}
-
-            User notes:
-            {notes_block}
-
-            Requirements:
-            - Inspect the actual repository before planning.
-            - Produce a concrete implementation plan in markdown.
-            - Define observable success criteria.
-            - Call out assumptions and open questions.
-            - Prefer cheap validation steps early.
-            """
-        ).strip()
-
-    if step == "integrate":
-        evaluate_path = current_iteration_artifact(plan_dir, "evaluation", state["iteration"])
-        evaluation = read_json(evaluate_path)
-        unresolved = unresolved_significant_flags(flag_registry)
-        open_flags = [
-            {
-                "id": flag["id"],
-                "severity": flag.get("severity"),
-                "status": flag.get("status"),
-                "concern": flag.get("concern"),
-                "evidence": flag.get("evidence"),
-            }
-            for flag in unresolved
-        ]
-        return textwrap.dedent(
-            f"""
-            You are updating an implementation plan based on critique and evaluation.
-
-            Project directory:
-            {project_dir}
-
-            {intent_and_notes_block(state)}
-
-            Current plan (markdown):
-            {latest_plan}
-
-            Current plan metadata:
-            {json_dump(latest_meta).strip()}
-
-            Evaluation:
-            {json_dump(evaluation).strip()}
-
-            Open significant flags:
-            {json_dump(open_flags).strip()}
-
-            Requirements:
-            - Update the plan to address the significant issues.
-            - Keep the plan readable and executable.
-            - Return flags_addressed with the exact flag IDs you addressed.
-            - Preserve or improve success criteria quality.
-            - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-            - Remove unjustified scope growth. If the critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
-            - If a broader change is truly necessary, explain that dependency explicitly in changes_summary instead of silently expanding the plan.
-            """
-        ).strip()
-
-    if step == "review":
-        execution = read_json(plan_dir / "execution.json")
-        gate = read_json(plan_dir / "gate.json")
-        diff_summary = collect_git_diff_summary(project_dir)
-        return textwrap.dedent(
-            f"""
-            Review the execution critically against user intent and observable success criteria.
-
-            Project directory:
-            {project_dir}
-
-            {intent_and_notes_block(state)}
-
-            Approved plan:
-            {latest_plan}
-
-            Plan metadata:
-            {json_dump(latest_meta).strip()}
-
-            Gate summary:
-            {json_dump(gate).strip()}
-
-            Execution summary:
-            {json_dump(execution).strip()}
-
-            Git diff summary:
-            {diff_summary}
-
-            Requirements:
-            - Judge against the success criteria, not plan elegance.
-            - Be critical and call out real misses.
-            - If there are failures, describe them as issues.
-            """
-        ).strip()
-
-    if step in {"critique", "execute"}:
-        return create_codex_prompt(step, state, plan_dir)
-
-    raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
+        Requirements:
+        - Inspect the actual repository before planning.
+        - Produce a concrete implementation plan in markdown.
+        - Define observable success criteria.
+        - Call out assumptions and open questions.
+        - Prefer cheap validation steps early.
+        """
+    ).strip()
 
 
-def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
-    if step in {"clarify", "plan", "integrate"}:
-        return create_claude_prompt(step, state, plan_dir)
+def _integrate_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    flag_registry = load_flag_registry(plan_dir)
+    evaluate_path = current_iteration_artifact(plan_dir, "evaluation", state["iteration"])
+    evaluation = read_json(evaluate_path)
+    unresolved = unresolved_significant_flags(flag_registry)
+    open_flags = [
+        {
+            "id": flag["id"],
+            "severity": flag.get("severity"),
+            "status": flag.get("status"),
+            "concern": flag.get("concern"),
+            "evidence": flag.get("evidence"),
+        }
+        for flag in unresolved
+    ]
+    return textwrap.dedent(
+        f"""
+        You are updating an implementation plan based on critique and evaluation.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Current plan (markdown):
+        {latest_plan}
+
+        Current plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Evaluation:
+        {json_dump(evaluation).strip()}
+
+        Open significant flags:
+        {json_dump(open_flags).strip()}
+
+        Requirements:
+        - Update the plan to address the significant issues.
+        - Keep the plan readable and executable.
+        - Return flags_addressed with the exact flag IDs you addressed.
+        - Preserve or improve success criteria quality.
+        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
+        - Remove unjustified scope growth. If the critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
+        - If a broader change is truly necessary, explain that dependency explicitly in changes_summary instead of silently expanding the plan.
+        """
+    ).strip()
+
+
+def _critique_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)
     robustness = configured_robustness(state)
+    unresolved = [
+        {
+            "id": flag["id"],
+            "concern": flag["concern"],
+            "status": flag.get("status"),
+            "severity": flag.get("severity"),
+        }
+        for flag in flag_registry.get("flags", [])
+        if flag.get("status") in {"addressed", "open", "disputed"}
+    ]
+    return textwrap.dedent(
+        f"""
+        You are an independent reviewer. Critique the plan against the actual repository.
 
-    if step == "critique":
-        unresolved = [
-            {
-                "id": flag["id"],
-                "concern": flag["concern"],
-                "status": flag.get("status"),
-                "severity": flag.get("severity"),
-            }
-            for flag in flag_registry.get("flags", [])
-            if flag.get("status") in {"addressed", "open", "disputed"}
-        ]
-        return textwrap.dedent(
-            f"""
-            You are an independent reviewer. Critique the plan against the actual repository.
+        Project directory:
+        {project_dir}
 
-            Project directory:
-            {project_dir}
+        {intent_and_notes_block(state)}
 
-            {intent_and_notes_block(state)}
+        Plan:
+        {latest_plan}
 
-            Plan:
-            {latest_plan}
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
 
-            Plan metadata:
-            {json_dump(latest_meta).strip()}
+        Existing flags:
+        {json_dump(unresolved).strip()}
 
-            Existing flags:
-            {json_dump(unresolved).strip()}
+        Requirements:
+        - Reuse existing flag IDs when the same concern is still open.
+        - verified_flag_ids should list previously addressed flags that now appear resolved.
+        - Focus on concrete issues that would cause real problems.
+        - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
+        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
+        - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern so the orchestrator can surface it.
+        - Do not rubber-stamp the plan.
+        - Assign severity_hint carefully: "likely-significant" for issues that would
+          cause real product or implementation problems. "likely-minor" for cosmetic,
+          nice-to-have, issues already covered elsewhere, or implementation details
+          the executor will naturally resolve by reading the actual code (e.g. exact
+          line numbers, missing boilerplate, export lists).
+        """
+    ).strip()
 
-            Requirements:
-            - Reuse existing flag IDs when the same concern is still open.
-            - verified_flag_ids should list previously addressed flags that now appear resolved.
-            - Focus on concrete issues that would cause real problems.
-            - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
-            - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-            - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern so the orchestrator can surface it.
-            - Do not rubber-stamp the plan.
-            - Assign severity_hint carefully: "likely-significant" for issues that would
-              cause real product or implementation problems. "likely-minor" for cosmetic,
-              nice-to-have, issues already covered elsewhere, or implementation details
-              the executor will naturally resolve by reading the actual code (e.g. exact
-              line numbers, missing boilerplate, export lists).
-            """
-        ).strip()
 
-    if step == "execute":
-        gate = read_json(plan_dir / "gate.json")
-        if state.get("config", {}).get("auto_approve"):
-            approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
-        elif state.get("meta", {}).get("user_approved_gate"):
-            approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
-        else:
-            approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
-        return textwrap.dedent(
-            f"""
-            Execute the approved plan in the repository.
+def _execute_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    robustness = configured_robustness(state)
+    gate = read_json(plan_dir / "gate.json")
+    if state.get("config", {}).get("auto_approve"):
+        approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
+    elif state.get("meta", {}).get("user_approved_gate"):
+        approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
+    else:
+        approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
+    return textwrap.dedent(
+        f"""
+        Execute the approved plan in the repository.
 
-            Project directory:
-            {project_dir}
+        Project directory:
+        {project_dir}
 
-            {intent_and_notes_block(state)}
+        {intent_and_notes_block(state)}
 
-            Approved plan:
-            {latest_plan}
+        Approved plan:
+        {latest_plan}
 
-            Plan metadata:
-            {json_dump(latest_meta).strip()}
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
 
-            Gate summary:
-            {json_dump(gate).strip()}
+        Gate summary:
+        {json_dump(gate).strip()}
 
-            {approval_note}
-            Robustness level: {robustness}.
+        {approval_note}
+        Robustness level: {robustness}.
 
-            Requirements:
-            - Implement the intent, not just the text.
-            - Adapt if repository reality contradicts the plan.
-            - Report deviations explicitly.
-            - Output concrete files changed and commands run.
-            """
-        ).strip()
+        Requirements:
+        - Implement the intent, not just the text.
+        - Adapt if repository reality contradicts the plan.
+        - Report deviations explicitly.
+        - Output concrete files changed and commands run.
+        """
+    ).strip()
 
-    if step == "review":
-        execution = read_json(plan_dir / "execution.json")
-        diff_summary = collect_git_diff_summary(project_dir)
-        return textwrap.dedent(
-            f"""
-            Review the implementation against the success criteria.
 
-            Project directory:
-            {project_dir}
+def _review_claude_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    execution = read_json(plan_dir / "execution.json")
+    gate = read_json(plan_dir / "gate.json")
+    diff_summary = collect_git_diff_summary(project_dir)
+    return textwrap.dedent(
+        f"""
+        Review the execution critically against user intent and observable success criteria.
 
-            {intent_and_notes_block(state)}
+        Project directory:
+        {project_dir}
 
-            Approved plan:
-            {latest_plan}
+        {intent_and_notes_block(state)}
 
-            Plan metadata:
-            {json_dump(latest_meta).strip()}
+        Approved plan:
+        {latest_plan}
 
-            Execution summary:
-            {json_dump(execution).strip()}
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
 
-            Git diff summary:
-            {diff_summary}
+        Gate summary:
+        {json_dump(gate).strip()}
 
-            Requirements:
-            - Be critical.
-            - Verify each success criterion explicitly.
-            - Call out any concrete gaps or regressions in issues.
-            """
-        ).strip()
+        Execution summary:
+        {json_dump(execution).strip()}
 
-    raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
+        Git diff summary:
+        {diff_summary}
+
+        Requirements:
+        - Judge against the success criteria, not plan elegance.
+        - Be critical and call out real misses.
+        - If there are failures, describe them as issues.
+        """
+    ).strip()
+
+
+def _review_codex_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    execution = read_json(plan_dir / "execution.json")
+    diff_summary = collect_git_diff_summary(project_dir)
+    return textwrap.dedent(
+        f"""
+        Review the implementation against the success criteria.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Approved plan:
+        {latest_plan}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Execution summary:
+        {json_dump(execution).strip()}
+
+        Git diff summary:
+        {diff_summary}
+
+        Requirements:
+        - Be critical.
+        - Verify each success criterion explicitly.
+        - Call out any concrete gaps or regressions in issues.
+        """
+    ).strip()
+
+
+# Step-to-builder dispatch tables per agent.
+# Steps shared across agents point to the same builder function.
+_CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
+    "clarify": _clarify_prompt,
+    "plan": _plan_prompt,
+    "integrate": _integrate_prompt,
+    "critique": _critique_prompt,
+    "execute": _execute_prompt,
+    "review": _review_claude_prompt,
+}
+
+_CODEX_PROMPT_BUILDERS: dict[str, Any] = {
+    "clarify": _clarify_prompt,
+    "plan": _plan_prompt,
+    "integrate": _integrate_prompt,
+    "critique": _critique_prompt,
+    "execute": _execute_prompt,
+    "review": _review_codex_prompt,
+}
+
+
+def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
+    builder = _CLAUDE_PROMPT_BUILDERS.get(step)
+    if builder is None:
+        raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
+    return builder(state, plan_dir)
+
+
+def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
+    builder = _CODEX_PROMPT_BUILDERS.get(step)
+    if builder is None:
+        raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
+    return builder(state, plan_dir)
 
 
 def collect_git_diff_summary(project_dir: Path) -> str:
@@ -1786,6 +1823,148 @@ def flag_weight(flag: dict[str, Any]) -> float:
     return weights.get(category, 1.0)
 
 
+def _is_over_budget(total_cost: float, budget: float, **_: Any) -> bool:
+    """Cost has exceeded the configured budget."""
+    return total_cost > budget
+
+
+def _is_all_flags_resolved(significant_count: int, unresolved: list[Any], **_: Any) -> bool:
+    """No unresolved significant flags remain."""
+    return significant_count == 0 and not unresolved
+
+
+def _is_low_weight_trending_down(
+    iteration: int, weighted_score: float, skip_threshold: float,
+    weighted_history: list[float], **_: Any,
+) -> bool:
+    """Past first iteration, score below threshold and improving."""
+    return (
+        iteration > 1
+        and weighted_score < skip_threshold
+        and len(weighted_history) >= 1
+        and weighted_score < weighted_history[-1]
+    )
+
+
+def _is_stagnant_with_unresolved(
+    plan_delta: float | None, unresolved: list[Any], **_: Any,
+) -> bool:
+    """Plan text barely changed but significant risks remain."""
+    return plan_delta is not None and plan_delta < 5.0 and bool(unresolved)
+
+
+def _is_stagnant_all_addressed(
+    plan_delta: float | None, unresolved: list[Any], **_: Any,
+) -> bool:
+    """Plan text barely changed and all significant risks addressed."""
+    return plan_delta is not None and plan_delta < 5.0 and not unresolved
+
+
+def _is_first_iteration_with_flags(
+    iteration: int, significant_count: int, **_: Any,
+) -> bool:
+    """First critique iteration and significant flags exist."""
+    return iteration == 1 and significant_count > 0
+
+
+def _has_recurring_critiques(recurring: list[Any], **_: Any) -> bool:
+    """Same critique concerns repeated across iterations."""
+    return bool(recurring)
+
+
+def _is_score_stagnating(
+    weighted_score: float, weighted_history: list[float],
+    stagnation_factor: float, **_: Any,
+) -> bool:
+    """Weighted flag score is not improving relative to stagnation factor."""
+    return (
+        len(weighted_history) >= 1
+        and weighted_score >= weighted_history[-1] * stagnation_factor
+    )
+
+
+def _is_score_improving(
+    weighted_score: float, weighted_history: list[float],
+    stagnation_factor: float, **_: Any,
+) -> bool:
+    """Weighted flag score is trending down past the stagnation factor."""
+    return (
+        len(weighted_history) >= 1
+        and weighted_score < weighted_history[-1] * stagnation_factor
+    )
+
+
+def _is_max_iterations_with_unresolved(
+    iteration: int, state: dict[str, Any], unresolved: list[Any], **_: Any,
+) -> bool:
+    """Reached max iterations with unresolved significant risks."""
+    return iteration >= int(state["config"].get("max_iterations", 3)) and bool(unresolved)
+
+
+# Decision table: evaluated in priority order; first match wins.
+# Each entry is (predicate, recommendation, confidence, rationale_template).
+# rationale_template may be a str or a callable(signals -> str) for dynamic messages.
+_EVALUATION_DECISION_TABLE: list[
+    tuple[
+        Any,  # predicate function
+        str,  # recommendation
+        str,  # confidence
+        str | Any,  # rationale (str or callable)
+    ]
+] = [
+    (
+        _is_over_budget,
+        "ABORT", "high",
+        lambda s: f"Cost ${s['total_cost']:.3f} exceeded configured budget ${s['budget']:.3f}.",
+    ),
+    (
+        _is_all_flags_resolved,
+        "SKIP", "high",
+        "No unresolved significant flags remain.",
+    ),
+    (
+        _is_low_weight_trending_down,
+        "SKIP", "medium",
+        lambda s: f"Remaining flags are low-weight ({s['weighted_score']}) and trending down. Executor can resolve.",
+    ),
+    (
+        _is_stagnant_with_unresolved,
+        "ESCALATE", "high",
+        "Plan stagnated with unresolved significant risks.",
+    ),
+    (
+        _is_stagnant_all_addressed,
+        "SKIP", "high",
+        "Plan changes are small and all significant risks appear addressed.",
+    ),
+    (
+        _is_first_iteration_with_flags,
+        "CONTINUE", "high",
+        lambda s: f"First iteration still has {s['significant_count']} significant flags.",
+    ),
+    (
+        _has_recurring_critiques,
+        "ESCALATE", "high",
+        "The same critique concerns repeated across iterations.",
+    ),
+    (
+        _is_score_stagnating,
+        "ESCALATE", "medium",
+        "Weighted flag score is not improving.",
+    ),
+    (
+        _is_score_improving,
+        "CONTINUE", "medium",
+        "Weighted flag score is trending down.",
+    ),
+    (
+        _is_max_iterations_with_unresolved,
+        "ESCALATE", "high",
+        "Reached max iterations with unresolved significant risks.",
+    ),
+]
+
+
 def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
@@ -1805,51 +1984,27 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     recurring = compute_recurring_critiques(plan_dir, iteration)
     budget = float(state["config"].get("budget_usd", 25.0))
     total_cost = float(state.get("meta", {}).get("total_cost_usd", 0.0))
+
+    # Bundle all signals into a dict so predicates can pick what they need.
+    signals = dict(
+        iteration=iteration, unresolved=unresolved, significant_count=significant_count,
+        weighted_score=weighted_score, weighted_history=weighted_history,
+        plan_delta=plan_delta, recurring=recurring, total_cost=total_cost,
+        budget=budget, skip_threshold=skip_threshold,
+        stagnation_factor=stagnation_factor, state=state,
+    )
+
+    # Walk the decision table — first matching predicate wins.
     recommendation = "CONTINUE"
     confidence = "medium"
     rationale = "Continue refining the plan."
 
-    if total_cost > budget:
-        recommendation = "ABORT"
-        confidence = "high"
-        rationale = f"Cost ${total_cost:.3f} exceeded configured budget ${budget:.3f}."
-    elif significant_count == 0 and not unresolved:
-        recommendation = "SKIP"
-        confidence = "high"
-        rationale = "No unresolved significant flags remain."
-    elif iteration > 1 and weighted_score < skip_threshold and len(weighted_history) >= 1 and weighted_score < weighted_history[-1]:
-        recommendation = "SKIP"
-        confidence = "medium"
-        rationale = f"Remaining flags are low-weight ({weighted_score}) and trending down. Executor can resolve."
-    elif plan_delta is not None and plan_delta < 5.0:
-        if unresolved:
-            recommendation = "ESCALATE"
-            confidence = "high"
-            rationale = "Plan stagnated with unresolved significant risks."
-        else:
-            recommendation = "SKIP"
-            confidence = "high"
-            rationale = "Plan changes are small and all significant risks appear addressed."
-    elif iteration == 1 and significant_count > 0:
-        recommendation = "CONTINUE"
-        confidence = "high"
-        rationale = f"First iteration still has {significant_count} significant flags."
-    elif recurring:
-        recommendation = "ESCALATE"
-        confidence = "high"
-        rationale = "The same critique concerns repeated across iterations."
-    elif len(weighted_history) >= 1 and weighted_score >= weighted_history[-1] * stagnation_factor:
-        recommendation = "ESCALATE"
-        confidence = "medium"
-        rationale = "Weighted flag score is not improving."
-    elif len(weighted_history) >= 1 and weighted_score < weighted_history[-1] * stagnation_factor:
-        recommendation = "CONTINUE"
-        confidence = "medium"
-        rationale = "Weighted flag score is trending down."
-    elif iteration >= int(state["config"].get("max_iterations", 3)) and unresolved:
-        recommendation = "ESCALATE"
-        confidence = "high"
-        rationale = "Reached max iterations with unresolved significant risks."
+    for predicate, rec, conf, rationale_tmpl in _EVALUATION_DECISION_TABLE:
+        if predicate(**signals):
+            recommendation = rec
+            confidence = conf
+            rationale = rationale_tmpl(signals) if callable(rationale_tmpl) else rationale_tmpl
+            break
 
     valid_next = ["integrate"] if recommendation == "CONTINUE" else ["gate"] if recommendation == "SKIP" else ["override add-note", "override force-proceed", "override abort"]
 
