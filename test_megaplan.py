@@ -6,7 +6,7 @@ from typing import Callable
 
 import pytest
 
-import megazord
+import megaplan
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -60,17 +60,17 @@ def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture
     project_dir.mkdir()
     (project_dir / ".git").mkdir()
 
-    monkeypatch.setenv(megazord.MOCK_ENV_VAR, "1")
+    monkeypatch.setenv(megaplan.MOCK_ENV_VAR, "1")
     monkeypatch.setattr(
-        megazord.shutil,
+        megaplan.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
 
     make_args = make_args_factory(project_dir)
-    response = megazord.handle_init(root, make_args())
+    response = megaplan.handle_init(root, make_args())
     plan_name = response["plan"]
-    plan_dir = megazord.plans_root(root) / plan_name
+    plan_dir = megaplan.plans_root(root) / plan_name
     return PlanFixture(root=root, project_dir=project_dir, plan_name=plan_name, plan_dir=plan_dir, make_args=make_args)
 
 
@@ -137,7 +137,7 @@ def eval_scaffold(
     state = {
         "name": "test-plan",
         "idea": "test idea",
-        "current_state": megazord.STATE_CRITIQUED,
+        "current_state": megaplan.STATE_CRITIQUED,
         "iteration": iteration,
         "config": {
             "budget_usd": budget_usd,
@@ -162,7 +162,7 @@ def eval_scaffold(
 
 
 def load_state(plan_dir: Path) -> dict:
-    return read_json(plan_dir / "morph.json")
+    return read_json(plan_dir / "state.json")
 
 
 def write_flag_registry(plan_dir: Path, flags: list[dict]) -> None:
@@ -170,14 +170,14 @@ def write_flag_registry(plan_dir: Path, flags: list[dict]) -> None:
 
 
 def advance_to_evaluated(plan_fx: PlanFixture) -> None:
-    megazord.handle_plan(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
-    megazord.handle_critique(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
-    megazord.handle_evaluate(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
+    megaplan.handle_plan(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
+    megaplan.handle_critique(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
+    megaplan.handle_evaluate(plan_fx.root, plan_fx.make_args(plan=plan_fx.plan_name))
 
 
 def advance_to_gated(plan_fx: PlanFixture) -> None:
     advance_to_evaluated(plan_fx)
-    megazord.handle_override(
+    megaplan.handle_override(
         plan_fx.root,
         plan_fx.make_args(plan=plan_fx.plan_name, override_action="force-proceed", reason="test gate override"),
     )
@@ -185,28 +185,28 @@ def advance_to_gated(plan_fx: PlanFixture) -> None:
 
 def test_init_creates_state_file(plan_fixture: PlanFixture) -> None:
     state = load_state(plan_fixture.plan_dir)
-    assert (plan_fixture.plan_dir / "morph.json").exists()
-    assert state["current_state"] == megazord.STATE_INITIALIZED
+    assert (plan_fixture.plan_dir / "state.json").exists()
+    assert state["current_state"] == megaplan.STATE_INITIALIZED
     assert state["iteration"] == 0
 
 
 def test_slugify() -> None:
-    assert megazord.slugify("Hello World!") == "hello-world"
-    assert megazord.slugify("") == "plan"
+    assert megaplan.slugify("Hello World!") == "hello-world"
+    assert megaplan.slugify("") == "plan"
     # Word-boundary truncation
-    assert megazord.slugify("Local-First Reigh — Run Entirely On Your Own Machine") == "local-first-reigh-run"
+    assert megaplan.slugify("Local-First Reigh — Run Entirely On Your Own Machine") == "local-first-reigh-run"
     # Short ideas pass through unchanged
-    assert megazord.slugify("fix-bug") == "fix-bug"
+    assert megaplan.slugify("fix-bug") == "fix-bug"
     # Custom max_length
-    assert megazord.slugify("one-two-three-four-five", max_length=15) == "one-two-three"
+    assert megaplan.slugify("one-two-three-four-five", max_length=15) == "one-two-three"
     # Only special chars
-    assert megazord.slugify("!!!") == "plan"
+    assert megaplan.slugify("!!!") == "plan"
 
 
 def test_compute_plan_delta_percent() -> None:
-    assert megazord.compute_plan_delta_percent("same text", "same text") == 0.0
-    assert megazord.compute_plan_delta_percent(None, "current text") is None
-    assert megazord.compute_plan_delta_percent("abc", "xyz") == 100.0
+    assert megaplan.compute_plan_delta_percent("same text", "same text") == 0.0
+    assert megaplan.compute_plan_delta_percent(None, "current text") is None
+    assert megaplan.compute_plan_delta_percent("abc", "xyz") == 100.0
 
 
 def test_compute_recurring_critiques(tmp_path: Path) -> None:
@@ -235,7 +235,7 @@ def test_compute_recurring_critiques(tmp_path: Path) -> None:
         },
     )
 
-    assert megazord.compute_recurring_critiques(plan_dir, 2) == ["same concern"]
+    assert megaplan.compute_recurring_critiques(plan_dir, 2) == ["same concern"]
 
     write_json(
         plan_dir / "critique_v2.json",
@@ -245,23 +245,23 @@ def test_compute_recurring_critiques(tmp_path: Path) -> None:
             "disputed_flag_ids": [],
         },
     )
-    assert megazord.compute_recurring_critiques(plan_dir, 2) == []
+    assert megaplan.compute_recurring_critiques(plan_dir, 2) == []
 
 
 @pytest.mark.parametrize(
     ("current_state", "last_evaluation", "expected"),
     [
-        (megazord.STATE_INITIALIZED, {}, ["plan"]),
-        (megazord.STATE_PLANNED, {}, ["critique"]),
-        (megazord.STATE_CRITIQUED, {}, ["evaluate"]),
-        (megazord.STATE_GATED, {}, ["execute"]),
-        (megazord.STATE_EXECUTED, {}, ["review"]),
-        (megazord.STATE_DONE, {}, []),
-        (megazord.STATE_ABORTED, {}, []),
+        (megaplan.STATE_INITIALIZED, {}, ["plan"]),
+        (megaplan.STATE_PLANNED, {}, ["critique"]),
+        (megaplan.STATE_CRITIQUED, {}, ["evaluate"]),
+        (megaplan.STATE_GATED, {}, ["execute"]),
+        (megaplan.STATE_EXECUTED, {}, ["review"]),
+        (megaplan.STATE_DONE, {}, []),
+        (megaplan.STATE_ABORTED, {}, []),
     ],
 )
 def test_infer_next_steps_non_evaluated_states(current_state: str, last_evaluation: dict, expected: list[str]) -> None:
-    assert megazord.infer_next_steps({"current_state": current_state, "last_evaluation": last_evaluation}) == expected
+    assert megaplan.infer_next_steps({"current_state": current_state, "last_evaluation": last_evaluation}) == expected
 
 
 @pytest.mark.parametrize(
@@ -275,14 +275,14 @@ def test_infer_next_steps_non_evaluated_states(current_state: str, last_evaluati
     ],
 )
 def test_infer_next_steps_evaluated_recommendations(recommendation: str | None, expected: list[str]) -> None:
-    state = {"current_state": megazord.STATE_EVALUATED, "last_evaluation": {"recommendation": recommendation}}
-    assert megazord.infer_next_steps(state) == expected
+    state = {"current_state": megaplan.STATE_EVALUATED, "last_evaluation": {"recommendation": recommendation}}
+    assert megaplan.infer_next_steps(state) == expected
 
 
 def test_update_flags_after_critique_creates_flags(tmp_path: Path) -> None:
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {
             "flags": [
@@ -308,7 +308,7 @@ def test_update_flags_after_critique_verifies_existing(tmp_path: Path) -> None:
         [{"id": "FLAG-001", "concern": "Concern", "status": "open", "severity": None, "verified": False}],
     )
 
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {"flags": [], "verified_flag_ids": ["FLAG-001"], "disputed_flag_ids": []},
         iteration=2,
@@ -328,7 +328,7 @@ def test_update_flags_after_critique_disputes_flags(tmp_path: Path) -> None:
         [{"id": "FLAG-001", "concern": "Concern", "status": "open", "severity": None, "verified": False}],
     )
 
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {"flags": [], "verified_flag_ids": [], "disputed_flag_ids": ["FLAG-001"]},
         iteration=2,
@@ -345,7 +345,7 @@ def test_update_flags_after_critique_reuses_ids(tmp_path: Path) -> None:
         [{"id": "FLAG-001", "concern": "Old concern", "status": "verified", "severity": "significant", "verified": True}],
     )
 
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {"flags": [{"id": "FLAG-001", "concern": "Updated concern", "category": "security", "severity_hint": "likely-significant", "evidence": "new evidence"}]},
         iteration=3,
@@ -364,7 +364,7 @@ def test_update_flags_after_critique_autonumbers(tmp_path: Path) -> None:
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
 
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {
             "flags": [
@@ -381,7 +381,7 @@ def test_update_flags_after_critique_autonumbers(tmp_path: Path) -> None:
 def test_update_flags_after_critique_sets_severity_from_hint(tmp_path: Path) -> None:
     plan_dir = tmp_path / "plan"
     plan_dir.mkdir()
-    registry = megazord.update_flags_after_critique(
+    registry = megaplan.update_flags_after_critique(
         plan_dir,
         {
             "flags": [
@@ -410,7 +410,7 @@ def test_update_flags_after_integrate_marks_addressed(tmp_path: Path) -> None:
         ],
     )
 
-    registry = megazord.update_flags_after_integrate(
+    registry = megaplan.update_flags_after_integrate(
         plan_dir,
         ["FLAG-001"],
         plan_file="plan_v2.md",
@@ -435,11 +435,11 @@ def test_unresolved_significant_flags_filtering() -> None:
         ]
     }
 
-    assert [flag["id"] for flag in megazord.unresolved_significant_flags(registry)] == ["FLAG-001", "FLAG-005"]
+    assert [flag["id"] for flag in megaplan.unresolved_significant_flags(registry)] == ["FLAG-001", "FLAG-005"]
 
 
 def test_normalize_flag_record_defaults() -> None:
-    normalized = megazord.normalize_flag_record({"id": "FLAG-001", "concern": "Concern", "category": "bogus", "evidence": "proof"}, "FLAG-999")
+    normalized = megaplan.normalize_flag_record({"id": "FLAG-001", "concern": "Concern", "category": "bogus", "evidence": "proof"}, "FLAG-999")
     assert normalized["category"] == "other"
     assert normalized["severity_hint"] == "uncertain"
 
@@ -451,14 +451,14 @@ def test_eval_abort_over_budget(tmp_path: Path) -> None:
         total_cost_usd=30.0,
         budget_usd=25.0,
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ABORT"
     assert evaluation["confidence"] == "high"
 
 
 def test_eval_skip_no_significant_flags(tmp_path: Path) -> None:
     plan_dir, state = eval_scaffold(tmp_path, flags=[])
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "SKIP"
     assert evaluation["confidence"] == "high"
 
@@ -473,7 +473,7 @@ def test_eval_escalate_stagnant_with_unresolved(tmp_path: Path) -> None:
         previous_plan_text=previous,
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["signals"]["plan_delta_from_previous"] < 5.0
     assert evaluation["recommendation"] == "ESCALATE"
 
@@ -488,7 +488,7 @@ def test_eval_skip_small_delta_all_resolved(tmp_path: Path) -> None:
         previous_plan_text=previous,
         flags=[{"id": "FLAG-001", "status": "addressed", "severity": "significant"}],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["signals"]["plan_delta_from_previous"] < 5.0
     assert evaluation["recommendation"] == "SKIP"
 
@@ -499,7 +499,7 @@ def test_eval_continue_first_iteration_significant(tmp_path: Path) -> None:
         iteration=1,
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "CONTINUE"
     assert evaluation["confidence"] == "high"
 
@@ -513,7 +513,7 @@ def test_eval_escalate_recurring_critiques(tmp_path: Path) -> None:
         current_critique_flags=[concern],
         previous_critique_flags=[{"id": "FLAG-001", "concern": " same   concern ", "category": "other", "evidence": "proof"}],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["confidence"] == "high"
 
@@ -525,7 +525,7 @@ def test_eval_escalate_weighted_score_not_improving(tmp_path: Path) -> None:
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant", "category": "correctness", "concern": "real issue"}],
         weighted_scores=[2.0],  # current weight 2.0 >= 2.0 * 0.9 = 1.8 → stagnant
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["confidence"] == "medium"
 
@@ -537,7 +537,7 @@ def test_eval_continue_weighted_score_improving(tmp_path: Path) -> None:
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant", "category": "other", "concern": "placeholder column name"}],
         weighted_scores=[4.0],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     # weight 0.5 < 4.0 * 0.9 = 3.6 → improving
     assert evaluation["recommendation"] == "CONTINUE"
     assert evaluation["confidence"] == "medium"
@@ -551,7 +551,7 @@ def test_eval_escalate_max_iterations_with_unresolved(tmp_path: Path) -> None:
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
         sig_history=[2],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["confidence"] == "high"
 
@@ -561,53 +561,53 @@ def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
     name = plan_fixture.plan_name
     make_args = plan_fixture.make_args
 
-    plan_result = megazord.handle_plan(root, make_args(plan=name))
-    assert plan_result["state"] == megazord.STATE_PLANNED
+    plan_result = megaplan.handle_plan(root, make_args(plan=name))
+    assert plan_result["state"] == megaplan.STATE_PLANNED
     assert plan_result["iteration"] == 1
     assert (plan_fixture.plan_dir / "plan_v1.md").exists()
 
-    critique_result = megazord.handle_critique(root, make_args(plan=name))
-    assert critique_result["state"] == megazord.STATE_CRITIQUED
+    critique_result = megaplan.handle_critique(root, make_args(plan=name))
+    assert critique_result["state"] == megaplan.STATE_CRITIQUED
     registry = read_json(plan_fixture.plan_dir / "faults.json")
     assert len(registry["flags"]) == 2
     # Severity is now set directly from severity_hint (no triage step)
     assert all(flag["severity"] == "significant" for flag in registry["flags"])
 
-    evaluate_result = megazord.handle_evaluate(root, make_args(plan=name))
-    assert evaluate_result["state"] == megazord.STATE_EVALUATED
+    evaluate_result = megaplan.handle_evaluate(root, make_args(plan=name))
+    assert evaluate_result["state"] == megaplan.STATE_EVALUATED
     assert evaluate_result["recommendation"] == "CONTINUE"
 
-    integrate_result = megazord.handle_integrate(root, make_args(plan=name))
-    assert integrate_result["state"] == megazord.STATE_PLANNED
+    integrate_result = megaplan.handle_integrate(root, make_args(plan=name))
+    assert integrate_result["state"] == megaplan.STATE_PLANNED
     assert integrate_result["iteration"] == 2
     registry = read_json(plan_fixture.plan_dir / "faults.json")
     assert {flag["status"] for flag in registry["flags"]} == {"addressed"}
 
-    megazord.handle_critique(root, make_args(plan=name))
+    megaplan.handle_critique(root, make_args(plan=name))
     registry = read_json(plan_fixture.plan_dir / "faults.json")
     assert {flag["status"] for flag in registry["flags"]} == {"verified"}
 
-    evaluate_result = megazord.handle_evaluate(root, make_args(plan=name))
+    evaluate_result = megaplan.handle_evaluate(root, make_args(plan=name))
     assert evaluate_result["recommendation"] == "SKIP"
 
-    gate_result = megazord.handle_gate(root, make_args(plan=name))
-    assert gate_result["state"] == megazord.STATE_GATED
+    gate_result = megaplan.handle_gate(root, make_args(plan=name))
+    assert gate_result["state"] == megaplan.STATE_GATED
     assert (plan_fixture.plan_dir / "link.json").exists()
-    assert (plan_fixture.plan_dir / "form.md").exists()
+    assert (plan_fixture.plan_dir / "final.md").exists()
 
-    execute_result = megazord.handle_execute(root, make_args(plan=name, confirm_destructive=True))
-    assert execute_result["state"] == megazord.STATE_EXECUTED
-    assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAZORD.txt").exists()
+    execute_result = megaplan.handle_execute(root, make_args(plan=name, confirm_destructive=True))
+    assert execute_result["state"] == megaplan.STATE_EXECUTED
+    assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
 
-    review_result = megazord.handle_review(root, make_args(plan=name))
-    assert review_result["state"] == megazord.STATE_DONE
+    review_result = megaplan.handle_review(root, make_args(plan=name))
+    assert review_result["state"] == megaplan.STATE_DONE
     review = read_json(plan_fixture.plan_dir / "review.json")
     assert all(item["pass"] for item in review["criteria"])
 
 
 def test_require_state_rejects_invalid_transition(plan_fixture: PlanFixture) -> None:
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
 
     assert exc_info.value.code == "invalid_transition"
     assert "plan" in exc_info.value.valid_next
@@ -616,29 +616,29 @@ def test_require_state_rejects_invalid_transition(plan_fixture: PlanFixture) -> 
 def test_cannot_execute_before_gate(plan_fixture: PlanFixture) -> None:
     advance_to_evaluated(plan_fixture)
 
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_execute(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True))
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_execute(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True))
 
     assert exc_info.value.code == "invalid_transition"
 
 
 def test_terminal_states_block_progression_steps(plan_fixture: PlanFixture) -> None:
-    megazord.handle_override(
+    megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="abort", reason="stop here"),
     )
     state = load_state(plan_fixture.plan_dir)
-    assert megazord.infer_next_steps(state) == []
+    assert megaplan.infer_next_steps(state) == []
 
     for action in (
-        lambda: megazord.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name)),
-        lambda: megazord.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name)),
-        lambda: megazord.handle_execute(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True)),
+        lambda: megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name)),
+        lambda: megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name)),
+        lambda: megaplan.handle_execute(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True)),
     ):
-        with pytest.raises(megazord.CliError):
+        with pytest.raises(megaplan.CliError):
             action()
 
-    result = megazord.handle_override(
+    result = megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="add-note", note="still documenting"),
     )
@@ -646,20 +646,20 @@ def test_terminal_states_block_progression_steps(plan_fixture: PlanFixture) -> N
 
 
 def test_override_abort_sets_terminal(plan_fixture: PlanFixture) -> None:
-    result = megazord.handle_override(
+    result = megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="abort", reason="manual stop"),
     )
 
     state = load_state(plan_fixture.plan_dir)
-    assert result["state"] == megazord.STATE_ABORTED
-    assert state["current_state"] == megazord.STATE_ABORTED
+    assert result["state"] == megaplan.STATE_ABORTED
+    assert state["current_state"] == megaplan.STATE_ABORTED
     assert state["meta"]["overrides"][-1]["action"] == "abort"
     assert state["meta"]["overrides"][-1]["reason"] == "manual stop"
 
 
 def test_override_add_note(plan_fixture: PlanFixture) -> None:
-    megazord.handle_override(
+    megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="add-note", note="remember this"),
     )
@@ -671,35 +671,35 @@ def test_override_add_note(plan_fixture: PlanFixture) -> None:
 
 
 def test_override_add_note_after_abort(plan_fixture: PlanFixture) -> None:
-    megazord.handle_override(
+    megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="abort", reason="stop"),
     )
 
-    result = megazord.handle_override(
+    result = megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="add-note", note="after abort"),
     )
 
     state = load_state(plan_fixture.plan_dir)
     assert result["success"] is True
-    assert state["current_state"] == megazord.STATE_ABORTED
+    assert state["current_state"] == megaplan.STATE_ABORTED
     assert state["meta"]["notes"][-1]["note"] == "after abort"
 
 
 def test_override_force_proceed_success(plan_fixture: PlanFixture) -> None:
     advance_to_evaluated(plan_fixture)
 
-    result = megazord.handle_override(
+    result = megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="accept risk"),
     )
 
     state = load_state(plan_fixture.plan_dir)
-    assert result["state"] == megazord.STATE_GATED
-    assert state["current_state"] == megazord.STATE_GATED
+    assert result["state"] == megaplan.STATE_GATED
+    assert state["current_state"] == megaplan.STATE_GATED
     assert (plan_fixture.plan_dir / "link.json").exists()
-    assert (plan_fixture.plan_dir / "form.md").exists()
+    assert (plan_fixture.plan_dir / "final.md").exists()
     assert state["meta"]["overrides"][-1]["action"] == "force-proceed"
 
 
@@ -707,10 +707,10 @@ def test_override_force_proceed_unsafe_missing_project_dir(plan_fixture: PlanFix
     advance_to_evaluated(plan_fixture)
     state = load_state(plan_fixture.plan_dir)
     state["config"]["project_dir"] = str(plan_fixture.project_dir / "missing")
-    write_json(plan_fixture.plan_dir / "morph.json", state)
+    write_json(plan_fixture.plan_dir / "state.json", state)
 
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_override(
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_override(
             plan_fixture.root,
             plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="unsafe"),
         )
@@ -725,8 +725,8 @@ def test_override_force_proceed_unsafe_no_success_criteria(plan_fixture: PlanFix
     meta["success_criteria"] = []
     write_json(meta_path, meta)
 
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_override(
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_override(
             plan_fixture.root,
             plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="unsafe"),
         )
@@ -735,10 +735,10 @@ def test_override_force_proceed_unsafe_no_success_criteria(plan_fixture: PlanFix
 
 
 def test_override_force_proceed_wrong_state(plan_fixture: PlanFixture) -> None:
-    megazord.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
 
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_override(
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_override(
             plan_fixture.root,
             plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="wrong state"),
         )
@@ -748,22 +748,22 @@ def test_override_force_proceed_wrong_state(plan_fixture: PlanFixture) -> None:
 
 def test_override_skip(plan_fixture: PlanFixture) -> None:
     advance_to_evaluated(plan_fixture)
-    result = megazord.handle_override(
+    result = megaplan.handle_override(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="skip", reason="move on"),
     )
 
     state = load_state(plan_fixture.plan_dir)
-    assert result["state"] == megazord.STATE_EVALUATED
-    assert state["current_state"] == megazord.STATE_EVALUATED
+    assert result["state"] == megaplan.STATE_EVALUATED
+    assert state["current_state"] == megaplan.STATE_EVALUATED
     assert state["last_evaluation"]["recommendation"] == "SKIP"
 
 
 def test_execute_requires_confirm_destructive(plan_fixture: PlanFixture) -> None:
     advance_to_gated(plan_fixture)
 
-    with pytest.raises(megazord.CliError) as exc_info:
-        megazord.handle_execute(
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_execute(
             plan_fixture.root,
             plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=False),
         )
@@ -772,19 +772,19 @@ def test_execute_requires_confirm_destructive(plan_fixture: PlanFixture) -> None
 
 
 def test_flag_weight_security() -> None:
-    assert megazord.flag_weight({"category": "security", "concern": "SQL injection"}) == 3.0
+    assert megaplan.flag_weight({"category": "security", "concern": "SQL injection"}) == 3.0
 
 
 def test_flag_weight_implementation_detail() -> None:
-    assert megazord.flag_weight({"category": "correctness", "concern": "The column name in the pseudocode is wrong"}) == 0.5
-    assert megazord.flag_weight({"category": "correctness", "concern": "Placeholder SQL should use real table"}) == 0.5
+    assert megaplan.flag_weight({"category": "correctness", "concern": "The column name in the pseudocode is wrong"}) == 0.5
+    assert megaplan.flag_weight({"category": "correctness", "concern": "Placeholder SQL should use real table"}) == 0.5
 
 
 def test_flag_weight_defaults() -> None:
-    assert megazord.flag_weight({"category": "correctness", "concern": "Architecture is wrong"}) == 2.0
-    assert megazord.flag_weight({"category": "completeness", "concern": "Missing error handling"}) == 1.5
-    assert megazord.flag_weight({"category": "maintainability", "concern": "Code duplication"}) == 0.75
-    assert megazord.flag_weight({"category": "other", "concern": "Something"}) == 1.0
+    assert megaplan.flag_weight({"category": "correctness", "concern": "Architecture is wrong"}) == 2.0
+    assert megaplan.flag_weight({"category": "completeness", "concern": "Missing error handling"}) == 1.5
+    assert megaplan.flag_weight({"category": "maintainability", "concern": "Code duplication"}) == 0.75
+    assert megaplan.flag_weight({"category": "other", "concern": "Something"}) == 1.0
 
 
 def test_eval_weighted_implementation_details_dont_escalate(tmp_path: Path) -> None:
@@ -799,7 +799,7 @@ def test_eval_weighted_implementation_details_dont_escalate(tmp_path: Path) -> N
         ],
         weighted_scores=[1.5],  # same as current → but within 0.9 tolerance since 1.5 >= 1.35
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     # All flags are low-weight (0.5 each = 1.5), so override should suggest force-proceed
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["suggested_override"] == "force-proceed"
@@ -816,7 +816,7 @@ def test_eval_weighted_security_flags_escalate(tmp_path: Path) -> None:
         ],
         weighted_scores=[6.0],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["suggested_override"] == "add-note"
 
@@ -828,7 +828,7 @@ def test_eval_override_guidance_abort_on_budget(tmp_path: Path) -> None:
         total_cost_usd=30.0,
         budget_usd=25.0,
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ABORT"
     assert evaluation["suggested_override"] == "abort"
 
@@ -839,6 +839,6 @@ def test_eval_no_override_on_continue(tmp_path: Path) -> None:
         iteration=1,
         flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
     )
-    evaluation = megazord.build_evaluation(plan_dir, state)
+    evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "CONTINUE"
     assert "suggested_override" not in evaluation

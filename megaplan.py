@@ -31,7 +31,7 @@ STATE_DONE = "done"
 STATE_ABORTED = "aborted"
 TERMINAL_STATES = {STATE_DONE, STATE_ABORTED}
 FLAG_BLOCKING_STATUSES = {"open", "disputed"}
-MOCK_ENV_VAR = "MEGAZORD_MOCK_WORKERS"
+MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
 WORKER_TIMEOUT_SECONDS = 600
 
 SCHEMAS: dict[str, dict[str, Any]] = {
@@ -220,24 +220,24 @@ def sha256_file(path: Path) -> str:
 
 
 def ensure_runtime_layout(root: Path) -> None:
-    grid_root = root / ".grid"
-    (grid_root / "plans").mkdir(parents=True, exist_ok=True)
-    schemas_dir = grid_root / "schemas"
+    megaplan_root = root / ".megaplan"
+    (megaplan_root / "plans").mkdir(parents=True, exist_ok=True)
+    schemas_dir = megaplan_root / "schemas"
     schemas_dir.mkdir(parents=True, exist_ok=True)
     for filename, schema in SCHEMAS.items():
         atomic_write_json(schemas_dir / filename, strict_schema(schema))
 
 
-def grid_root(root: Path) -> Path:
-    return root / ".grid"
+def megaplan_root(root: Path) -> Path:
+    return root / ".megaplan"
 
 
 def plans_root(root: Path) -> Path:
-    return grid_root(root) / "plans"
+    return megaplan_root(root) / "plans"
 
 
 def schemas_root(root: Path) -> Path:
-    return grid_root(root) / "schemas"
+    return megaplan_root(root) / "schemas"
 
 
 def artifact_path(plan_dir: Path, filename: str) -> Path:
@@ -258,7 +258,7 @@ def active_plan_dirs(root: Path) -> list[Path]:
         return []
     directories: list[Path] = []
     for child in plans_root(root).iterdir():
-        if child.is_dir() and (child / "morph.json").exists():
+        if child.is_dir() and (child / "state.json").exists():
             directories.append(child)
     return sorted(directories)
 
@@ -267,14 +267,14 @@ def resolve_plan_dir(root: Path, requested_name: str | None) -> Path:
     plan_dirs = active_plan_dirs(root)
     if requested_name:
         plan_dir = plans_root(root) / requested_name
-        if not (plan_dir / "morph.json").exists():
+        if not (plan_dir / "state.json").exists():
             raise CliError("missing_plan", f"Plan '{requested_name}' does not exist")
         return plan_dir
     if not plan_dirs:
         raise CliError("missing_plan", "No plans found. Run init first.")
     active = []
     for plan_dir in plan_dirs:
-        state = read_json(plan_dir / "morph.json")
+        state = read_json(plan_dir / "state.json")
         if state.get("current_state") not in TERMINAL_STATES:
             active.append(plan_dir)
     if len(active) == 1:
@@ -291,11 +291,11 @@ def resolve_plan_dir(root: Path, requested_name: str | None) -> Path:
 
 def load_plan(root: Path, requested_name: str | None) -> tuple[Path, dict[str, Any]]:
     plan_dir = resolve_plan_dir(root, requested_name)
-    return plan_dir, read_json(plan_dir / "morph.json")
+    return plan_dir, read_json(plan_dir / "state.json")
 
 
 def save_state(plan_dir: Path, state: dict[str, Any]) -> None:
-    atomic_write_json(plan_dir / "morph.json", state)
+    atomic_write_json(plan_dir / "state.json", state)
 
 
 def render_response(data: dict[str, Any], *, exit_code: int = 0) -> int:
@@ -849,12 +849,12 @@ def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> Work
         return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
     if step == "execute":
-        target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAZORD.txt"
+        target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
         target.write_text("mock execution completed\n", encoding="utf-8")
         payload = {
             "output": "Mock execution completed successfully.",
             "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
-            "commands_run": ["mock-write IMPLEMENTED_BY_MEGAZORD.txt"],
+            "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
             "deviations": [],
         }
         return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()), trace_output='{"event":"mock-execute"}\n')
@@ -1222,7 +1222,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "plan": plan_name,
         "state": STATE_INITIALIZED,
         "summary": f"Initialized plan '{plan_name}' for project {project_dir}",
-        "artifacts": ["morph.json"],
+        "artifacts": ["state.json"],
         "next_step": "plan",
     }
 
@@ -1616,7 +1616,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             **gate,
         }
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    atomic_write_text(plan_dir / "form.md", final_plan)
+    atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
     append_history(
         state,
@@ -1635,7 +1635,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "success": True,
         "step": "gate",
         "summary": "Gate passed. Plan is ready for execution.",
-        "artifacts": ["link.json", "form.md"],
+        "artifacts": ["link.json", "final.md"],
         "next_step": "execute",
         "state": STATE_GATED,
         **gate,
@@ -1698,7 +1698,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         raise
     atomic_write_json(plan_dir / "review.json", worker.payload)
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    atomic_write_text(plan_dir / "form.md", final_plan)
+    atomic_write_text(plan_dir / "final.md", final_plan)
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
     state["current_state"] = STATE_DONE
@@ -1723,7 +1723,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "success": True,
         "step": "review",
         "summary": f"Review complete: {passed}/{total} success criteria passed.",
-        "artifacts": ["review.json", "form.md"],
+        "artifacts": ["review.json", "final.md"],
         "next_step": None,
         "state": STATE_DONE,
         "issues": worker.payload.get("issues", []),
@@ -1760,7 +1760,7 @@ def handle_list(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     ensure_runtime_layout(root)
     items = []
     for plan_dir in active_plan_dirs(root):
-        state = read_json(plan_dir / "morph.json")
+        state = read_json(plan_dir / "state.json")
         items.append(
             {
                 "name": state["name"],
@@ -1814,7 +1814,7 @@ def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
                 raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
             atomic_write_json(plan_dir / "link.json", gate)
             final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-            atomic_write_text(plan_dir / "form.md", final_plan)
+            atomic_write_text(plan_dir / "final.md", final_plan)
             state["current_state"] = STATE_GATED
             state.setdefault("meta", {}).setdefault("overrides", []).append({"action": action, "timestamp": now_utc(), "reason": args.reason})
             save_state(plan_dir, state)
@@ -1849,7 +1849,7 @@ def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Megazord orchestration CLI")
+    parser = argparse.ArgumentParser(description="Megaplan orchestration CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init")
