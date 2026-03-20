@@ -653,7 +653,6 @@ def run_command(
             f"Command not found: {command[0]}",
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        duration_ms = int((time.monotonic() - started) * 1000)
         raise CliError(
             "worker_timeout",
             f"Command timed out after {timeout}s: {' '.join(command[:3])}...",
