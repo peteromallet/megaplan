@@ -8,19 +8,67 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import textwrap
-import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from importlib import resources
 from pathlib import Path
 from enum import Enum
 from typing import Any, NotRequired, TypedDict
+
+# Re-export from sub-modules so that everything remains importable from megaplan.cli
+from megaplan.schemas import SCHEMAS, strict_schema  # noqa: F401
+from megaplan.evaluation import (  # noqa: F401
+    build_evaluation,
+    flag_weight,
+    compute_plan_delta_percent,
+    compute_recurring_critiques,
+    ROBUSTNESS_SKIP_THRESHOLDS,
+    ROBUSTNESS_STAGNATION_FACTORS,
+    _EVALUATION_DECISION_TABLE,
+    _is_over_budget,
+    _is_all_flags_resolved,
+    _is_low_weight_trending_down,
+    _is_stagnant_with_unresolved,
+    _is_stagnant_all_addressed,
+    _is_first_iteration_with_flags,
+    _has_recurring_critiques,
+    _is_score_stagnating,
+    _is_score_improving,
+    _is_max_iterations_with_unresolved,
+)
+from megaplan.workers import (  # noqa: F401
+    CommandResult,
+    WorkerResult,
+    run_command,
+    run_claude_step,
+    run_codex_step,
+    run_step_with_worker,
+    extract_session_id,
+    parse_claude_envelope,
+    parse_json_file,
+    validate_payload,
+    mock_worker_output,
+    session_key_for,
+    persist_session,
+    resolve_agent_mode,
+    WORKER_TIMEOUT_SECONDS,
+)
+from megaplan.prompts import (  # noqa: F401
+    create_claude_prompt,
+    create_codex_prompt,
+    _clarify_prompt,
+    _plan_prompt,
+    _integrate_prompt,
+    _critique_prompt,
+    _execute_prompt,
+    _review_claude_prompt,
+    _review_codex_prompt,
+    _CLAUDE_PROMPT_BUILDERS,
+    _CODEX_PROMPT_BUILDERS,
+)
 
 __all__ = [
     "PlanStage", "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
@@ -116,7 +164,6 @@ class FlagRecord(TypedDict, total=False):
     verified_in: str
 FLAG_BLOCKING_STATUSES = {"open", "disputed"}
 MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
-WORKER_TIMEOUT_SECONDS = 3600
 
 DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "clarify": "claude",
@@ -128,8 +175,6 @@ DEFAULT_AGENT_ROUTING: dict[str, str] = {
 }
 KNOWN_AGENTS = ["claude", "codex"]
 ROBUSTNESS_LEVELS = ("light", "standard", "thorough")
-ROBUSTNESS_SKIP_THRESHOLDS = {"light": 4.0, "standard": 2.0, "thorough": 1.0}
-ROBUSTNESS_STAGNATION_FACTORS = {"light": 0.8, "standard": 0.9, "thorough": 0.95}
 SCOPE_CREEP_TERMS = (
     "scope creep",
     "out of scope",
@@ -156,10 +201,6 @@ def load_config(home: Path | None = None) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
-        # Intentionally return empty dict on corrupt config: the config file is
-        # non-critical (only agent routing prefs), and callers fall back to
-        # defaults.  A warning here would clutter every CLI invocation when the
-        # user can simply run `megaplan config reset` to fix it.
         return {}
     if not isinstance(data, dict):
         return {}
@@ -174,129 +215,6 @@ def save_config(config: dict[str, Any], home: Path | None = None) -> Path:
 
 def detect_available_agents() -> list[str]:
     return [a for a in KNOWN_AGENTS if shutil.which(a)]
-
-
-SCHEMAS: dict[str, dict[str, Any]] = {
-    "clarify.json": {
-        "type": "object",
-        "properties": {
-            "questions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string"},
-                        "context": {"type": "string"},
-                    },
-                    "required": ["question", "context"],
-                },
-            },
-            "refined_idea": {"type": "string"},
-            "intent_summary": {"type": "string"},
-        },
-        "required": ["questions", "refined_idea", "intent_summary"],
-    },
-    "plan.json": {
-        "type": "object",
-        "properties": {
-            "plan": {"type": "string"},
-            "questions": {"type": "array", "items": {"type": "string"}},
-            "success_criteria": {"type": "array", "items": {"type": "string"}},
-            "assumptions": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["plan", "questions", "success_criteria", "assumptions"],
-    },
-    "integrate.json": {
-        "type": "object",
-        "properties": {
-            "plan": {"type": "string"},
-            "changes_summary": {"type": "string"},
-            "flags_addressed": {"type": "array", "items": {"type": "string"}},
-            "assumptions": {"type": "array", "items": {"type": "string"}},
-            "success_criteria": {"type": "array", "items": {"type": "string"}},
-            "questions": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["plan", "changes_summary", "flags_addressed"],
-    },
-    "critique.json": {
-        "type": "object",
-        "properties": {
-            "flags": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "concern": {"type": "string"},
-                        "category": {
-                            "type": "string",
-                            "enum": [
-                                "correctness",
-                                "security",
-                                "completeness",
-                                "performance",
-                                "maintainability",
-                                "other",
-                            ],
-                        },
-                        "severity_hint": {
-                            "type": "string",
-                            "enum": ["likely-significant", "likely-minor", "uncertain"],
-                        },
-                        "evidence": {"type": "string"},
-                    },
-                    "required": ["id", "concern", "category", "severity_hint", "evidence"],
-                },
-            },
-            "verified_flag_ids": {"type": "array", "items": {"type": "string"}},
-            "disputed_flag_ids": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["flags"],
-    },
-    "execution.json": {
-        "type": "object",
-        "properties": {
-            "output": {"type": "string"},
-            "files_changed": {"type": "array", "items": {"type": "string"}},
-            "commands_run": {"type": "array", "items": {"type": "string"}},
-            "deviations": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["output", "files_changed", "commands_run", "deviations"],
-    },
-    "review.json": {
-        "type": "object",
-        "properties": {
-            "criteria": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "pass": {"type": "boolean"},
-                        "evidence": {"type": "string"},
-                    },
-                    "required": ["name", "pass", "evidence"],
-                },
-            },
-            "issues": {"type": "array", "items": {"type": "string"}},
-            "summary": {"type": "string"},
-        },
-        "required": ["criteria", "issues"],
-    },
-}
-
-
-def strict_schema(schema: Any) -> Any:
-    if isinstance(schema, dict):
-        updated = {key: strict_schema(value) for key, value in schema.items()}
-        if updated.get("type") == "object":
-            updated.setdefault("additionalProperties", False)
-            if "properties" in updated:
-                updated["required"] = list(updated["properties"].keys())
-        return updated
-    if isinstance(schema, list):
-        return [strict_schema(item) for item in schema]
-    return schema
 
 
 class CliError(Exception):
@@ -315,26 +233,6 @@ class CliError(Exception):
         self.valid_next = valid_next or []
         self.extra = extra or {}
         self.exit_code = exit_code
-
-
-@dataclass
-class CommandResult:
-    command: list[str]
-    cwd: Path
-    returncode: int
-    stdout: str
-    stderr: str
-    duration_ms: int
-
-
-@dataclass
-class WorkerResult:
-    payload: dict[str, Any]
-    raw_output: str
-    duration_ms: int
-    cost_usd: float
-    session_id: str | None = None
-    trace_output: str | None = None
 
 
 def now_utc() -> str:
@@ -564,13 +462,6 @@ def attach_agent_fallback(response: dict[str, Any], args: argparse.Namespace) ->
         response["agent_fallback"] = args._agent_fallback
 
 
-def compute_plan_delta_percent(previous_text: str | None, current_text: str) -> float | None:
-    if previous_text is None:
-        return None
-    ratio = SequenceMatcher(None, previous_text, current_text).ratio()
-    return round((1.0 - ratio) * 100.0, 2)
-
-
 def unresolved_significant_flags(flag_registry: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         flag
@@ -630,121 +521,6 @@ def find_command(name: str) -> str | None:
     return shutil.which(name)
 
 
-def run_command(
-    command: list[str],
-    *,
-    cwd: Path,
-    stdin_text: str | None = None,
-    timeout: int | None = WORKER_TIMEOUT_SECONDS,
-) -> CommandResult:
-    started = time.monotonic()
-    try:
-        process = subprocess.run(
-            command,
-            cwd=str(cwd),
-            input=stdin_text,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise CliError(
-            "agent_not_found",
-            f"Command not found: {command[0]}",
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CliError(
-            "worker_timeout",
-            f"Command timed out after {timeout}s: {' '.join(command[:3])}...",
-            extra={"raw_output": str(exc.stdout or "") + str(exc.stderr or "")},
-        ) from exc
-    return CommandResult(
-        command=command,
-        cwd=cwd,
-        returncode=process.returncode,
-        stdout=process.stdout,
-        stderr=process.stderr,
-        duration_ms=int((time.monotonic() - started) * 1000),
-    )
-
-
-def extract_session_id(raw: str) -> str | None:
-    # Try structured JSONL first (codex --json emits {"type":"thread.started","thread_id":"..."})
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict) and obj.get("thread_id"):
-                return str(obj["thread_id"])
-        except (json.JSONDecodeError, ValueError):
-            continue
-    # Fallback: unstructured text pattern
-    match = re.search(r"\bsession[_ ]id[: ]+([0-9a-fA-F-]{8,})", raw)
-    return match.group(1) if match else None
-
-
-def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        envelope = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise CliError("parse_error", f"Claude output was not valid JSON: {exc}", extra={"raw_output": raw}) from exc
-    if isinstance(envelope, dict) and envelope.get("is_error"):
-        message = envelope.get("result") or envelope.get("message") or "Claude returned an error"
-        raise CliError("worker_error", f"Claude step failed: {message}", extra={"raw_output": raw})
-    # When using --json-schema, structured output lives in "structured_output"
-    # rather than "result" (which may be empty).
-    payload: Any = envelope
-    if isinstance(envelope, dict):
-        if "structured_output" in envelope and isinstance(envelope["structured_output"], dict):
-            payload = envelope["structured_output"]
-        elif "result" in envelope:
-            payload = envelope["result"]
-    if isinstance(payload, str):
-        if not payload.strip():
-            raise CliError("parse_error", "Claude returned empty result (check structured_output field)", extra={"raw_output": raw})
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise CliError("parse_error", f"Claude result payload was not valid JSON: {exc}", extra={"raw_output": raw}) from exc
-    if not isinstance(payload, dict):
-        raise CliError("parse_error", "Claude result payload was not an object", extra={"raw_output": raw})
-    return envelope, payload
-
-
-def parse_json_file(path: Path) -> dict[str, Any]:
-    try:
-        payload = read_json(path)
-    except FileNotFoundError as exc:
-        raise CliError("parse_error", f"Output file {path.name} was not created") from exc
-    except json.JSONDecodeError as exc:
-        raise CliError("parse_error", f"Output file {path.name} was not valid JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise CliError("parse_error", f"Output file {path.name} did not contain a JSON object")
-    return payload
-
-
-def validate_payload(step: str, payload: dict[str, Any]) -> None:
-    def require_keys(keys: list[str]) -> None:
-        missing = [key for key in keys if key not in payload]
-        if missing:
-            raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
-
-    if step == "clarify":
-        require_keys(["questions", "refined_idea", "intent_summary"])
-    elif step == "plan":
-        require_keys(["plan", "questions", "success_criteria", "assumptions"])
-    elif step == "integrate":
-        require_keys(["plan", "changes_summary", "flags_addressed"])
-    elif step == "critique":
-        require_keys(["flags"])
-    elif step == "execute":
-        require_keys(["output", "files_changed", "commands_run", "deviations"])
-    elif step == "review":
-        require_keys(["criteria", "issues"])
-
-
 def intent_and_notes_block(state: dict[str, Any]) -> str:
     sections = []
     clarification = state.get("clarification", {})
@@ -794,336 +570,6 @@ def scope_creep_flags(
     return matches
 
 
-def _clarify_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    notes = state.get("meta", {}).get("notes", [])
-    notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
-    return textwrap.dedent(
-        f"""
-        You are a planning assistant. The user has proposed the following idea:
-
-        Idea:
-        {state['idea']}
-
-        Project directory:
-        {project_dir}
-
-        User notes:
-        {notes_block}
-
-        Requirements:
-        - Read the project directory to understand the codebase.
-        - Restate the idea in your own words as a precise intent summary.
-        - Identify ambiguities, underspecified aspects, or implicit assumptions.
-        - For each ambiguity, produce a question that, if answered, would materially change the implementation plan.
-        - Propose a refined version of the idea that resolves obvious ambiguities.
-        - Do NOT plan the implementation - only clarify the intent.
-        """
-    ).strip()
-
-
-def _plan_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    notes = state.get("meta", {}).get("notes", [])
-    notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
-    clarification = state.get("clarification", {})
-    refined = clarification.get("refined_idea", "")
-    intent = clarification.get("intent_summary", "")
-    if refined:
-        clarify_block = textwrap.dedent(
-            f"""
-            Refined idea (from clarification):
-            {refined}
-
-            Intent summary:
-            {intent}
-
-            Original idea (for reference):
-            {state['idea']}
-            """
-        ).strip()
-    else:
-        clarify_block = textwrap.dedent(
-            f"""
-            Idea:
-            {state['idea']}
-            """
-        ).strip()
-    return textwrap.dedent(
-        f"""
-        You are creating an implementation plan for the following idea.
-
-        {clarify_block}
-
-        Project directory:
-        {project_dir}
-
-        User notes:
-        {notes_block}
-
-        Requirements:
-        - Inspect the actual repository before planning.
-        - Produce a concrete implementation plan in markdown.
-        - Define observable success criteria.
-        - Call out assumptions and open questions.
-        - Prefer cheap validation steps early.
-        """
-    ).strip()
-
-
-def _integrate_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    flag_registry = load_flag_registry(plan_dir)
-    evaluate_path = current_iteration_artifact(plan_dir, "evaluation", state["iteration"])
-    evaluation = read_json(evaluate_path)
-    unresolved = unresolved_significant_flags(flag_registry)
-    open_flags = [
-        {
-            "id": flag["id"],
-            "severity": flag.get("severity"),
-            "status": flag.get("status"),
-            "concern": flag.get("concern"),
-            "evidence": flag.get("evidence"),
-        }
-        for flag in unresolved
-    ]
-    return textwrap.dedent(
-        f"""
-        You are updating an implementation plan based on critique and evaluation.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Current plan (markdown):
-        {latest_plan}
-
-        Current plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Evaluation:
-        {json_dump(evaluation).strip()}
-
-        Open significant flags:
-        {json_dump(open_flags).strip()}
-
-        Requirements:
-        - Update the plan to address the significant issues.
-        - Keep the plan readable and executable.
-        - Return flags_addressed with the exact flag IDs you addressed.
-        - Preserve or improve success criteria quality.
-        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-        - Remove unjustified scope growth. If the critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
-        - If a broader change is truly necessary, explain that dependency explicitly in changes_summary instead of silently expanding the plan.
-        """
-    ).strip()
-
-
-def _critique_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    flag_registry = load_flag_registry(plan_dir)
-    robustness = configured_robustness(state)
-    unresolved = [
-        {
-            "id": flag["id"],
-            "concern": flag["concern"],
-            "status": flag.get("status"),
-            "severity": flag.get("severity"),
-        }
-        for flag in flag_registry.get("flags", [])
-        if flag.get("status") in {"addressed", "open", "disputed"}
-    ]
-    return textwrap.dedent(
-        f"""
-        You are an independent reviewer. Critique the plan against the actual repository.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Plan:
-        {latest_plan}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Existing flags:
-        {json_dump(unresolved).strip()}
-
-        Requirements:
-        - Reuse existing flag IDs when the same concern is still open.
-        - verified_flag_ids should list previously addressed flags that now appear resolved.
-        - Focus on concrete issues that would cause real problems.
-        - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
-        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-        - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern so the orchestrator can surface it.
-        - Do not rubber-stamp the plan.
-        - Assign severity_hint carefully: "likely-significant" for issues that would
-          cause real product or implementation problems. "likely-minor" for cosmetic,
-          nice-to-have, issues already covered elsewhere, or implementation details
-          the executor will naturally resolve by reading the actual code (e.g. exact
-          line numbers, missing boilerplate, export lists).
-        """
-    ).strip()
-
-
-def _execute_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    robustness = configured_robustness(state)
-    gate = read_json(plan_dir / "gate.json")
-    if state.get("config", {}).get("auto_approve"):
-        approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
-    elif state.get("meta", {}).get("user_approved_gate"):
-        approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
-    else:
-        approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
-    return textwrap.dedent(
-        f"""
-        Execute the approved plan in the repository.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Approved plan:
-        {latest_plan}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Gate summary:
-        {json_dump(gate).strip()}
-
-        {approval_note}
-        Robustness level: {robustness}.
-
-        Requirements:
-        - Implement the intent, not just the text.
-        - Adapt if repository reality contradicts the plan.
-        - Report deviations explicitly.
-        - Output concrete files changed and commands run.
-        """
-    ).strip()
-
-
-def _review_claude_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    execution = read_json(plan_dir / "execution.json")
-    gate = read_json(plan_dir / "gate.json")
-    diff_summary = collect_git_diff_summary(project_dir)
-    return textwrap.dedent(
-        f"""
-        Review the execution critically against user intent and observable success criteria.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Approved plan:
-        {latest_plan}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Gate summary:
-        {json_dump(gate).strip()}
-
-        Execution summary:
-        {json_dump(execution).strip()}
-
-        Git diff summary:
-        {diff_summary}
-
-        Requirements:
-        - Judge against the success criteria, not plan elegance.
-        - Be critical and call out real misses.
-        - If there are failures, describe them as issues.
-        """
-    ).strip()
-
-
-def _review_codex_prompt(state: dict[str, Any], plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    execution = read_json(plan_dir / "execution.json")
-    diff_summary = collect_git_diff_summary(project_dir)
-    return textwrap.dedent(
-        f"""
-        Review the implementation against the success criteria.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Approved plan:
-        {latest_plan}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Execution summary:
-        {json_dump(execution).strip()}
-
-        Git diff summary:
-        {diff_summary}
-
-        Requirements:
-        - Be critical.
-        - Verify each success criterion explicitly.
-        - Call out any concrete gaps or regressions in issues.
-        """
-    ).strip()
-
-
-# Step-to-builder dispatch tables per agent.
-# Steps shared across agents point to the same builder function.
-_CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
-    "clarify": _clarify_prompt,
-    "plan": _plan_prompt,
-    "integrate": _integrate_prompt,
-    "critique": _critique_prompt,
-    "execute": _execute_prompt,
-    "review": _review_claude_prompt,
-}
-
-_CODEX_PROMPT_BUILDERS: dict[str, Any] = {
-    "clarify": _clarify_prompt,
-    "plan": _plan_prompt,
-    "integrate": _integrate_prompt,
-    "critique": _critique_prompt,
-    "execute": _execute_prompt,
-    "review": _review_codex_prompt,
-}
-
-
-def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
-    builder = _CLAUDE_PROMPT_BUILDERS.get(step)
-    if builder is None:
-        raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
-    return builder(state, plan_dir)
-
-
-def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
-    builder = _CODEX_PROMPT_BUILDERS.get(step)
-    if builder is None:
-        raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
-    return builder(state, plan_dir)
-
-
 def collect_git_diff_summary(project_dir: Path) -> str:
     if not (project_dir / ".git").exists():
         return "Project directory is not a git repository."
@@ -1131,275 +577,6 @@ def collect_git_diff_summary(project_dir: Path) -> str:
     if diff.returncode != 0:
         return f"Unable to read git status: {diff.stderr.strip() or diff.stdout.strip()}"
     return diff.stdout.strip() or "No git changes detected."
-
-
-def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> WorkerResult:
-    iteration = state["iteration"] or 1
-    if step == "clarify":
-        payload = {
-            "questions": [
-                {
-                    "question": "Should the feature be behind a flag?",
-                    "context": "No feature flags exist in the repo currently.",
-                },
-            ],
-            "refined_idea": f"Refined: {state['idea']}",
-            "intent_summary": f"The user wants to {state['idea']}.",
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-    if step == "plan":
-        payload = {
-            "plan": textwrap.dedent(
-                f"""
-                # Implementation Plan
-
-                ## Goal
-                Implement: {state['idea']}
-
-                ## Steps
-                1. Inspect the repository and identify the touch points.
-                2. Implement the feature with tests or local verification hooks.
-                3. Validate success criteria before finishing.
-
-                ## Risks
-                - Repository reality may differ from the initial assumption.
-                - Missing verification would block execution.
-                """
-            ).strip(),
-            "questions": ["Are there existing patterns in the repo that should be preserved?"],
-            "success_criteria": [
-                "A concrete implementation path exists.",
-                "Verification is defined before execution.",
-            ],
-            "assumptions": ["The project directory is writable."],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-    if step == "critique":
-        if iteration == 1:
-            payload = {
-                "flags": [
-                    {
-                        "id": "FLAG-001",
-                        "concern": "The plan does not name the files or modules it expects to touch.",
-                        "category": "completeness",
-                        "severity_hint": "likely-significant",
-                        "evidence": "Execution could drift because there is no repo-specific scope.",
-                    },
-                    {
-                        "id": "FLAG-002",
-                        "concern": "The plan does not define an observable verification command.",
-                        "category": "correctness",
-                        "severity_hint": "likely-significant",
-                        "evidence": "Success cannot be demonstrated without a concrete check.",
-                    },
-                ],
-                "verified_flag_ids": [],
-                "disputed_flag_ids": [],
-            }
-        else:
-            payload = {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-    if step == "integrate":
-        payload = {
-            "plan": textwrap.dedent(
-                f"""
-                # Implementation Plan
-
-                ## Goal
-                Implement: {state['idea']}
-
-                ## Concrete Scope
-                1. Inspect the repository and identify the exact files to touch before editing.
-                2. Implement the change in the smallest viable slice.
-                3. Run a concrete verification command and capture the result.
-
-                ## Verification
-                - Run a repo-specific smoke test or command before closing the task.
-
-                ## Risks
-                - If the repo shape differs from expectations, adapt and record the deviation.
-                """
-            ).strip(),
-            "changes_summary": "Added explicit repo-scoping and verification steps.",
-            "flags_addressed": ["FLAG-001", "FLAG-002"],
-            "assumptions": ["The repository contains enough context for implementation."],
-            "success_criteria": [
-                "The plan identifies exact touch points before editing.",
-                "A concrete verification command is defined.",
-            ],
-            "questions": [],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-    if step == "execute":
-        target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
-        target.write_text("mock execution completed\n", encoding="utf-8")
-        payload = {
-            "output": "Mock execution completed successfully.",
-            "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
-            "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
-            "deviations": [],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()), trace_output='{"event":"mock-execute"}\n')
-
-    if step == "review":
-        meta = read_json(latest_plan_meta_path(plan_dir, state))
-        criteria = [
-            {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
-            for criterion in meta.get("success_criteria", [])
-        ]
-        payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-    raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
-
-
-def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
-    if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir)
-    project_dir = Path(state["config"]["project_dir"])
-    schema_name = {
-        "clarify": "clarify.json",
-        "plan": "plan.json",
-        "integrate": "integrate.json",
-        "critique": "critique.json",
-        "execute": "execution.json",
-        "review": "review.json",
-    }[step]
-    schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
-    session_key = session_key_for(step, "claude")
-    session = state.setdefault("sessions", {}).get(session_key, {})
-    session_id = session.get("id")
-    command = ["claude", "-p", "--output-format", "json", "--json-schema", schema_text, "--add-dir", str(project_dir)]
-    if session_id and not fresh:
-        command.extend(["--resume", session_id])
-    else:
-        session_id = str(uuid.uuid4())
-        command.extend(["--session-id", session_id])
-    prompt = create_claude_prompt(step, state, plan_dir)
-    result = run_command(command, cwd=project_dir, stdin_text=prompt)
-    raw = result.stdout or result.stderr
-    envelope, payload = parse_claude_envelope(raw)
-    try:
-        validate_payload(step, payload)
-    except CliError as error:
-        raise CliError(error.code, error.message, extra={"raw_output": raw}) from error
-    return WorkerResult(
-        payload=payload,
-        raw_output=raw,
-        duration_ms=result.duration_ms,
-        cost_usd=float(envelope.get("total_cost_usd", 0.0) or 0.0),
-        session_id=str(envelope.get("session_id") or session_id),
-    )
-
-
-def run_codex_step(
-    step: str,
-    state: dict[str, Any],
-    plan_dir: Path,
-    *,
-    root: Path,
-    persistent: bool,
-    fresh: bool = False,
-    json_trace: bool = False,
-) -> WorkerResult:
-    if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir)
-    project_dir = Path(state["config"]["project_dir"])
-    schema_file = schemas_root(root) / {
-        "clarify": "clarify.json",
-        "plan": "plan.json",
-        "integrate": "integrate.json",
-        "critique": "critique.json",
-        "execute": "execution.json",
-        "review": "review.json",
-    }[step]
-    session_key = session_key_for(step, "codex")
-    session = state.setdefault("sessions", {}).get(session_key, {})
-    out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)
-    out_handle.close()
-    output_path = Path(out_handle.name)
-    prompt = create_codex_prompt(step, state, plan_dir)
-
-    if persistent and session.get("id") and not fresh:
-        # codex exec resume does not support --output-schema; we rely on
-        # validate_payload() after parsing the output file instead.
-        command = ["codex", "exec", "resume"]
-        if json_trace:
-            command.append("--json")
-        command.extend([
-            "--skip-git-repo-check",
-            "-o", str(output_path),
-            str(session["id"]), "-",
-        ])
-    else:
-        command = ["codex", "exec", "--skip-git-repo-check", "-C", str(project_dir), "-o", str(output_path)]
-        if not persistent:
-            command.append("--ephemeral")
-        if step == "execute":
-            command.append("--full-auto")
-        if json_trace:
-            command.append("--json")
-        command.extend(["--output-schema", str(schema_file), "-"])
-
-    result = run_command(command, cwd=Path.cwd(), stdin_text=prompt)
-    raw = result.stdout + result.stderr
-    if result.returncode != 0 and (not output_path.exists() or not output_path.read_text(encoding="utf-8").strip()):
-        raise CliError("worker_error", f"Codex step failed with exit code {result.returncode}", extra={"raw_output": raw})
-    try:
-        payload = parse_json_file(output_path)
-    except CliError as error:
-        raise CliError(error.code, error.message, extra={"raw_output": raw}) from error
-    try:
-        validate_payload(step, payload)
-    except CliError as error:
-        raise CliError(error.code, error.message, extra={"raw_output": raw}) from error
-    session_id = session.get("id") if persistent else None
-    if persistent and not session_id:
-        session_id = extract_session_id(raw)
-        if not session_id:
-            raise CliError(
-                "worker_error",
-                f"Could not determine Codex session id for persistent {step} step",
-                extra={"raw_output": raw},
-            )
-    trace_output = raw if json_trace else None
-    return WorkerResult(
-        payload=payload,
-        raw_output=raw,
-        duration_ms=result.duration_ms,
-        cost_usd=0.0,
-        session_id=session_id,
-        trace_output=trace_output,
-    )
-
-
-def session_key_for(step: str, agent: str) -> str:
-    if step in {"clarify", "plan", "integrate"}:
-        return f"{agent}_planner"
-    if step == "critique":
-        return f"{agent}_critic"
-    if step == "execute":
-        return f"{agent}_executor"
-    if step == "review":
-        return f"{agent}_reviewer"
-    return f"{agent}_{step}"
-
-
-def persist_session(state: dict[str, Any], step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
-    if not session_id:
-        return
-    key = session_key_for(step, agent)
-    state.setdefault("sessions", {})[key] = {
-        "id": session_id,
-        "mode": mode,
-        "created_at": state.setdefault("sessions", {}).get(key, {}).get("created_at", now_utc()),
-        "last_used_at": now_utc(),
-        "refreshed": refreshed,
-    }
 
 
 def normalize_flag_record(item: dict[str, Any], fallback_id: str) -> dict[str, Any]:
@@ -1474,16 +651,6 @@ def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, 
     return registry
 
 
-def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
-    if iteration < 2:
-        return []
-    previous = read_json(current_iteration_artifact(plan_dir, "critique", iteration - 1))
-    current = read_json(current_iteration_artifact(plan_dir, "critique", iteration))
-    previous_concerns = {normalize_text(item["concern"]) for item in previous.get("flags", [])}
-    current_concerns = {normalize_text(item["concern"]) for item in current.get("flags", [])}
-    return sorted(previous_concerns.intersection(current_concerns))
-
-
 def store_raw_worker_output(plan_dir: Path, step: str, iteration: int, content: str) -> str:
     filename = current_iteration_raw_artifact(plan_dir, step, iteration).name
     atomic_write_text(plan_dir / filename, content)
@@ -1513,62 +680,6 @@ def record_step_failure(
         ),
     )
     save_state(plan_dir, state)
-
-
-def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None = None) -> tuple[str, str, bool]:
-    """Returns (agent, mode, refreshed).
-
-    Both agents default to persistent sessions.  Use --fresh to start a new
-    persistent session (break continuity) or --ephemeral for a truly one-off
-    call with no session saved.
-    """
-    explicit = args.agent
-    if explicit:
-        if not shutil.which(explicit):
-            raise CliError("agent_not_found", f"Agent '{explicit}' not found on PATH")
-        agent = explicit
-    else:
-        config = load_config(home)
-        agent = config.get("agents", {}).get(step) or DEFAULT_AGENT_ROUTING[step]
-        if not shutil.which(agent):
-            available = detect_available_agents()
-            if not available:
-                raise CliError(
-                    "agent_not_found",
-                    "No supported agents found on PATH. Install claude or codex.",
-                )
-            fallback = available[0]
-            args._agent_fallback = {
-                "requested": agent,
-                "resolved": fallback,
-                "reason": f"{agent} not found on PATH",
-            }
-            agent = fallback
-    ephemeral = getattr(args, "ephemeral", False)
-    fresh = getattr(args, "fresh", False)
-    persist = getattr(args, "persist", False)
-    conflicting = sum([fresh, persist, ephemeral])
-    if conflicting > 1:
-        raise CliError("invalid_args", "Cannot combine --fresh, --persist, and --ephemeral")
-    if ephemeral:
-        return agent, "ephemeral", True
-    refreshed = fresh
-    # Review with Claude: default to fresh to avoid self-bias (principle #5)
-    if step == "review" and agent == "claude":
-        if persist and not getattr(args, "confirm_self_review", False):
-            raise CliError("invalid_args", "Claude review requires --confirm-self-review when using --persist")
-        if not persist:
-            refreshed = True
-    return agent, "persistent", refreshed
-
-
-def run_step_with_worker(step: str, state: dict[str, Any], plan_dir: Path, args: argparse.Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
-    agent, mode, refreshed = resolve_agent_mode(step, args)
-    if agent == "claude":
-        worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed)
-    else:
-        worker = run_codex_step(step, state, plan_dir, root=root, persistent=(mode == "persistent"), fresh=refreshed, json_trace=(step == "execute"))
-    return worker, agent, mode, refreshed
 
 
 def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1796,263 +907,6 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         ]
     attach_agent_fallback(response, args)
     return response
-
-
-def flag_weight(flag: dict[str, Any]) -> float:
-    """Weight a flag for evaluation scoring. Higher = more blocking."""
-    category = flag.get("category", "other")
-    concern = flag.get("concern", "").lower()
-
-    if category == "security":
-        return 3.0
-
-    implementation_detail_signals = [
-        "column", "schema", "field", "as written",
-        "pseudocode", "seed sql", "placeholder",
-    ]
-    if any(signal in concern for signal in implementation_detail_signals):
-        return 0.5
-
-    weights = {
-        "correctness": 2.0,
-        "completeness": 1.5,
-        "performance": 1.0,
-        "maintainability": 0.75,
-        "other": 1.0,
-    }
-    return weights.get(category, 1.0)
-
-
-def _is_over_budget(total_cost: float, budget: float, **_: Any) -> bool:
-    """Cost has exceeded the configured budget."""
-    return total_cost > budget
-
-
-def _is_all_flags_resolved(significant_count: int, unresolved: list[Any], **_: Any) -> bool:
-    """No unresolved significant flags remain."""
-    return significant_count == 0 and not unresolved
-
-
-def _is_low_weight_trending_down(
-    iteration: int, weighted_score: float, skip_threshold: float,
-    weighted_history: list[float], **_: Any,
-) -> bool:
-    """Past first iteration, score below threshold and improving."""
-    return (
-        iteration > 1
-        and weighted_score < skip_threshold
-        and len(weighted_history) >= 1
-        and weighted_score < weighted_history[-1]
-    )
-
-
-def _is_stagnant_with_unresolved(
-    plan_delta: float | None, unresolved: list[Any], **_: Any,
-) -> bool:
-    """Plan text barely changed but significant risks remain."""
-    return plan_delta is not None and plan_delta < 5.0 and bool(unresolved)
-
-
-def _is_stagnant_all_addressed(
-    plan_delta: float | None, unresolved: list[Any], **_: Any,
-) -> bool:
-    """Plan text barely changed and all significant risks addressed."""
-    return plan_delta is not None and plan_delta < 5.0 and not unresolved
-
-
-def _is_first_iteration_with_flags(
-    iteration: int, significant_count: int, **_: Any,
-) -> bool:
-    """First critique iteration and significant flags exist."""
-    return iteration == 1 and significant_count > 0
-
-
-def _has_recurring_critiques(recurring: list[Any], **_: Any) -> bool:
-    """Same critique concerns repeated across iterations."""
-    return bool(recurring)
-
-
-def _is_score_stagnating(
-    weighted_score: float, weighted_history: list[float],
-    stagnation_factor: float, **_: Any,
-) -> bool:
-    """Weighted flag score is not improving relative to stagnation factor."""
-    return (
-        len(weighted_history) >= 1
-        and weighted_score >= weighted_history[-1] * stagnation_factor
-    )
-
-
-def _is_score_improving(
-    weighted_score: float, weighted_history: list[float],
-    stagnation_factor: float, **_: Any,
-) -> bool:
-    """Weighted flag score is trending down past the stagnation factor."""
-    return (
-        len(weighted_history) >= 1
-        and weighted_score < weighted_history[-1] * stagnation_factor
-    )
-
-
-def _is_max_iterations_with_unresolved(
-    iteration: int, state: dict[str, Any], unresolved: list[Any], **_: Any,
-) -> bool:
-    """Reached max iterations with unresolved significant risks."""
-    return iteration >= int(state["config"].get("max_iterations", 3)) and bool(unresolved)
-
-
-# Decision table: evaluated in priority order; first match wins.
-# Each entry is (predicate, recommendation, confidence, rationale_template).
-# rationale_template may be a str or a callable(signals -> str) for dynamic messages.
-_EVALUATION_DECISION_TABLE: list[
-    tuple[
-        Any,  # predicate function
-        str,  # recommendation
-        str,  # confidence
-        str | Any,  # rationale (str or callable)
-    ]
-] = [
-    (
-        _is_over_budget,
-        "ABORT", "high",
-        lambda s: f"Cost ${s['total_cost']:.3f} exceeded configured budget ${s['budget']:.3f}.",
-    ),
-    (
-        _is_all_flags_resolved,
-        "SKIP", "high",
-        "No unresolved significant flags remain.",
-    ),
-    (
-        _is_low_weight_trending_down,
-        "SKIP", "medium",
-        lambda s: f"Remaining flags are low-weight ({s['weighted_score']}) and trending down. Executor can resolve.",
-    ),
-    (
-        _is_stagnant_with_unresolved,
-        "ESCALATE", "high",
-        "Plan stagnated with unresolved significant risks.",
-    ),
-    (
-        _is_stagnant_all_addressed,
-        "SKIP", "high",
-        "Plan changes are small and all significant risks appear addressed.",
-    ),
-    (
-        _is_first_iteration_with_flags,
-        "CONTINUE", "high",
-        lambda s: f"First iteration still has {s['significant_count']} significant flags.",
-    ),
-    (
-        _has_recurring_critiques,
-        "ESCALATE", "high",
-        "The same critique concerns repeated across iterations.",
-    ),
-    (
-        _is_score_stagnating,
-        "ESCALATE", "medium",
-        "Weighted flag score is not improving.",
-    ),
-    (
-        _is_score_improving,
-        "CONTINUE", "medium",
-        "Weighted flag score is trending down.",
-    ),
-    (
-        _is_max_iterations_with_unresolved,
-        "ESCALATE", "high",
-        "Reached max iterations with unresolved significant risks.",
-    ),
-]
-
-
-def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
-    iteration = state["iteration"]
-    flag_registry = load_flag_registry(plan_dir)
-    unresolved = unresolved_significant_flags(flag_registry)
-    robustness = configured_robustness(state)
-    skip_threshold = ROBUSTNESS_SKIP_THRESHOLDS.get(robustness, 2.0)
-    stagnation_factor = ROBUSTNESS_STAGNATION_FACTORS.get(robustness, 0.9)
-    open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
-    significant_count = len([flag for flag in flag_registry.get("flags", []) if flag.get("severity") == "significant" and flag.get("status") != "verified"])
-    weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
-    weighted_history = state.get("meta", {}).get("weighted_scores", [])
-    latest_plan_text = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    previous_text = None
-    if iteration > 1:
-        previous_text = (plan_dir / f"plan_v{iteration - 1}.md").read_text(encoding="utf-8")
-    plan_delta = compute_plan_delta_percent(previous_text, latest_plan_text)
-    recurring = compute_recurring_critiques(plan_dir, iteration)
-    budget = float(state["config"].get("budget_usd", 25.0))
-    total_cost = float(state.get("meta", {}).get("total_cost_usd", 0.0))
-
-    # Bundle all signals into a dict so predicates can pick what they need.
-    signals = dict(
-        iteration=iteration, unresolved=unresolved, significant_count=significant_count,
-        weighted_score=weighted_score, weighted_history=weighted_history,
-        plan_delta=plan_delta, recurring=recurring, total_cost=total_cost,
-        budget=budget, skip_threshold=skip_threshold,
-        stagnation_factor=stagnation_factor, state=state,
-    )
-
-    # Walk the decision table — first matching predicate wins.
-    recommendation = "CONTINUE"
-    confidence = "medium"
-    rationale = "Continue refining the plan."
-
-    for predicate, rec, conf, rationale_tmpl in _EVALUATION_DECISION_TABLE:
-        if predicate(**signals):
-            recommendation = rec
-            confidence = conf
-            rationale = rationale_tmpl(signals) if callable(rationale_tmpl) else rationale_tmpl
-            break
-
-    valid_next = ["integrate"] if recommendation == "CONTINUE" else ["gate"] if recommendation == "SKIP" else ["override add-note", "override force-proceed", "override abort"]
-
-    result: dict[str, Any] = {
-        "recommendation": recommendation,
-        "confidence": confidence,
-        "robustness": robustness,
-        "signals": {
-            "iteration": iteration,
-            "max_iterations": state["config"].get("max_iterations"),
-            "significant_flags": significant_count,
-            "weighted_score": weighted_score,
-            "weighted_history": weighted_history,
-            "plan_delta_from_previous": plan_delta,
-            "recurring_critiques": recurring,
-            "cost_so_far_usd": total_cost,
-            "scope_creep_flags": [flag["id"] for flag in open_scope_creep],
-        },
-        "rationale": rationale,
-        "valid_next_steps": valid_next,
-    }
-    if open_scope_creep:
-        result["warnings"] = [
-            "Scope creep detected: the plan appears to be expanding beyond the original idea or recorded user notes."
-        ]
-
-    if recommendation in ("ESCALATE", "ABORT"):
-        if recommendation == "ABORT":
-            result["suggested_override"] = "abort"
-            result["override_rationale"] = "Budget exceeded. Abort or increase budget."
-        elif all(flag_weight(f) <= 1.0 for f in unresolved):
-            result["suggested_override"] = "force-proceed"
-            result["override_rationale"] = (
-                "Remaining flags are implementation details (pseudocode accuracy, "
-                "schema column names) that the executor will resolve by reading "
-                "the actual code. Safe to proceed."
-            )
-        elif len(weighted_history) >= 1 and weighted_score > weighted_history[-1] * 1.5:
-            result["suggested_override"] = "abort"
-            result["override_rationale"] = "Weighted flag score is increasing — the plan may be fundamentally misaligned."
-        else:
-            result["suggested_override"] = "add-note"
-            result["override_rationale"] = (
-                "Significant flags remain. Add context to help the next iteration, "
-                "or force-proceed if you believe the executor can handle them."
-            )
-
-    return result
 
 
 def handle_evaluate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
