@@ -28,11 +28,14 @@ def make_args_factory(project_dir: Path):
             "project_dir": str(project_dir),
             "max_iterations": 3,
             "budget_usd": 25.0,
+            "auto_approve": False,
+            "robustness": "standard",
             "agent": None,
             "ephemeral": False,
             "fresh": False,
             "persist": False,
             "confirm_destructive": True,
+            "user_approved": False,
             "confirm_self_review": False,
             "override_action": None,
             "note": None,
@@ -90,9 +93,10 @@ def eval_scaffold(
     total_cost_usd: float = 0.0,
     budget_usd: float = 25.0,
     max_iterations: int = 3,
+    robustness: str = "standard",
 ) -> tuple[Path, dict]:
     plan_dir = tmp_path / "plan"
-    plan_dir.mkdir()
+    plan_dir.mkdir(parents=True)
 
     success_criteria = success_criteria if success_criteria is not None else ["criterion"]
     flags = flags if flags is not None else []
@@ -144,6 +148,8 @@ def eval_scaffold(
             "budget_usd": budget_usd,
             "max_iterations": max_iterations,
             "project_dir": str(tmp_path / "project"),
+            "auto_approve": False,
+            "robustness": robustness,
         },
         "plan_versions": [{"version": iteration, "file": f"plan_v{iteration}.md", "hash": "sha256:test", "timestamp": "2026-03-20T00:00:00Z"}],
         "meta": {
@@ -189,6 +195,44 @@ def test_init_creates_state_file(plan_fixture: PlanFixture) -> None:
     assert (plan_fixture.plan_dir / "state.json").exists()
     assert state["current_state"] == megaplan.STATE_INITIALIZED
     assert state["iteration"] == 0
+
+
+def test_init_returns_clarify_as_next_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(
+        megaplan.cli.shutil,
+        "which",
+        lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
+    )
+
+    response = megaplan.handle_init(root, make_args_factory(project_dir)())
+    assert response["next_step"] == "clarify"
+
+
+def test_init_persists_auto_approve_and_robustness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(
+        megaplan.cli.shutil,
+        "which",
+        lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
+    )
+
+    response = megaplan.handle_init(
+        root,
+        make_args_factory(project_dir)(auto_approve=True, robustness="thorough"),
+    )
+    state = load_state(megaplan.plans_root(root) / response["plan"])
+
+    assert response["auto_approve"] is True
+    assert response["robustness"] == "thorough"
+    assert state["config"]["auto_approve"] is True
+    assert state["config"]["robustness"] == "thorough"
 
 
 def test_slugify() -> None:
@@ -252,7 +296,8 @@ def test_compute_recurring_critiques(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("current_state", "last_evaluation", "expected"),
     [
-        (megaplan.STATE_INITIALIZED, {}, ["plan"]),
+        (megaplan.STATE_INITIALIZED, {}, ["clarify"]),
+        (megaplan.STATE_CLARIFIED, {}, ["clarify", "plan"]),
         (megaplan.STATE_PLANNED, {}, ["critique"]),
         (megaplan.STATE_CRITIQUED, {}, ["evaluate"]),
         (megaplan.STATE_GATED, {}, ["execute"]),
@@ -531,7 +576,7 @@ def test_eval_escalate_weighted_score_not_improving(tmp_path: Path) -> None:
     assert evaluation["confidence"] == "medium"
 
 
-def test_eval_continue_weighted_score_improving(tmp_path: Path) -> None:
+def test_eval_skip_low_weight_improving(tmp_path: Path) -> None:
     plan_dir, state = eval_scaffold(
         tmp_path,
         iteration=2,
@@ -539,9 +584,78 @@ def test_eval_continue_weighted_score_improving(tmp_path: Path) -> None:
         weighted_scores=[4.0],
     )
     evaluation = megaplan.build_evaluation(plan_dir, state)
-    # weight 0.5 < 4.0 * 0.9 = 3.6 → improving
+    # weight 0.5 < 2.0 threshold and < 4.0 → "good enough", executor can handle
+    assert evaluation["recommendation"] == "SKIP"
+    assert evaluation["confidence"] == "medium"
+
+
+def test_eval_continue_weighted_score_improving_above_threshold(tmp_path: Path) -> None:
+    plan_dir, state = eval_scaffold(
+        tmp_path,
+        iteration=2,
+        flags=[
+            {"id": "FLAG-001", "status": "open", "severity": "significant", "category": "correctness", "concern": "wrong API endpoint"},
+            {"id": "FLAG-002", "status": "open", "severity": "significant", "category": "completeness", "concern": "missing error handling"},
+        ],
+        weighted_scores=[6.0],
+    )
+    evaluation = megaplan.build_evaluation(plan_dir, state)
+    # weight 2.0 + 1.5 = 3.5 >= 2.0 threshold → still CONTINUE
     assert evaluation["recommendation"] == "CONTINUE"
     assert evaluation["confidence"] == "medium"
+
+
+def test_eval_thresholds_change_with_robustness(tmp_path: Path) -> None:
+    light_plan_dir, light_state = eval_scaffold(
+        tmp_path / "light",
+        iteration=2,
+        flags=[
+            {"id": "FLAG-001", "status": "open", "severity": "significant", "category": "security", "concern": "security risk"},
+        ],
+        weighted_scores=[5.0],
+        robustness="light",
+    )
+    light_evaluation = megaplan.build_evaluation(light_plan_dir, light_state)
+
+    thorough_plan_dir, thorough_state = eval_scaffold(
+        tmp_path / "thorough",
+        iteration=2,
+        flags=[
+            {"id": "FLAG-001", "status": "open", "severity": "significant", "category": "performance", "concern": "slow path"},
+            {"id": "FLAG-002", "status": "open", "severity": "significant", "category": "maintainability", "concern": "duplicate branch"},
+        ],
+        weighted_scores=[3.0],
+        robustness="thorough",
+    )
+    thorough_evaluation = megaplan.build_evaluation(thorough_plan_dir, thorough_state)
+
+    assert light_evaluation["robustness"] == "light"
+    assert light_evaluation["recommendation"] == "SKIP"
+    assert thorough_evaluation["robustness"] == "thorough"
+    assert thorough_evaluation["recommendation"] == "CONTINUE"
+
+
+def test_eval_surfaces_scope_creep_warning(tmp_path: Path) -> None:
+    plan_dir, state = eval_scaffold(
+        tmp_path,
+        iteration=2,
+        flags=[
+            {
+                "id": "FLAG-007",
+                "status": "open",
+                "severity": "significant",
+                "category": "maintainability",
+                "concern": "Scope creep: the plan now adds a broad refactor beyond the original idea",
+                "evidence": "The new steps include unrelated cleanup work.",
+            },
+        ],
+        weighted_scores=[2.0],
+    )
+
+    evaluation = megaplan.build_evaluation(plan_dir, state)
+
+    assert evaluation["signals"]["scope_creep_flags"] == ["FLAG-007"]
+    assert "Scope creep detected" in evaluation["warnings"][0]
 
 
 def test_eval_escalate_max_iterations_with_unresolved(tmp_path: Path) -> None:
@@ -561,6 +675,10 @@ def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
     root = plan_fixture.root
     name = plan_fixture.plan_name
     make_args = plan_fixture.make_args
+
+    clarify_result = megaplan.handle_clarify(root, make_args(plan=name))
+    assert clarify_result["state"] == megaplan.STATE_CLARIFIED
+    assert (plan_fixture.plan_dir / "clarify.json").exists()
 
     plan_result = megaplan.handle_plan(root, make_args(plan=name))
     assert plan_result["state"] == megaplan.STATE_PLANNED
@@ -593,10 +711,10 @@ def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
 
     gate_result = megaplan.handle_gate(root, make_args(plan=name))
     assert gate_result["state"] == megaplan.STATE_GATED
-    assert (plan_fixture.plan_dir / "link.json").exists()
+    assert (plan_fixture.plan_dir / "gate.json").exists()
     assert (plan_fixture.plan_dir / "final.md").exists()
 
-    execute_result = megaplan.handle_execute(root, make_args(plan=name, confirm_destructive=True))
+    execute_result = megaplan.handle_execute(root, make_args(plan=name, confirm_destructive=True, user_approved=True))
     assert execute_result["state"] == megaplan.STATE_EXECUTED
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
 
@@ -611,7 +729,122 @@ def test_require_state_rejects_invalid_transition(plan_fixture: PlanFixture) -> 
         megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
 
     assert exc_info.value.code == "invalid_transition"
-    assert "plan" in exc_info.value.valid_next
+    assert "clarify" in exc_info.value.valid_next
+
+
+def test_clarify_transitions_to_clarified(plan_fixture: PlanFixture) -> None:
+    result = megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    assert result["state"] == megaplan.STATE_CLARIFIED
+    assert (plan_fixture.plan_dir / "clarify.json").exists()
+    assert state["current_state"] == megaplan.STATE_CLARIFIED
+    assert set(state["clarification"]) == {"refined_idea", "intent_summary", "questions"}
+
+
+def test_clarify_requires_initialized(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert exc_info.value.code == "invalid_transition"
+
+
+def test_plan_accepts_both_initialized_and_clarified(plan_fixture: PlanFixture) -> None:
+    initialized_result = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    assert initialized_result["state"] == megaplan.STATE_PLANNED
+
+    second_init = megaplan.handle_init(
+        plan_fixture.root,
+        plan_fixture.make_args(name="clarified-plan", idea="clarified idea"),
+    )
+    second_name = second_init["plan"]
+    megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=second_name, idea="clarified idea"))
+    clarified_result = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=second_name, idea="clarified idea"))
+    assert clarified_result["state"] == megaplan.STATE_PLANNED
+
+
+def test_plan_prompt_includes_refined_idea(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    prompt = megaplan.cli.create_claude_prompt("plan", state, plan_fixture.plan_dir)
+    assert "Refined: test idea" in prompt
+
+
+def test_intent_in_critique_prompt(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    prompt = megaplan.cli.create_codex_prompt("critique", state, plan_fixture.plan_dir)
+    assert "The user wants to test idea." in prompt
+
+
+def test_notes_in_critique_prompt(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_clarify(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="add-note", note="use existing repository patterns"),
+    )
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    prompt = megaplan.cli.create_codex_prompt("critique", state, plan_fixture.plan_dir)
+    assert "use existing repository patterns" in prompt
+
+
+def test_critique_prompt_includes_robustness_guidance(plan_fixture: PlanFixture) -> None:
+    state = load_state(plan_fixture.plan_dir)
+    state["config"]["robustness"] = "thorough"
+    megaplan.cli.save_state(plan_fixture.plan_dir, state)
+
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+    prompt = megaplan.cli.create_codex_prompt("critique", state, plan_fixture.plan_dir)
+
+    assert "Robustness level: thorough." in prompt
+    assert "Be exhaustive." in prompt
+
+
+def test_critique_response_surfaces_scope_creep_warning(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    original_mock = megaplan.cli.mock_worker_output
+
+    def mock_with_scope_creep(step: str, state: dict, plan_dir: Path):
+        if step == "critique":
+            payload = {
+                "flags": [
+                    {
+                        "id": "FLAG-099",
+                        "concern": "Scope creep: the plan adds unrelated cleanup work beyond the original idea",
+                        "category": "maintainability",
+                        "severity_hint": "likely-significant",
+                        "evidence": "A repository-wide refactor was added without user input.",
+                    }
+                ],
+                "verified_flag_ids": [],
+                "disputed_flag_ids": [],
+            }
+            return megaplan.cli.WorkerResult(
+                payload=payload,
+                raw_output=json.dumps(payload),
+                duration_ms=10,
+                cost_usd=0.0,
+                session_id="scope-creep",
+            )
+        return original_mock(step, state, plan_dir)
+
+    monkeypatch.setattr(megaplan.cli, "mock_worker_output", mock_with_scope_creep)
+
+    critique_result = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert critique_result["scope_creep_flags"] == ["FLAG-099"]
+    assert "Scope creep detected" in critique_result["warnings"][0]
 
 
 def test_cannot_execute_before_gate(plan_fixture: PlanFixture) -> None:
@@ -699,7 +932,7 @@ def test_override_force_proceed_success(plan_fixture: PlanFixture) -> None:
     state = load_state(plan_fixture.plan_dir)
     assert result["state"] == megaplan.STATE_GATED
     assert state["current_state"] == megaplan.STATE_GATED
-    assert (plan_fixture.plan_dir / "link.json").exists()
+    assert (plan_fixture.plan_dir / "gate.json").exists()
     assert (plan_fixture.plan_dir / "final.md").exists()
     assert state["meta"]["overrides"][-1]["action"] == "force-proceed"
 
@@ -770,6 +1003,74 @@ def test_execute_requires_confirm_destructive(plan_fixture: PlanFixture) -> None
         )
 
     assert exc_info.value.code == "missing_confirmation"
+
+
+def test_gate_response_surfaces_auto_approve(plan_fixture: PlanFixture) -> None:
+    init_result = megaplan.handle_init(
+        plan_fixture.root,
+        plan_fixture.make_args(name="auto-approve-plan", idea="auto approve idea", auto_approve=True),
+    )
+    name = init_result["plan"]
+
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    megaplan.handle_evaluate(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    megaplan.handle_integrate(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    megaplan.handle_evaluate(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+    gate_result = megaplan.handle_gate(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto approve idea"))
+
+    assert gate_result["auto_approve"] is True
+
+
+def test_execute_requires_user_approval_in_review_mode(plan_fixture: PlanFixture) -> None:
+    advance_to_gated(plan_fixture)
+
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_execute(
+            plan_fixture.root,
+            plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=False),
+        )
+
+    assert exc_info.value.code == "missing_approval"
+
+
+def test_execute_succeeds_with_user_approval_in_review_mode(plan_fixture: PlanFixture) -> None:
+    advance_to_gated(plan_fixture)
+
+    result = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    state = load_state(plan_fixture.plan_dir)
+
+    assert result["state"] == megaplan.STATE_EXECUTED
+    assert result["user_approved_gate"] is True
+    assert state["meta"]["user_approved_gate"] is True
+
+
+def test_execute_succeeds_without_user_approval_in_auto_approve_mode(plan_fixture: PlanFixture) -> None:
+    init_result = megaplan.handle_init(
+        plan_fixture.root,
+        plan_fixture.make_args(name="auto-exec-plan", idea="auto execute idea", auto_approve=True),
+    )
+    name = init_result["plan"]
+
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto execute idea"))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto execute idea"))
+    megaplan.handle_evaluate(plan_fixture.root, plan_fixture.make_args(plan=name, idea="auto execute idea"))
+    megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=name, idea="auto execute idea", override_action="force-proceed", reason="test gate"),
+    )
+
+    result = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=name, idea="auto execute idea", confirm_destructive=True, user_approved=False),
+    )
+
+    assert result["state"] == megaplan.STATE_EXECUTED
+    assert result["auto_approve"] is True
 
 
 def test_flag_weight_security() -> None:
@@ -843,3 +1144,270 @@ def test_eval_no_override_on_continue(tmp_path: Path) -> None:
     evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "CONTINUE"
     assert "suggested_override" not in evaluation
+
+
+# ── Global setup tests ──────────────────────────────────────────────
+
+
+def test_global_setup_creates_files_for_detected_agents(tmp_path: Path) -> None:
+    """Fresh install creates files only for agents whose config dir exists."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    # .cursor not created → should be skipped
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    assert result["success"] is True
+    assert result["mode"] == "global"
+
+    by_agent = {e["agent"]: e for e in result["installed"]}
+    assert not by_agent["claude"]["skipped"]
+    assert not by_agent["codex"]["skipped"]
+    assert by_agent["cursor"]["skipped"]
+    assert by_agent["cursor"]["reason"] == "not installed"
+
+    assert (home / ".claude" / "skills" / "megaplan" / "SKILL.md").exists()
+    assert (home / ".codex" / "skills" / "megaplan" / "SKILL.md").exists()
+    assert not (home / ".cursor" / "rules" / "megaplan.mdc").exists()
+
+
+def test_global_setup_skips_not_installed(tmp_path: Path) -> None:
+    """Agents whose config dir doesn't exist are skipped with reason."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    by_agent = {e["agent"]: e for e in result["installed"]}
+
+    assert by_agent["codex"]["skipped"]
+    assert by_agent["codex"]["reason"] == "not installed"
+    assert by_agent["cursor"]["skipped"]
+    assert by_agent["cursor"]["reason"] == "not installed"
+
+
+def test_global_setup_idempotent(tmp_path: Path) -> None:
+    """Running twice skips all files on the second run."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    (home / ".cursor").mkdir(parents=True)
+
+    first = megaplan.handle_setup_global(force=False, home=home)
+    assert all(not e["skipped"] for e in first["installed"])
+
+    second = megaplan.handle_setup_global(force=False, home=home)
+    assert all(e["skipped"] for e in second["installed"])
+
+
+def test_global_setup_force_overwrites(tmp_path: Path) -> None:
+    """--force overwrites even when content matches."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+
+    megaplan.handle_setup_global(force=False, home=home)
+    result = megaplan.handle_setup_global(force=True, home=home)
+
+    by_agent = {e["agent"]: e for e in result["installed"]}
+    assert not by_agent["claude"]["skipped"]
+    assert by_agent["claude"]["existed"]
+
+
+def test_global_setup_creates_child_directories(tmp_path: Path) -> None:
+    """Subdirectories like skills/megaplan/ are created automatically."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    assert result["success"] is True
+    assert (home / ".claude" / "skills" / "megaplan" / "SKILL.md").is_file()
+
+
+def test_global_setup_zero_agents_detected(tmp_path: Path) -> None:
+    """If no agent dirs exist, returns success=False."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    assert result["success"] is False
+    assert all(e["skipped"] for e in result["installed"])
+
+
+# ── Config I/O tests ─────────────────────────────────────────────────
+
+
+def test_load_config_missing_file(tmp_path: Path) -> None:
+    """load_config returns {} when no config file exists."""
+    home = tmp_path / "home"
+    home.mkdir()
+    assert megaplan.load_config(home) == {}
+
+
+def test_save_and_load_config_roundtrip(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config = {"agents": {"plan": "codex", "critique": "claude"}}
+    megaplan.save_config(config, home)
+    loaded = megaplan.load_config(home)
+    assert loaded == config
+
+
+def test_load_config_corrupt_json(tmp_path: Path) -> None:
+    """load_config returns {} when config.json is corrupt."""
+    home = tmp_path / "home"
+    config_path = home / ".config" / "megaplan" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("not valid json{{{", encoding="utf-8")
+    assert megaplan.load_config(home) == {}
+
+
+def test_config_dir_respects_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert megaplan.config_dir() == xdg / "megaplan"
+
+
+# ── Agent resolution tests ───────────────────────────────────────────
+
+
+def test_resolve_agent_cli_flag_overrides_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--agent codex for plan step overrides config and defaults."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: "/usr/bin/mock" if name == "codex" else None)
+    config = {"agents": {"plan": "claude"}}
+    megaplan.save_config(config, home)
+    args = Namespace(agent="codex", ephemeral=False, fresh=False, persist=False, confirm_self_review=False)
+    agent, _mode, _refreshed = megaplan.cli.resolve_agent_mode("plan", args, home=home)
+    assert agent == "codex"
+
+
+def test_resolve_agent_config_overrides_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Config says plan=codex, no CLI flag → uses codex."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None)
+    config = {"agents": {"plan": "codex"}}
+    megaplan.save_config(config, home)
+    args = Namespace(agent=None, ephemeral=False, fresh=False, persist=False, confirm_self_review=False)
+    agent, _mode, _refreshed = megaplan.cli.resolve_agent_mode("plan", args, home=home)
+    assert agent == "codex"
+
+
+def test_resolve_agent_fallback_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When default agent is missing, falls back to available one."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: "/usr/bin/mock" if name == "claude" else None)
+    args = Namespace(agent=None, ephemeral=False, fresh=False, persist=False, confirm_self_review=False)
+    agent, _mode, _refreshed = megaplan.cli.resolve_agent_mode("critique", args, home=home)
+    assert agent == "claude"
+    assert args._agent_fallback["requested"] == "codex"
+    assert args._agent_fallback["resolved"] == "claude"
+
+
+def test_resolve_agent_explicit_missing_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--agent codex but codex not on PATH → CliError."""
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: None)
+    args = Namespace(agent="codex", ephemeral=False, fresh=False, persist=False, confirm_self_review=False)
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.cli.resolve_agent_mode("plan", args)
+    assert exc_info.value.code == "agent_not_found"
+
+
+def test_resolve_agent_no_agents_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing on PATH → CliError."""
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: None)
+    args = Namespace(agent=None, ephemeral=False, fresh=False, persist=False, confirm_self_review=False)
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.cli.resolve_agent_mode("plan", args)
+    assert exc_info.value.code == "agent_not_found"
+    assert "No supported agents" in exc_info.value.message
+
+
+# ── Setup global config writing tests ────────────────────────────────
+
+
+def test_setup_global_writes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """After handle_setup_global, config.json exists with correct routing."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None)
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    assert "config_path" in result
+    assert "routing" in result
+    config = megaplan.load_config(home)
+    assert config["agents"]["plan"] == "claude"
+    assert config["agents"]["critique"] == "codex"
+    assert config["agents"]["execute"] == "codex"
+
+
+def test_setup_global_only_claude_routes_all_to_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only claude available → all steps route to claude."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr(megaplan.cli.shutil, "which", lambda name: "/usr/bin/mock" if name == "claude" else None)
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+    config = megaplan.load_config(home)
+    assert all(agent == "claude" for agent in config["agents"].values())
+    assert result["routing"] == config["agents"]
+
+
+# ── Config subcommand tests ──────────────────────────────────────────
+
+
+def test_config_show_returns_effective_routing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    config = {"agents": {"plan": "codex"}}
+    megaplan.save_config(config)
+    args = Namespace(config_action="show")
+    result = megaplan.handle_config(args)
+    assert result["routing"]["plan"] == "codex"
+    assert result["routing"]["critique"] == "codex"  # not in config, falls back to DEFAULT_AGENT_ROUTING
+
+
+def test_config_set_persists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    args = Namespace(config_action="set", key="agents.plan", value="codex")
+    result = megaplan.handle_config(args)
+    assert result["success"] is True
+    config = megaplan.load_config()
+    assert config["agents"]["plan"] == "codex"
+
+
+def test_config_set_invalid_key_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    args = Namespace(config_action="set", key="agents.bogus", value="claude")
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.handle_config(args)
+    assert exc_info.value.code == "invalid_args"
+
+
+def test_config_reset_removes_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    megaplan.save_config({"agents": {"plan": "codex"}})
+    config_file = megaplan.config_dir() / "config.json"
+    assert config_file.exists()
+    args = Namespace(config_action="reset")
+    result = megaplan.handle_config(args)
+    assert result["success"] is True
+    assert not config_file.exists()
+
+
+# ── Safety net test ──────────────────────────────────────────────────
+
+
+def test_run_command_missing_binary_raises_cli_error(tmp_path: Path) -> None:
+    """run_command with a nonexistent binary raises CliError, not FileNotFoundError."""
+    with pytest.raises(megaplan.CliError) as exc_info:
+        megaplan.cli.run_command(
+            ["nonexistent-binary-xyz", "--help"],
+            cwd=tmp_path,
+        )
+    assert exc_info.value.code == "agent_not_found"

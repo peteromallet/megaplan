@@ -156,6 +156,10 @@ def load_config(home: Path | None = None) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
+        # Intentionally return empty dict on corrupt config: the config file is
+        # non-critical (only agent routing prefs), and callers fall back to
+        # defaults.  A warning here would clutter every CLI invocation when the
+        # user can simply run `megaplan config reset` to fix it.
         return {}
     if not isinstance(data, dict):
         return {}
@@ -468,7 +472,8 @@ def error_response(error: CliError) -> int:
     }
     if error.valid_next:
         payload["valid_next"] = error.valid_next
-    payload.update(error.extra)
+    if error.extra:
+        payload["details"] = error.extra
     return render_response(payload, exit_code=error.exit_code)
 
 
@@ -621,7 +626,7 @@ def require_state(state: dict[str, Any], step: str, allowed: set[str]) -> None:
         )
 
 
-def ensure_command(name: str) -> str | None:
+def find_command(name: str) -> str | None:
     return shutil.which(name)
 
 
@@ -919,7 +924,7 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
 
     if step == "review":
         execution = read_json(plan_dir / "execution.json")
-        gate = read_json(plan_dir / "link.json")
+        gate = read_json(plan_dir / "gate.json")
         diff_summary = collect_git_diff_summary(project_dir)
         return textwrap.dedent(
             f"""
@@ -1013,7 +1018,7 @@ def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str
         ).strip()
 
     if step == "execute":
-        gate = read_json(plan_dir / "link.json")
+        gate = read_json(plan_dir / "gate.json")
         if state.get("config", {}).get("auto_approve"):
             approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
         elif state.get("meta", {}).get("user_approved_gate"):
@@ -1581,8 +1586,8 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             cost_usd=0.0,
             result="success",
             environment={
-                "claude": bool(ensure_command("claude")),
-                "codex": bool(ensure_command("codex")),
+                "claude": bool(find_command("claude")),
+                "codex": bool(find_command("codex")),
             },
         ),
     )
@@ -2011,8 +2016,8 @@ def run_gate_checks(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
         "project_dir_exists": project_dir.exists(),
         "project_dir_writable": os.access(project_dir, os.W_OK),
         "success_criteria_present": bool(meta.get("success_criteria")),
-        "claude_available": bool(ensure_command("claude")),
-        "codex_available": bool(ensure_command("codex")),
+        "claude_available": bool(find_command("claude")),
+        "codex_available": bool(find_command("codex")),
     }
     passed = all(checks.values()) and not unresolved
     return {
@@ -2034,7 +2039,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             valid_next=infer_next_steps(state),
         )
     gate = run_gate_checks(plan_dir, state)
-    atomic_write_json(plan_dir / "link.json", gate)
+    atomic_write_json(plan_dir / "gate.json", gate)
     if not gate["passed"]:
         append_history(
             state,
@@ -2043,8 +2048,8 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
                 duration_ms=0,
                 cost_usd=0.0,
                 result="blocked",
-                output_file="link.json",
-                artifact_hash=sha256_file(plan_dir / "link.json"),
+                output_file="gate.json",
+                artifact_hash=sha256_file(plan_dir / "gate.json"),
             ),
         )
         save_state(plan_dir, state)
@@ -2052,7 +2057,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             "success": False,
             "step": "gate",
             "summary": "Gate blocked: unresolved flags or failed preflight checks remain.",
-            "artifacts": ["link.json"],
+            "artifacts": ["gate.json"],
             "next_step": "integrate" if recommendation == "CONTINUE" else "override force-proceed",
             "state": state["current_state"],
             "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
@@ -2070,8 +2075,8 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             duration_ms=0,
             cost_usd=0.0,
             result="success",
-            output_file="link.json",
-            artifact_hash=sha256_file(plan_dir / "link.json"),
+            output_file="gate.json",
+            artifact_hash=sha256_file(plan_dir / "gate.json"),
         ),
     )
     save_state(plan_dir, state)
@@ -2079,7 +2084,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "success": True,
         "step": "gate",
         "summary": "Gate passed. Plan is ready for execution.",
-        "artifacts": ["link.json", "final.md"],
+        "artifacts": ["gate.json", "final.md"],
         "next_step": "execute",
         "state": STATE_GATED,
         "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
@@ -2112,6 +2117,12 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
     state["current_state"] = STATE_EXECUTED
     persist_session(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    if auto_approve:
+        approval_mode = "auto_approve"
+    elif state.get("meta", {}).get("user_approved_gate", False):
+        approval_mode = "user_approved"
+    else:
+        approval_mode = "manual"
     append_history(
         state,
         make_history_entry(
@@ -2124,6 +2135,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             mode=mode,
             output_file="execution.json",
             artifact_hash=sha256_file(plan_dir / "execution.json"),
+            approval_mode=approval_mode,
         ),
     )
     save_state(plan_dir, state)
@@ -2273,7 +2285,7 @@ def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             gate = run_gate_checks(plan_dir, state)
             if not gate["preflight_results"]["project_dir_exists"] or not gate["preflight_results"]["success_criteria_present"]:
                 raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
-            atomic_write_json(plan_dir / "link.json", gate)
+            atomic_write_json(plan_dir / "gate.json", gate)
             final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
             atomic_write_text(plan_dir / "final.md", final_plan)
             state["current_state"] = STATE_GATED
@@ -2431,9 +2443,9 @@ def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
                 "summary": f"AGENTS.md already contains megaplan instructions at {target}",
                 "skipped": True,
             }
-        # Append to existing AGENTS.md
-        with open(target, "a", encoding="utf-8") as f:
-            f.write("\n\n" + content)
+        # Append to existing AGENTS.md (atomic: read-concat-write)
+        combined = existing + "\n\n" + content
+        atomic_write_text(target, combined)
         return {
             "success": True,
             "step": "setup",
