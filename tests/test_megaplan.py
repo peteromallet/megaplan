@@ -320,8 +320,8 @@ def test_infer_next_steps_non_evaluated_states(current_state: str, last_evaluati
     [
         ("CONTINUE", ["integrate", "gate"]),
         ("SKIP", ["gate"]),
-        ("ESCALATE", ["override add-note", "override force-proceed", "override abort"]),
-        ("ABORT", ["override add-note", "override force-proceed", "override abort"]),
+        ("ESCALATE", ["override test-both", "override add-note", "override force-proceed", "override abort"]),
+        ("ABORT", ["override test-both", "override add-note", "override force-proceed", "override abort"]),
         (None, ["override add-note", "override abort"]),
     ],
 )

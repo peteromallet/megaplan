@@ -94,7 +94,7 @@ class TestStrictSchema:
 
 class TestSCHEMAS:
     def test_schemas_contains_expected_keys(self) -> None:
-        expected = {"clarify.json", "plan.json", "integrate.json", "critique.json", "execution.json", "review.json"}
+        expected = {"clarify.json", "plan.json", "integrate.json", "critique.json", "execution.json", "review.json", "test-both.json"}
         assert expected == set(SCHEMAS.keys())
 
     def test_all_schemas_are_objects(self) -> None:

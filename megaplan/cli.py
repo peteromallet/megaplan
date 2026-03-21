@@ -226,7 +226,7 @@ def infer_next_steps(state: PlanState) -> list[str]:
         if recommendation in {"SKIP", "CONTINUE"}:
             valid.append("gate")
         if recommendation in {"ESCALATE", "ABORT"}:
-            valid.extend(["override add-note", "override force-proceed", "override abort"])
+            valid.extend(["override test-both", "override add-note", "override force-proceed", "override abort"])
         return valid or ["override add-note", "override abort"]
     if current == STATE_GATED:
         return ["execute"]
@@ -1008,11 +1008,92 @@ def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -
     }
 
 
+def _override_test_both(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+    if state["current_state"] != STATE_EVALUATED:
+        raise CliError(
+            "invalid_transition",
+            "test-both is only supported from evaluated state",
+            valid_next=infer_next_steps(state),
+        )
+    recommendation = state["last_evaluation"].get("recommendation")
+    if recommendation not in {"ESCALATE", "ABORT"}:
+        raise CliError(
+            "invalid_transition",
+            f"test-both requires an ESCALATE or ABORT evaluation, got {recommendation!r}",
+            valid_next=infer_next_steps(state),
+        )
+    root = args._test_both_root if hasattr(args, "_test_both_root") else Path.cwd()
+    try:
+        worker, agent, mode, refreshed = run_step_with_worker("test-both", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="test-both", iteration=state["iteration"], error=error)
+        raise
+    test_both_filename = "test-both.json"
+    atomic_write_json(plan_dir / test_both_filename, worker.payload)
+    verdict = worker.payload["verdict"]
+    rationale = worker.payload["verdict_rationale"]
+    apply_session_update(state, "test-both", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    append_history(
+        state,
+        make_history_entry(
+            "test-both",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=test_both_filename,
+            artifact_hash=sha256_file(plan_dir / test_both_filename),
+            recommendation=verdict,
+        ),
+    )
+    if verdict == "approach_a":
+        # Current plan wins — proceed to gate
+        gate = run_gate_checks(plan_dir, state)
+        atomic_write_json(plan_dir / "gate.json", gate)
+        if gate["passed"]:
+            final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+            atomic_write_text(plan_dir / "final.md", final_plan)
+            state["current_state"] = STATE_GATED
+        next_step = "execute" if gate["passed"] else "integrate"
+    elif verdict == "approach_b":
+        # Alternative wins — need to integrate the alternative into the plan
+        next_step = "integrate"
+    else:
+        # Synthesis — need to integrate the synthesis
+        next_step = "integrate"
+    evaluation = copy.deepcopy(state["last_evaluation"])
+    evaluation["recommendation"] = "SKIP" if verdict == "approach_a" else "CONTINUE"
+    state["last_evaluation"] = evaluation
+    _append_to_meta(state, "overrides", {
+        "action": "test-both",
+        "timestamp": now_utc(),
+        "verdict": verdict,
+        "rationale": rationale,
+        "reason": args.reason,
+    })
+    save_state(plan_dir, state)
+    response: StepResponse = {
+        "success": True,
+        "step": "override",
+        "summary": f"Test-both complete. Verdict: {verdict}. {rationale}",
+        "artifacts": [test_both_filename],
+        "next_step": next_step,
+        "state": state["current_state"],
+    }
+    if verdict == "synthesis" and worker.payload.get("synthesis_description"):
+        response["message"] = worker.payload["synthesis_description"]
+    attach_agent_fallback(response, args)
+    return response
+
+
 _OVERRIDE_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], StepResponse]] = {
     "add-note": _override_add_note,
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
     "skip": _override_skip,
+    "test-both": _override_test_both,
 }
 
 
@@ -1292,7 +1373,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("reset")
 
     override_parser = subparsers.add_parser("override")
-    override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note"])
+    override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note", "test-both"])
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")

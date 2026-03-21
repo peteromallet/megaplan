@@ -112,6 +112,40 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["criteria", "issues"],
     },
+    "test-both.json": {
+        "type": "object",
+        "properties": {
+            "approach_a": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "build_pass": {"type": "boolean"},
+                    "test_pass": {"type": "boolean"},
+                    "issues": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["label", "build_pass", "test_pass", "issues", "evidence"],
+            },
+            "approach_b": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "build_pass": {"type": "boolean"},
+                    "test_pass": {"type": "boolean"},
+                    "issues": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["label", "build_pass", "test_pass", "issues", "evidence"],
+            },
+            "verdict": {
+                "type": "string",
+                "enum": ["approach_a", "approach_b", "synthesis"],
+            },
+            "verdict_rationale": {"type": "string"},
+            "synthesis_description": {"type": "string"},
+        },
+        "required": ["approach_a", "approach_b", "verdict", "verdict_rationale"],
+    },
 }
 
 
