@@ -1,13 +1,8 @@
----
-name: megaplan
-description: AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans.
----
-
 # Megaplan
 
-Use this skill when the user wants to run an idea through the megaplan harness — a structured clarify → plan → critique → evaluate loop between AI agents with auditable artifacts and gated execution.
+Use megaplan when the user wants to run an idea through a structured clarify, plan, critique, evaluate loop between AI agents with auditable artifacts and gated execution.
 
-You must route every workflow step through `megaplan`. Do not call `claude` or `codex` directly for the workflow itself, because that bypasses enforcement and audit logging.
+Route every workflow step through the `megaplan` CLI. Do not call agents directly — that bypasses enforcement and audit logging.
 
 ## Triage
 
@@ -96,8 +91,7 @@ The orchestrator may make small clarifications or corrections to the megaplan te
 
 ## Session Defaults
 
-Both agents default to **persistent** sessions. The Codex critic carries context
-across iterations so it can verify its own prior feedback was addressed.
+Both agents default to **persistent** sessions. The Codex critic carries context across iterations so it can verify its own prior feedback was addressed.
 
 Override flags (mutually exclusive):
 - `--fresh` — start a new persistent session (break continuity)

@@ -1025,14 +1025,41 @@ def handle_override(root: Path, args: argparse.Namespace) -> StepResponse:
     return handler(plan_dir, state, args)
 
 
+def _canonical_instructions() -> str:
+    """Return the single canonical instructions file."""
+    return resources.files("megaplan").joinpath("data", "instructions.md").read_text(encoding="utf-8")
+
+
+_SKILL_HEADER = """\
+---
+name: megaplan
+description: AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans.
+---
+
+"""
+
+_CURSOR_HEADER = """\
+---
+description: Use megaplan for high-rigor planning on complex, high-risk, or multi-stage tasks.
+alwaysApply: false
+---
+
+"""
+
+
 def bundled_agents_md() -> str:
-    """Return the contents of the bundled AGENTS.md file."""
-    return resources.files("megaplan").joinpath("data", "AGENTS.md").read_text(encoding="utf-8")
+    """Return instructions formatted as AGENTS.md (plain markdown)."""
+    return _canonical_instructions()
 
 
 def bundled_global_file(name: str) -> str:
-    """Return the contents of a bundled global config file."""
-    return resources.files("megaplan").joinpath("data", "global", name).read_text(encoding="utf-8")
+    """Return instructions formatted for a specific agent target."""
+    content = _canonical_instructions()
+    if name == "skill.md":
+        return _SKILL_HEADER + content
+    if name == "cursor_rule.mdc":
+        return _CURSOR_HEADER + content
+    return content
 
 
 GLOBAL_TARGETS = [
