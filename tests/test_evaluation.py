@@ -1,6 +1,11 @@
 """Direct tests for megaplan.evaluation module."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+
 from megaplan.evaluation import (
     build_evaluation,
     flag_weight,
@@ -16,6 +21,83 @@ from megaplan.evaluation import (
     _is_max_iterations_with_unresolved,
     compute_plan_delta_percent,
 )
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _eval_scaffold(
+    tmp_path: Path,
+    *,
+    iteration: int = 1,
+    flags: list[dict] | None = None,
+    weighted_scores: list[float] | None = None,
+    total_cost_usd: float = 0.0,
+    budget_usd: float = 25.0,
+    max_iterations: int = 3,
+    robustness: str = "standard",
+) -> tuple[Path, dict]:
+    """Set up filesystem state for build_evaluation."""
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True)
+    flags = flags if flags is not None else []
+    weighted_scores = weighted_scores if weighted_scores is not None else []
+
+    plan_text = "Current plan text with substantial changes for a healthy delta.\n"
+    (plan_dir / f"plan_v{iteration}.md").write_text(plan_text, encoding="utf-8")
+    _write_json(
+        plan_dir / f"plan_v{iteration}.meta.json",
+        {
+            "version": iteration,
+            "timestamp": "2026-03-20T00:00:00Z",
+            "hash": "sha256:test",
+            "success_criteria": ["criterion"],
+            "questions": [],
+            "assumptions": [],
+        },
+    )
+    _write_json(
+        plan_dir / f"critique_v{iteration}.json",
+        {"flags": [], "verified_flag_ids": [], "disputed_flag_ids": []},
+    )
+    _write_json(plan_dir / "faults.json", {"flags": flags})
+
+    state = {
+        "name": "test-plan",
+        "idea": "test idea",
+        "current_state": "critiqued",
+        "iteration": iteration,
+        "config": {
+            "budget_usd": budget_usd,
+            "max_iterations": max_iterations,
+            "project_dir": str(tmp_path / "project"),
+            "auto_approve": False,
+            "robustness": robustness,
+        },
+        "plan_versions": [
+            {
+                "version": iteration,
+                "file": f"plan_v{iteration}.md",
+                "hash": "sha256:test",
+                "timestamp": "2026-03-20T00:00:00Z",
+            },
+        ],
+        "meta": {
+            "significant_counts": [],
+            "weighted_scores": weighted_scores,
+            "total_cost_usd": total_cost_usd,
+            "plan_deltas": [],
+            "recurring_critiques": [],
+            "overrides": [],
+            "notes": [],
+        },
+        "history": [],
+        "sessions": {},
+        "last_evaluation": {},
+    }
+    return plan_dir, state
 
 
 class TestFlagWeight:
@@ -59,11 +141,79 @@ class TestFlagWeight:
         assert flag_weight({}) == 1.0
 
 
-class TestBuildEvaluation:
-    """build_evaluation requires filesystem state; just verify it is importable and callable."""
+class TestBuildEvaluationIntegration:
+    """Integration tests for build_evaluation with filesystem state."""
 
-    def test_is_callable(self) -> None:
-        assert callable(build_evaluation)
+    def test_first_iteration_with_flags_returns_continue(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(
+            tmp_path,
+            flags=[
+                {
+                    "id": "FLAG-001",
+                    "concern": "Missing error handling",
+                    "category": "correctness",
+                    "severity_hint": "likely-significant",
+                    "evidence": "no try/except",
+                    "status": "open",
+                    "severity": "significant",
+                    "verified": False,
+                    "raised_in": "critique_v1.json",
+                },
+            ],
+        )
+        result = build_evaluation(plan_dir, state)
+        assert result["recommendation"] == "CONTINUE"
+        assert result["confidence"] == "high"
+        assert "signals" in result
+        assert "rationale" in result
+        assert "valid_next_steps" in result
+        assert result["signals"]["iteration"] == 1
+        assert result["signals"]["significant_flags"] == 1
+
+    def test_no_flags_returns_skip(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(tmp_path, flags=[])
+        result = build_evaluation(plan_dir, state)
+        assert result["recommendation"] == "SKIP"
+        assert result["valid_next_steps"] == ["gate"]
+
+    def test_over_budget_returns_abort(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(
+            tmp_path, total_cost_usd=30.0, budget_usd=25.0,
+        )
+        result = build_evaluation(plan_dir, state)
+        assert result["recommendation"] == "ABORT"
+
+    def test_robustness_affects_result(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(tmp_path, robustness="thorough")
+        result = build_evaluation(plan_dir, state)
+        assert result["robustness"] == "thorough"
+
+    def test_result_contains_required_keys(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(tmp_path)
+        result = build_evaluation(plan_dir, state)
+        required_keys = {"recommendation", "confidence", "robustness", "signals", "rationale", "valid_next_steps"}
+        assert required_keys.issubset(result.keys())
+
+    def test_scope_creep_flags_produce_warning(self, tmp_path: Path) -> None:
+        plan_dir, state = _eval_scaffold(
+            tmp_path,
+            flags=[
+                {
+                    "id": "FLAG-001",
+                    "concern": "Scope creep: plan expands beyond the original idea",
+                    "category": "other",
+                    "severity_hint": "likely-significant",
+                    "evidence": "expanded scope",
+                    "status": "open",
+                    "severity": "significant",
+                    "verified": False,
+                    "raised_in": "critique_v1.json",
+                },
+            ],
+        )
+        result = build_evaluation(plan_dir, state)
+        assert "warnings" in result
+        assert any("scope creep" in w.lower() for w in result["warnings"])
 
 
 # ---------------------------------------------------------------------------

@@ -1841,3 +1841,60 @@ class TestAgentNotFoundDuringStep:
         saved = read_json(pf.plan_dir / "state.json")
         error_entries = [e for e in saved["history"] if e.get("result") == "error"]
         assert len(error_entries) >= 1
+
+
+# ---------------------------------------------------------------------------
+# main() and CLI entry point tests
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    """Direct tests for main() CLI argument parsing and dispatch."""
+
+    def test_main_init_produces_json_output(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.setattr(
+            megaplan.cli.shutil,
+            "which",
+            lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
+        )
+        monkeypatch.chdir(tmp_path)
+        exit_code = megaplan.main(["init", "--project-dir", str(project_dir), "test idea"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["success"] is True
+        assert output["step"] == "init"
+
+    def test_main_list_returns_empty_plans(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        monkeypatch.chdir(tmp_path)
+        exit_code = megaplan.main(["list"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["success"] is True
+        assert output["plans"] == []
+
+    def test_main_invalid_command_returns_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            megaplan.main(["nonexistent_command"])
+
+    def test_main_setup_local(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        monkeypatch.chdir(tmp_path)
+        exit_code = megaplan.main(["setup", "--local"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["success"] is True
+        assert (tmp_path / "AGENTS.md").exists()
+
+    def test_main_config_show(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        monkeypatch.chdir(tmp_path)
+        exit_code = megaplan.main(["config", "show"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["success"] is True
+        assert "routing" in output

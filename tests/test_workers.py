@@ -12,11 +12,13 @@ import pytest
 from megaplan._core import CliError
 from megaplan.workers import (
     parse_claude_envelope,
+    parse_json_file,
     validate_payload,
     resolve_agent_mode,
     run_command,
     update_session_state,
     session_key_for,
+    extract_session_id,
 )
 
 
@@ -241,3 +243,64 @@ class TestUpdateSessionState:
         assert session_key_for("critique", "codex") == "codex_critic"
         assert session_key_for("execute", "claude") == "claude_executor"
         assert session_key_for("review", "codex") == "codex_reviewer"
+
+
+# ---------------------------------------------------------------------------
+# parse_json_file tests
+# ---------------------------------------------------------------------------
+
+class TestParseJsonFile:
+    def test_valid_json_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "output.json"
+        path.write_text(json.dumps({"plan": "hello"}), encoding="utf-8")
+        result = parse_json_file(path)
+        assert result == {"plan": "hello"}
+
+    def test_invalid_json_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.json"
+        path.write_text("not valid json {{{", encoding="utf-8")
+        with pytest.raises(CliError) as exc_info:
+            parse_json_file(path)
+        assert exc_info.value.code == "parse_error"
+        assert "not valid JSON" in exc_info.value.message
+
+    def test_missing_file_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "nonexistent.json"
+        with pytest.raises(CliError) as exc_info:
+            parse_json_file(path)
+        assert exc_info.value.code == "parse_error"
+        assert "not created" in exc_info.value.message
+
+    def test_non_object_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "array.json"
+        path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        with pytest.raises(CliError) as exc_info:
+            parse_json_file(path)
+        assert exc_info.value.code == "parse_error"
+        assert "not contain a JSON object" in exc_info.value.message
+
+    def test_empty_object_returns_dict(self, tmp_path: Path) -> None:
+        path = tmp_path / "empty.json"
+        path.write_text("{}", encoding="utf-8")
+        result = parse_json_file(path)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# extract_session_id tests
+# ---------------------------------------------------------------------------
+
+class TestExtractSessionId:
+    def test_jsonl_thread_id(self) -> None:
+        raw = '{"type":"thread.started","thread_id":"abc-123-def"}\n'
+        assert extract_session_id(raw) == "abc-123-def"
+
+    def test_text_pattern(self) -> None:
+        raw = "Session started\nsession_id: abcd1234-5678-90ef\n"
+        assert extract_session_id(raw) == "abcd1234-5678-90ef"
+
+    def test_no_match_returns_none(self) -> None:
+        assert extract_session_id("no session here") is None
+
+    def test_empty_returns_none(self) -> None:
+        assert extract_session_id("") is None

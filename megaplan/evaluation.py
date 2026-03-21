@@ -9,6 +9,7 @@ from typing import Any
 from megaplan._core import (
     PlanState,
     FlagRecord,
+    EvaluationResult,
     current_iteration_artifact,
     read_json,
     normalize_text,
@@ -141,7 +142,7 @@ def _is_score_improving(
 
 
 def _is_max_iterations_with_unresolved(
-    iteration: int, state: dict[str, Any], unresolved: list[Any], **_: Any,
+    iteration: int, state: PlanState, unresolved: list[Any], **_: Any,
 ) -> bool:
     """Reached max iterations with unresolved significant risks."""
     return iteration >= int(state["config"].get("max_iterations", 3)) and bool(unresolved)
@@ -211,7 +212,7 @@ _EVALUATION_DECISION_TABLE: list[
 ]
 
 
-def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
+def build_evaluation(plan_dir: Path, state: PlanState) -> EvaluationResult:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
@@ -219,7 +220,7 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     skip_threshold = ROBUSTNESS_SKIP_THRESHOLDS.get(robustness, 2.0)
     stagnation_factor = ROBUSTNESS_STAGNATION_FACTORS.get(robustness, 0.9)
     open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
-    significant_count = len([flag for flag in flag_registry.get("flags", []) if flag.get("severity") == "significant" and flag.get("status") != "verified"])
+    significant_count = len([flag for flag in flag_registry["flags"] if flag.get("severity") == "significant" and flag.get("status") != "verified"])
     weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
     weighted_history = state["meta"].get("weighted_scores", [])
     latest_plan_text = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
@@ -254,7 +255,7 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
 
     valid_next = ["integrate"] if recommendation == "CONTINUE" else ["gate"] if recommendation == "SKIP" else ["override add-note", "override force-proceed", "override abort"]
 
-    result: dict[str, Any] = {
+    result: EvaluationResult = {
         "recommendation": recommendation,
         "confidence": confidence,
         "robustness": robustness,

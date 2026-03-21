@@ -164,7 +164,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
             "status": flag.get("status"),
             "severity": flag.get("severity"),
         }
-        for flag in flag_registry.get("flags", [])
+        for flag in flag_registry["flags"]
         if flag.get("status") in {"addressed", "open", "disputed"}
     ]
     return textwrap.dedent(

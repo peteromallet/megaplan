@@ -126,6 +126,19 @@ class FlagRegistry(TypedDict):
     flags: list[FlagRecord]
 
 
+class EvaluationResult(TypedDict, total=False):
+    """Typed result from build_evaluation()."""
+    recommendation: str
+    confidence: str
+    robustness: str
+    signals: dict[str, Any]
+    rationale: str
+    valid_next_steps: list[str]
+    warnings: list[str]
+    suggested_override: str
+    override_rationale: str
+
+
 class StepResponse(TypedDict, total=False):
     """Typed response dict returned by all handler functions."""
     success: bool
@@ -308,9 +321,9 @@ def load_config(home: Path | None = None) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
         import sys
-        print(f"megaplan: warning: ignoring malformed config at {path}", file=sys.stderr)
+        print(f"megaplan: warning: ignoring malformed config at {path}: {exc}", file=sys.stderr)
         return {}
     if not isinstance(data, dict):
         return {}
@@ -448,7 +461,7 @@ def save_flag_registry(plan_dir: Path, registry: FlagRegistry) -> None:
 def unresolved_significant_flags(flag_registry: FlagRegistry) -> list[FlagRecord]:
     return [
         flag
-        for flag in flag_registry.get("flags", [])
+        for flag in flag_registry["flags"]
         if flag.get("severity") == "significant" and flag.get("status") in FLAG_BLOCKING_STATUSES
     ]
 
@@ -464,7 +477,7 @@ def scope_creep_flags(
     statuses: set[str] | None = None,
 ) -> list[FlagRecord]:
     matches = []
-    for flag in flag_registry.get("flags", []):
+    for flag in flag_registry["flags"]:
         if statuses is not None and flag.get("status") not in statuses:
             continue
         if is_scope_creep_flag(flag):

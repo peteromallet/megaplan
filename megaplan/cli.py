@@ -12,36 +12,32 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
 
-# Import shared utilities from _core — these were previously defined here.
-from megaplan._core import (  # noqa: F401
+# Import shared utilities from _core used by cli.py handlers.
+from megaplan._core import (
     PlanState, PlanConfig, PlanMeta, FlagRecord, FlagRegistry,
-    SessionInfo, PlanVersionRecord, HistoryEntry, StepResponse,
+    HistoryEntry, StepResponse,
     STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED, STATE_EVALUATED,
     STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
-    TERMINAL_STATES, FLAG_BLOCKING_STATUSES, MOCK_ENV_VAR,
+    TERMINAL_STATES, FLAG_BLOCKING_STATUSES,
     DEFAULT_AGENT_ROUTING, KNOWN_AGENTS,
-    ROBUSTNESS_LEVELS, SCOPE_CREEP_TERMS,
+    ROBUSTNESS_LEVELS,
     CliError,
-    now_utc, slugify, json_dump, normalize_text,
+    now_utc, slugify, json_dump,
     sha256_text, sha256_file,
     atomic_write_text, atomic_write_json, read_json,
     config_dir, load_config, save_config, detect_available_agents,
-    ensure_runtime_layout, megaplan_root, plans_root, schemas_root,
-    artifact_path, current_iteration_artifact, current_iteration_raw_artifact,
-    active_plan_dirs, resolve_plan_dir, load_plan, save_state,
-    latest_plan_record, latest_plan_path, latest_plan_meta_path,
+    ensure_runtime_layout, plans_root,
+    current_iteration_raw_artifact,
+    active_plan_dirs, load_plan, save_state,
+    latest_plan_path, latest_plan_meta_path,
     load_flag_registry, save_flag_registry,
-    unresolved_significant_flags, is_scope_creep_flag, scope_creep_flags,
-    configured_robustness, robustness_critique_instruction,
-    intent_and_notes_block, collect_git_diff_summary,
-    ROBUSTNESS_SKIP_THRESHOLDS, ROBUSTNESS_STAGNATION_FACTORS,
+    unresolved_significant_flags, scope_creep_flags,
+    configured_robustness,
 )
 
-# Re-export from sub-modules so that everything remains importable from megaplan.cli
-from megaplan.schemas import SCHEMAS, strict_schema  # noqa: F401
+# Re-export from sub-modules for backward compatibility (tests import via megaplan.cli).
 from megaplan.evaluation import (  # noqa: F401
     build_evaluation,
-    flag_weight,
     compute_plan_delta_percent,
     compute_recurring_critiques,
 )
@@ -162,7 +158,15 @@ def make_history_entry(
     worker: "WorkerResult | None" = None,
     agent: str | None = None,
     mode: str | None = None,
-    **extra: Any,
+    output_file: str | None = None,
+    artifact_hash: str | None = None,
+    raw_output_file: str | None = None,
+    message: str | None = None,
+    flags_count: int | None = None,
+    flags_addressed: list[str] | None = None,
+    recommendation: str | None = None,
+    approval_mode: str | None = None,
+    environment: dict[str, bool] | None = None,
 ) -> HistoryEntry:
     """Build a history entry dict with common fields plus step-specific extras."""
     entry: HistoryEntry = {
@@ -176,7 +180,24 @@ def make_history_entry(
         entry["session_mode"] = mode
         entry["session_id"] = worker.session_id
         entry["agent"] = agent
-    entry.update(extra)
+    if output_file is not None:
+        entry["output_file"] = output_file
+    if artifact_hash is not None:
+        entry["artifact_hash"] = artifact_hash
+    if raw_output_file is not None:
+        entry["raw_output_file"] = raw_output_file
+    if message is not None:
+        entry["message"] = message
+    if flags_count is not None:
+        entry["flags_count"] = flags_count
+    if flags_addressed is not None:
+        entry["flags_addressed"] = flags_addressed
+    if recommendation is not None:
+        entry["recommendation"] = recommendation
+    if approval_mode is not None:
+        entry["approval_mode"] = approval_mode
+    if environment is not None:
+        entry["environment"] = environment
     return entry
 
 
@@ -292,7 +313,7 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
 
 def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> FlagRegistry:
     registry = load_flag_registry(plan_dir)
-    for flag in registry.get("flags", []):
+    for flag in registry["flags"]:
         if flag["id"] in flags_addressed:
             flag["status"] = "addressed"
             flag["addressed_in"] = plan_file
@@ -520,7 +541,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     critique_filename = f"critique_v{iteration}.json"
     atomic_write_json(plan_dir / critique_filename, worker.payload)
     registry = update_flags_after_critique(plan_dir, worker.payload, iteration=iteration)
-    significant = len([f for f in registry.get("flags", []) if f.get("severity") == "significant" and f.get("status") in FLAG_BLOCKING_STATUSES])
+    significant = len([f for f in registry["flags"] if f.get("severity") == "significant" and f.get("status") in FLAG_BLOCKING_STATUSES])
     _append_to_meta(state, "significant_counts", significant)
     recurring = compute_recurring_critiques(plan_dir, iteration)
     _append_to_meta(state, "recurring_critiques", recurring)
@@ -552,7 +573,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         "next_step": "evaluate",
         "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
-        "open_flags": [flag["id"] for flag in registry.get("flags", []) if flag.get("status") == "open"],
+        "open_flags": [flag["id"] for flag in registry["flags"] if flag.get("status") == "open"],
         "scope_creep_flags": [flag["id"] for flag in scope_flags_list],
     }
     if scope_flags_list:
