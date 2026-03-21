@@ -249,6 +249,62 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
+def _test_both_prompt(state: PlanState, plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    flag_registry = load_flag_registry(plan_dir)
+    unresolved = unresolved_significant_flags(flag_registry)
+    open_flags = [
+        {
+            "id": flag["id"],
+            "severity": flag.get("severity"),
+            "concern": flag.get("concern"),
+            "evidence": flag.get("evidence"),
+        }
+        for flag in unresolved
+    ]
+    return textwrap.dedent(
+        f"""
+        You are a neutral judge resolving a deadlock between a planner and a critic.
+        The critique loop has stagnated — the same concerns keep recurring despite
+        revisions. Your job is to test both the current plan AND an alternative
+        approach, then rule based on evidence.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Current plan (Approach A):
+        {latest_plan}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Unresolved flags from the critic (the concerns driving the deadlock):
+        {json_dump(open_flags).strip()}
+
+        Requirements:
+        - Inspect the actual repository before judging.
+        - Evaluate Approach A (the current plan) against the unresolved flags.
+          For each flag, determine: does the plan actually have this problem,
+          or is the critic being overly cautious?
+        - Propose Approach B: an alternative that addresses the unresolved flags
+          differently. This could be a modified version of the plan, a simpler
+          approach, or a fundamentally different strategy.
+        - For BOTH approaches, assess:
+          1. Would it build and pass existing tests? (build_pass, test_pass)
+          2. What concrete issues would it cause? (issues)
+          3. What evidence supports your assessment? (evidence)
+        - Render a verdict: approach_a, approach_b, or synthesis.
+        - If synthesis, describe what to take from each approach.
+        - Judge based on correctness and practicality, not elegance.
+        - An approach that would fail to build loses automatically.
+        """
+    ).strip()
+
+
 def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
@@ -332,6 +388,7 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
     "critique": _critique_prompt,
     "execute": _execute_prompt,
     "review": _review_claude_prompt,
+    "test-both": _test_both_prompt,
 }
 
 _CODEX_PROMPT_BUILDERS: dict[str, Any] = {
@@ -341,6 +398,7 @@ _CODEX_PROMPT_BUILDERS: dict[str, Any] = {
     "critique": _critique_prompt,
     "execute": _execute_prompt,
     "review": _review_codex_prompt,
+    "test-both": _test_both_prompt,
 }
 
 

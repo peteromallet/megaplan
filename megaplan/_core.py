@@ -210,6 +210,7 @@ DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "integrate": "claude",
     "execute": "codex",
     "review": "codex",
+    "test-both": "claude",
 }
 KNOWN_AGENTS = ["claude", "codex"]
 ROBUSTNESS_LEVELS = ("light", "standard", "thorough")

@@ -83,6 +83,22 @@ Auto-force-proceed (and tell the user why) when:
 - `suggested_override` is `"force-proceed"`, OR
 - Robustness is `light` and `weighted_score` < 4.0
 
+When the critique loop has stagnated (recurring critiques or score not improving),
+consider using `test-both` to break the deadlock empirically:
+
+```bash
+megaplan override test-both --plan <name> --reason "critique loop stagnated"
+```
+
+This invokes a judge agent that evaluates both the current plan and an alternative
+approach against the unresolved flags, then renders a verdict (approach_a, approach_b,
+or synthesis). The verdict determines the next step:
+- `approach_a` (current plan wins) → proceeds to gate
+- `approach_b` or `synthesis` → proceeds to integrate with the judge's recommendations
+
+Use `test-both` when the same concerns keep recurring across iterations and neither
+force-proceed nor add-note is resolving the impasse.
+
 Otherwise, present the evaluation details and ask the user what to do.
 
 ## Minor Megaplan Edits
@@ -114,5 +130,6 @@ megaplan status --plan <name>
 megaplan audit --plan <name>
 megaplan list
 megaplan override add-note --plan <name> --note "user context"
+megaplan override test-both --plan <name> --reason "critique loop stagnated"
 megaplan override abort --plan <name>
 ```

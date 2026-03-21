@@ -45,6 +45,7 @@ STEP_SCHEMA_FILENAMES: dict[str, str] = {
     "critique": "critique.json",
     "execute": "execution.json",
     "review": "review.json",
+    "test-both": "test-both.json",
 }
 
 # Derive required keys per step from SCHEMAS so they aren't duplicated.
@@ -304,6 +305,29 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
     return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
 
+def _mock_test_both(state: PlanState, plan_dir: Path) -> WorkerResult:
+    payload = {
+        "approach_a": {
+            "label": "Current plan",
+            "build_pass": True,
+            "test_pass": True,
+            "issues": [],
+            "evidence": "The current plan builds and passes existing tests.",
+        },
+        "approach_b": {
+            "label": "Simplified alternative addressing unresolved flags",
+            "build_pass": True,
+            "test_pass": True,
+            "issues": ["Requires minor refactor of existing module structure."],
+            "evidence": "Alternative approach resolves the flagged concerns with a simpler design.",
+        },
+        "verdict": "synthesis",
+        "verdict_rationale": "Both approaches build and pass tests. Approach A is more complete but carries the flagged risks. Approach B addresses the flags but introduces a minor refactor. A synthesis takes the core structure from A with the risk mitigations from B.",
+        "synthesis_description": "Keep the current plan structure but incorporate the critic's suggested safeguards for the flagged concerns.",
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+
+
 _MOCK_DISPATCH: dict[str, Any] = {
     "clarify": _mock_clarify,
     "plan": _mock_plan,
@@ -311,6 +335,7 @@ _MOCK_DISPATCH: dict[str, Any] = {
     "integrate": _mock_integrate,
     "execute": _mock_execute,
     "review": _mock_review,
+    "test-both": _mock_test_both,
 }
 
 
@@ -330,6 +355,8 @@ def session_key_for(step: str, agent: str) -> str:
         return f"{agent}_executor"
     if step == "review":
         return f"{agent}_reviewer"
+    if step == "test-both":
+        return f"{agent}_judge"
     return f"{agent}_{step}"
 
 
