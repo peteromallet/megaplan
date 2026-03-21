@@ -1,33 +1,22 @@
 # Megaplan
 
-An AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans.
+An agent harness for combining Codex and Claude to make robust plans.
 
-Structured plan/critique/execute loop with auditable artifacts, gated behind human approval.
+We combine Claude's high-level genius with GPT's level-headed robustness to create and execute higher quality plans than either of them alone can manage.
 
-## Setup
+## Get started
 
-Send this to your agent:
-
-```
-pip install megaplan && megaplan setup
-```
-
-That's it. Your agent now knows how to use megaplan automatically.
-
-## Usage
-
-Tell your agent to megaplan a task:
+Give this to your agent:
 
 ```
-megaplan this: migrate the database to PostgreSQL
+Please install megaplan and set it up for this project:
+
+pip install megaplan-harness
+megaplan setup
+
+Once you're done, ask me what I need megaplan for.
 ```
 
-Or invoke directly:
+## Code Health
 
-```bash
-megaplan init --project-dir . "migrate the database to PostgreSQL"
-megaplan plan
-megaplan critique
-megaplan evaluate
-# ... follow next_step from each response
-```
+<img src="scorecard.png" width="100%">

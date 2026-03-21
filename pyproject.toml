@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "megaplan"
-version = "0.1.0"
+name = "megaplan-harness"
+version = "0.1.1"
 description = "AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans"
 requires-python = ">=3.11"
 license = "MIT"
