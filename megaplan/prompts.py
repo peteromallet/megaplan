@@ -186,6 +186,11 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         {json_dump(unresolved).strip()}
 
         Requirements:
+        - Consider whether the plan is at the right level of abstraction. If it
+          patches multiple systems for one goal, it may be too low — flag whether
+          a simpler design would eliminate the problem class. If it redesigns
+          architecture for a simple bug, it may be too high. Push the plan up or
+          down the abstraction ladder as needed.
         - Reuse existing flag IDs when the same concern is still open.
         - verified_flag_ids should list previously addressed flags that now appear resolved.
         - Focus on concrete issues that would cause real problems.

@@ -67,7 +67,10 @@ Standard loop:
    - Otherwise, present a high-level summary of the megaplan (objectives, key steps, remaining risks), offer to read `.megaplan/plans/<plan-name>/final.md` inline, and only after explicit user confirmation run `megaplan execute --confirm-destructive --user-approved`.
 8. Finish with `megaplan review`.
 
-At every step, sense-check against the user's original intent before proceeding. If the megaplan is growing beyond the original idea or recorded user notes, flag that drift to the user instead of silently accepting it.
+At every step, consider two things:
+
+1. **Intent alignment** — is this still solving what the user asked for? If the megaplan is drifting from the original idea, flag it.
+2. **Level of abstraction** — are we approaching this at the right level? If the plan patches multiple systems for one goal, we might be too low (fix the design instead). If the plan redesigns architecture for a simple bug, we might be too high (just fix the bug). Push up or down the abstraction ladder as needed, and say so when you do.
 
 ## Autonomy
 
