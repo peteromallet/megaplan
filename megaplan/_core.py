@@ -126,6 +126,63 @@ class FlagRegistry(TypedDict):
     flags: list[FlagRecord]
 
 
+class StepResponse(TypedDict, total=False):
+    """Typed response dict returned by all handler functions."""
+    success: bool
+    step: str
+    summary: str
+    artifacts: list[str]
+    next_step: str | None
+    state: str
+    # Fields returned by specific handlers
+    auto_approve: bool
+    robustness: str
+    iteration: int
+    plan: str
+    plan_dir: str
+    questions: list[str]
+    verified_flags: list[str]
+    open_flags: list[str]
+    scope_creep_flags: list[str]
+    warnings: list[str]
+    files_changed: list[str]
+    deviations: list[str]
+    user_approved_gate: bool
+    issues: list[str]
+    valid_next: list[str]
+    # Override / setup / config responses
+    mode: str
+    installed: list[dict[str, Any]]
+    config_path: str
+    routing: dict[str, str]
+    raw_config: dict[str, Any]
+    action: str
+    key: str
+    value: str
+    skipped: bool
+    file: str
+    plans: list[dict[str, Any]]
+    # Evaluation fields (spread via **evaluation)
+    recommendation: str
+    confidence: str
+    signals: dict[str, Any]
+    rationale: str
+    valid_next_steps: list[str]
+    suggested_override: str
+    override_rationale: str
+    # Gate check fields (spread via **gate)
+    passed: bool
+    criteria_check: dict[str, Any]
+    preflight_results: dict[str, bool]
+    unresolved_flags: list[Any]
+    # Error response fields
+    error: str
+    message: str
+    details: dict[str, Any]
+    # Fallback
+    agent_fallback: dict[str, str]
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -357,7 +414,7 @@ def save_state(plan_dir: Path, state: PlanState) -> None:
 
 
 def latest_plan_record(state: PlanState) -> PlanVersionRecord:
-    plan_versions = state.get("plan_versions", [])
+    plan_versions = state["plan_versions"]
     if not plan_versions:
         raise CliError("missing_plan_version", "No plan version exists yet")
     return plan_versions[-1]
@@ -420,7 +477,7 @@ def scope_creep_flags(
 # ---------------------------------------------------------------------------
 
 def configured_robustness(state: PlanState) -> str:
-    robustness = state.get("config", {}).get("robustness", "standard")
+    robustness = state["config"].get("robustness", "standard")
     if robustness not in ROBUSTNESS_LEVELS:
         return "standard"
     return robustness
@@ -446,7 +503,7 @@ def intent_and_notes_block(state: PlanState) -> str:
         sections.append(f"Original idea:\n{state['idea']}")
     else:
         sections.append(f"Idea:\n{state['idea']}")
-    notes = state.get("meta", {}).get("notes", [])
+    notes = state["meta"].get("notes", [])
     if notes:
         notes_text = "\n".join(f"- {note['note']}" for note in notes)
         sections.append(f"User notes and answers:\n{notes_text}")

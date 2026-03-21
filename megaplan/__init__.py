@@ -1,7 +1,7 @@
 """Megaplan — stateful orchestration CLI for high-rigor planning loops."""
 
 from megaplan._core import (
-    PlanState, PlanConfig, PlanMeta, FlagRecord,
+    PlanState, PlanConfig, PlanMeta, FlagRecord, StepResponse,
     STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED,
     STATE_EVALUATED, STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, MOCK_ENV_VAR,
@@ -32,7 +32,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     # Types
-    "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
+    "PlanState", "PlanConfig", "PlanMeta", "FlagRecord", "StepResponse",
     # State constants
     "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED",
     "STATE_EVALUATED", "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",

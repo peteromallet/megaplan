@@ -10,12 +10,12 @@ import sys
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Import shared utilities from _core — these were previously defined here.
 from megaplan._core import (  # noqa: F401
     PlanState, PlanConfig, PlanMeta, FlagRecord, FlagRegistry,
-    SessionInfo, PlanVersionRecord, HistoryEntry,
+    SessionInfo, PlanVersionRecord, HistoryEntry, StepResponse,
     STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED, STATE_EVALUATED,
     STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, FLAG_BLOCKING_STATUSES, MOCK_ENV_VAR,
@@ -62,7 +62,7 @@ from megaplan.prompts import (  # noqa: F401
 
 __all__ = [
     # Types
-    "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
+    "PlanState", "PlanConfig", "PlanMeta", "FlagRecord", "StepResponse",
     # State constants
     "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED",
     "STATE_EVALUATED", "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
@@ -86,10 +86,10 @@ __all__ = [
 
 def _append_to_meta(state: PlanState, field: str, value: Any) -> None:
     """Append *value* to ``state["meta"][field]``, creating intermediates as needed."""
-    state.setdefault("meta", {}).setdefault(field, []).append(value)
+    state["meta"].setdefault(field, []).append(value)
 
 
-def render_response(response: dict[str, Any], *, exit_code: int = 0) -> int:
+def render_response(response: StepResponse, *, exit_code: int = 0) -> int:
     print(json_dump(response), end="")
     return exit_code
 
@@ -109,15 +109,15 @@ def error_response(error: CliError) -> int:
 
 def apply_session_update(state: PlanState, step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
     """Call update_session_state and store the result on state."""
-    result = update_session_state(step, agent, session_id, mode=mode, refreshed=refreshed, existing_sessions=state.get("sessions"))
+    result = update_session_state(step, agent, session_id, mode=mode, refreshed=refreshed, existing_sessions=state["sessions"])
     if result is not None:
         key, entry = result
-        state.setdefault("sessions", {})[key] = entry
+        state["sessions"][key] = entry
 
 
-def append_history(state: PlanState, entry: dict[str, Any]) -> None:
-    state.setdefault("history", []).append(entry)
-    state.setdefault("meta", {}).setdefault("total_cost_usd", 0.0)
+def append_history(state: PlanState, entry: HistoryEntry) -> None:
+    state["history"].append(entry)
+    state["meta"].setdefault("total_cost_usd", 0.0)
     state["meta"]["total_cost_usd"] = round(
         float(state["meta"]["total_cost_usd"]) + float(entry.get("cost_usd", 0.0)),
         6,
@@ -180,14 +180,14 @@ def make_history_entry(
     return entry
 
 
-def attach_agent_fallback(response: dict[str, Any], args: argparse.Namespace) -> None:
+def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> None:
     """Copy agent fallback info onto a response dict if present."""
     if hasattr(args, "_agent_fallback"):
         response["agent_fallback"] = args._agent_fallback
 
 
 def infer_next_steps(state: PlanState) -> list[str]:
-    current = state.get("current_state")
+    current = state["current_state"]
     if current == STATE_INITIALIZED:
         return ["clarify"]
     if current == STATE_CLARIFIED:
@@ -197,7 +197,7 @@ def infer_next_steps(state: PlanState) -> list[str]:
     if current == STATE_CRITIQUED:
         return ["evaluate"]
     if current == STATE_EVALUATED:
-        evaluation = state.get("last_evaluation", {})
+        evaluation = state["last_evaluation"]
         recommendation = evaluation.get("recommendation")
         valid = []
         if recommendation == "CONTINUE":
@@ -215,7 +215,7 @@ def infer_next_steps(state: PlanState) -> list[str]:
 
 
 def require_state(state: PlanState, step: str, allowed: set[str]) -> None:
-    current = state.get("current_state")
+    current = state["current_state"]
     if current not in allowed:
         raise CliError(
             "invalid_transition",
@@ -336,7 +336,7 @@ def record_step_failure(
 # Handlers
 # ---------------------------------------------------------------------------
 
-def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
     ensure_runtime_layout(root)
     project_dir = Path(args.project_dir).expanduser().resolve()
     if not project_dir.exists() or not project_dir.is_dir():
@@ -406,7 +406,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_clarify(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "clarify", {STATE_INITIALIZED, STATE_CLARIFIED})
     try:
@@ -452,7 +452,7 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "plan", {STATE_INITIALIZED, STATE_CLARIFIED})
     try:
@@ -477,8 +477,8 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
-    state.setdefault("meta", {}).pop("user_approved_gate", None)
-    state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
+    state["meta"].pop("user_approved_gate", None)
+    state["plan_versions"].append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
     apply_session_update(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
@@ -508,7 +508,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "critique", {STATE_PLANNED})
     iteration = state["iteration"]
@@ -563,7 +563,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def handle_evaluate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_evaluate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "evaluate", {STATE_CRITIQUED})
     evaluation = build_evaluation(plan_dir, state)
@@ -594,14 +594,14 @@ def handle_evaluate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": [filename],
         "next_step": evaluation["valid_next_steps"][0] if evaluation["valid_next_steps"] else None,
         "state": STATE_EVALUATED,
-        **evaluation,
+        "evaluation": evaluation,
     }
 
 
-def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "integrate", {STATE_EVALUATED})
-    if state.get("last_evaluation", {}).get("recommendation") != "CONTINUE":
+    if state["last_evaluation"].get("recommendation") != "CONTINUE":
         raise CliError(
             "invalid_transition",
             "Integrate requires an evaluation recommendation of CONTINUE",
@@ -635,8 +635,8 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
-    state.setdefault("meta", {}).pop("user_approved_gate", None)
-    state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
+    state["meta"].pop("user_approved_gate", None)
+    state["plan_versions"].append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
     _append_to_meta(state, "plan_deltas", delta)
     update_flags_after_integrate(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
     apply_session_update(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
@@ -669,7 +669,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def run_gate_checks(plan_dir: Path, state: PlanState) -> dict[str, Any]:
+def run_gate_checks(plan_dir: Path, state: PlanState) -> StepResponse:
     project_dir = Path(state["config"]["project_dir"])
     meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)
@@ -690,10 +690,10 @@ def run_gate_checks(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     }
 
 
-def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "gate", {STATE_EVALUATED})
-    recommendation = state.get("last_evaluation", {}).get("recommendation")
+    recommendation = state["last_evaluation"].get("recommendation")
     if recommendation not in {"SKIP", "CONTINUE"}:
         raise CliError(
             "invalid_transition",
@@ -722,14 +722,14 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": ["gate.json"],
             "next_step": "integrate" if recommendation == "CONTINUE" else "override force-proceed",
             "state": state["current_state"],
-            "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
+            "auto_approve": bool(state["config"].get("auto_approve", False)),
             "robustness": configured_robustness(state),
             **gate,
         }
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
-    state.setdefault("meta", {}).pop("user_approved_gate", None)
+    state["meta"].pop("user_approved_gate", None)
     append_history(
         state,
         make_history_entry(
@@ -749,22 +749,22 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": ["gate.json", "final.md"],
         "next_step": "execute",
         "state": STATE_GATED,
-        "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
+        "auto_approve": bool(state["config"].get("auto_approve", False)),
         "robustness": configured_robustness(state),
         **gate,
     }
 
 
-def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "execute", {STATE_GATED})
     if not args.confirm_destructive:
         raise CliError("missing_confirmation", "Execute requires --confirm-destructive")
-    auto_approve = bool(state.get("config", {}).get("auto_approve", False))
+    auto_approve = bool(state["config"].get("auto_approve", False))
     if getattr(args, "user_approved", False):
-        state.setdefault("meta", {})["user_approved_gate"] = True
+        state["meta"]["user_approved_gate"] = True
         save_state(plan_dir, state)
-    if not auto_approve and not state.get("meta", {}).get("user_approved_gate", False):
+    if not auto_approve and not state["meta"].get("user_approved_gate", False):
         raise CliError(
             "missing_approval",
             "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
@@ -781,7 +781,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
     if auto_approve:
         approval_mode = "auto_approve"
-    elif state.get("meta", {}).get("user_approved_gate", False):
+    elif state["meta"].get("user_approved_gate", False):
         approval_mode = "user_approved"
     else:
         approval_mode = "manual"
@@ -814,13 +814,13 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "files_changed": worker.payload.get("files_changed", []),
         "deviations": worker.payload.get("deviations", []),
         "auto_approve": auto_approve,
-        "user_approved_gate": bool(state.get("meta", {}).get("user_approved_gate", False)),
+        "user_approved_gate": bool(state["meta"].get("user_approved_gate", False)),
     }
     attach_agent_fallback(response, args)
     return response
 
 
-def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "review", {STATE_EXECUTED})
     try:
@@ -863,7 +863,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return response
 
 
-def handle_status(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_status(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     next_steps = infer_next_steps(state)
     return {
@@ -879,7 +879,7 @@ def handle_status(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def handle_audit(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_audit(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     return {
         "success": True,
@@ -890,7 +890,7 @@ def handle_audit(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def handle_list(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_list(root: Path, args: argparse.Namespace) -> StepResponse:
     ensure_runtime_layout(root)
     items = []
     for plan_dir in active_plan_dirs(root):
@@ -913,7 +913,7 @@ def handle_list(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     action = "add-note"
     note = args.note
     override_entry = {"action": action, "timestamp": now_utc(), "note": note}
@@ -930,7 +930,7 @@ def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespac
     }
 
 
-def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     override_entry = {"action": "abort", "timestamp": now_utc(), "reason": args.reason}
     state["current_state"] = STATE_ABORTED
     _append_to_meta(state, "overrides", override_entry)
@@ -944,7 +944,7 @@ def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) 
     }
 
 
-def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     if state["current_state"] != STATE_EVALUATED:
         raise CliError(
             "invalid_transition",
@@ -958,7 +958,7 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
-    state.setdefault("meta", {}).pop("user_approved_gate", None)
+    state["meta"].pop("user_approved_gate", None)
     _append_to_meta(state, "overrides", {"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
     return {
@@ -970,10 +970,10 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
     }
 
 
-def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     if state["current_state"] != STATE_EVALUATED:
         raise CliError("invalid_transition", "skip is currently only supported from evaluated state", valid_next=infer_next_steps(state))
-    evaluation = copy.deepcopy(state.get("last_evaluation", {}))
+    evaluation = copy.deepcopy(state["last_evaluation"])
     evaluation["recommendation"] = "SKIP"
     state["last_evaluation"] = evaluation
     _append_to_meta(state, "overrides", {"action": "skip", "timestamp": now_utc(), "reason": args.reason})
@@ -987,7 +987,7 @@ def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -
     }
 
 
-_OVERRIDE_ACTIONS: dict[str, Any] = {
+_OVERRIDE_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], StepResponse]] = {
     "add-note": _override_add_note,
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
@@ -995,7 +995,7 @@ _OVERRIDE_ACTIONS: dict[str, Any] = {
 }
 
 
-def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def handle_override(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     action = args.override_action
     handler = _OVERRIDE_ACTIONS.get(action)
@@ -1023,7 +1023,7 @@ GLOBAL_TARGETS = [
 
 def _install_owned_file(
     path: Path, content: str, *, force: bool = False
-) -> dict[str, Any]:
+) -> dict[str, bool | str]:
     """Write a file we own, skipping if content already matches."""
     existed = path.exists()
     if existed and not force:
@@ -1034,7 +1034,7 @@ def _install_owned_file(
     return {"path": str(path), "skipped": False, "existed": existed}
 
 
-def handle_setup_global(force: bool = False, home: Path | None = None) -> dict[str, Any]:
+def handle_setup_global(force: bool = False, home: Path | None = None) -> StepResponse:
     """Install megaplan config into all detected agent global dirs."""
     if home is None:
         home = Path.home()
@@ -1109,7 +1109,7 @@ def handle_setup_global(force: bool = False, home: Path | None = None) -> dict[s
     return result_data
 
 
-def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
+def handle_setup(args: argparse.Namespace) -> StepResponse:
     local = args.local or args.target_dir
     if not local:
         return handle_setup_global(force=args.force)
@@ -1143,7 +1143,7 @@ def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def handle_config(args: argparse.Namespace) -> dict[str, Any]:
+def handle_config(args: argparse.Namespace) -> StepResponse:
     """Handle the config subcommand: show, set, reset."""
     action = args.config_action
 
@@ -1247,7 +1247,7 @@ def build_parser() -> argparse.ArgumentParser:
     override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note"])
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
-    override_parser.add_argument("note", nargs="?")
+    override_parser.add_argument("--note")
 
     return parser
 
@@ -1257,7 +1257,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 # Commands that take (root, args) and return a response dict.
-COMMAND_HANDLERS: dict[str, Any] = {
+COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "init": handle_init,
     "clarify": handle_clarify,
     "plan": handle_plan,

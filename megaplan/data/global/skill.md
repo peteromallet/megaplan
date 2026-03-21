@@ -54,7 +54,7 @@ Always follow the `next_step` or `valid_next` fields returned by the CLI.
 
 Standard loop:
 1. `megaplan init`
-2. `megaplan clarify` — show the refined idea, intent summary, and clarification questions. If the user volunteers corrections, record them with `megaplan override add-note`, then keep moving.
+2. `megaplan clarify` — show the refined idea, intent summary, and clarification questions. If the user volunteers corrections, record them with `megaplan override add-note --note "..."`, then keep moving.
 3. `megaplan plan` — show the megaplan's `questions`, `assumptions`, and success criteria, then continue unless the user redirects.
 4. `megaplan critique` — show the flags (concern, severity, evidence), not just the count. If any flag or warning indicates scope creep, call that out explicitly to the user while continuing the loop.
 5. `megaplan evaluate`
@@ -92,7 +92,7 @@ Otherwise, present the evaluation details and ask the user what to do.
 
 ## Minor Megaplan Edits
 
-The orchestrator may make small clarifications or corrections to the megaplan text directly (e.g. fixing a typo, adding a note the user dictated) without re-running the full critique/integrate loop. Use `megaplan override add-note` for context additions, or edit the megaplan artifact directly for trivial fixes. Reserve the full loop for substantive changes.
+The orchestrator may make small clarifications or corrections to the megaplan text directly (e.g. fixing a typo, adding a note the user dictated) without re-running the full critique/integrate loop. Use `megaplan override add-note --note "..."` for context additions, or edit the megaplan artifact directly for trivial fixes. Reserve the full loop for substantive changes.
 
 ## Session Defaults
 
@@ -119,6 +119,6 @@ If the user wants detail, inspect the artifact files under `.megaplan/plans/<pla
 megaplan status --plan <name>
 megaplan audit --plan <name>
 megaplan list
-megaplan override add-note --plan <name> "user context"
+megaplan override add-note --plan <name> --note "user context"
 megaplan override abort --plan <name>
 ```

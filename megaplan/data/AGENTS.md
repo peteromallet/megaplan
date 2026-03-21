@@ -36,7 +36,7 @@ Read the JSON response and report the plan name, execution mode, robustness, and
 1. `megaplan init`
 2. `megaplan clarify` — present the refined idea, intent summary, and
    clarification questions, then keep moving unless the user redirects. Record
-   any user clarifications with `megaplan override add-note --plan <name> "..."`
+   any user clarifications with `megaplan override add-note --plan <name> --note "..."`
 3. `megaplan plan` — present the plan's questions, assumptions, and success
    criteria, then keep moving unless the user redirects
 4. `megaplan critique` — present the flags, not just the count. If a flag or
@@ -71,7 +71,7 @@ gate → execute checkpoint. Auto-approve only skips that final approval gate.
 megaplan status --plan <name>    # current state and next step
 megaplan audit --plan <name>     # full state dump
 megaplan list                    # all plans
-megaplan override add-note --plan <name> "context for the next iteration"
+megaplan override add-note --plan <name> --note "context for the next iteration"
 megaplan override abort --plan <name>
 ```
 

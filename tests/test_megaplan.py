@@ -699,7 +699,7 @@ def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
 
     evaluate_result = megaplan.handle_evaluate(root, make_args(plan=name))
     assert evaluate_result["state"] == megaplan.STATE_EVALUATED
-    assert evaluate_result["recommendation"] == "CONTINUE"
+    assert evaluate_result["evaluation"]["recommendation"] == "CONTINUE"
 
     integrate_result = megaplan.handle_integrate(root, make_args(plan=name))
     assert integrate_result["state"] == megaplan.STATE_PLANNED
@@ -712,7 +712,7 @@ def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
     assert {flag["status"] for flag in registry["flags"]} == {"verified"}
 
     evaluate_result = megaplan.handle_evaluate(root, make_args(plan=name))
-    assert evaluate_result["recommendation"] == "SKIP"
+    assert evaluate_result["evaluation"]["recommendation"] == "SKIP"
 
     gate_result = megaplan.handle_gate(root, make_args(plan=name))
     assert gate_result["state"] == megaplan.STATE_GATED

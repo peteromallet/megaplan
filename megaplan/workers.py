@@ -28,7 +28,6 @@ from megaplan._core import (
     schemas_root,
     latest_plan_meta_path,
     DEFAULT_AGENT_ROUTING,
-    KNOWN_AGENTS,
     load_config,
     detect_available_agents,
 )
@@ -362,7 +361,7 @@ def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, 
     schema_name = STEP_SCHEMA_FILENAMES[step]
     schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
     session_key = session_key_for(step, "claude")
-    session = state.setdefault("sessions", {}).get(session_key, {})
+    session = state["sessions"].get(session_key, {})
     session_id = session.get("id")
     command = ["claude", "-p", "--output-format", "json", "--json-schema", schema_text, "--add-dir", str(project_dir)]
     if session_id and not fresh:
@@ -402,7 +401,7 @@ def run_codex_step(
     project_dir = Path(state["config"]["project_dir"])
     schema_file = schemas_root(root) / STEP_SCHEMA_FILENAMES[step]
     session_key = session_key_for(step, "codex")
-    session = state.setdefault("sessions", {}).get(session_key, {})
+    session = state["sessions"].get(session_key, {})
     out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)
     out_handle.close()
     output_path = Path(out_handle.name)

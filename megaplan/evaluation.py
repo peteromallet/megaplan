@@ -221,7 +221,7 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
     significant_count = len([flag for flag in flag_registry.get("flags", []) if flag.get("severity") == "significant" and flag.get("status") != "verified"])
     weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
-    weighted_history = state.get("meta", {}).get("weighted_scores", [])
+    weighted_history = state["meta"].get("weighted_scores", [])
     latest_plan_text = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     previous_text = None
     if iteration > 1:
@@ -229,7 +229,7 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> dict[str, Any]:
     plan_delta = compute_plan_delta_percent(previous_text, latest_plan_text)
     recurring = compute_recurring_critiques(plan_dir, iteration)
     budget = float(state["config"].get("budget_usd", 25.0))
-    total_cost = float(state.get("meta", {}).get("total_cost_usd", 0.0))
+    total_cost = float(state["meta"].get("total_cost_usd", 0.0))
 
     # Bundle all signals into a dict so predicates can pick what they need.
     signals = dict(

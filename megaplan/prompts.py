@@ -25,7 +25,7 @@ from megaplan._core import (
 
 def _clarify_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
-    notes = state.get("meta", {}).get("notes", [])
+    notes = state["meta"].get("notes", [])
     notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
     return textwrap.dedent(
         f"""
@@ -53,7 +53,7 @@ def _clarify_prompt(state: PlanState, plan_dir: Path) -> str:
 
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
-    notes = state.get("meta", {}).get("notes", [])
+    notes = state["meta"].get("notes", [])
     notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
     clarification = state.get("clarification", {})
     refined = clarification.get("refined_idea", "")
@@ -213,9 +213,9 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
-    if state.get("config", {}).get("auto_approve"):
+    if state["config"].get("auto_approve"):
         approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
-    elif state.get("meta", {}).get("user_approved_gate"):
+    elif state["meta"].get("user_approved_gate"):
         approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
     else:
         approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
