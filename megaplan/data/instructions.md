@@ -97,13 +97,21 @@ Otherwise: show evaluation details and ask the user — force-proceed, add-note,
 
 ## Re-entering the planning loop
 
-If the user wants to expand scope or revise the plan after gate (or at any post-critique stage), use `replan` to re-enter the loop without losing history:
+If the user wants to expand scope or revise the plan after gate (or at any post-critique stage), use `replan`:
 
 ```bash
 megaplan override replan --plan <name> --reason "expanding scope" --note "Also clean up the display layer"
 ```
 
-This moves the plan back to `planned` state so you can run critique → evaluate → integrate again. All prior flags, plan versions, and notes are preserved. Much better than aborting and starting fresh.
+This resets to `planned` state. The response includes `plan_file` — the path to the current plan markdown file. After running replan:
+
+1. Read the plan file with your Read tool
+2. Edit it with your Edit tool to incorporate the user's changes — add sections, expand scope, revise steps, whatever they asked for
+3. Run `megaplan critique` to review the revised plan
+
+All prior flags, plan versions, and history are preserved.
+
+For small additions where the user gave clear direction in `--note`, you can skip the manual edit — the critic will see the note, flag that the plan doesn't cover it, and the integrator will add it on the next loop. But for substantive scope changes, edit the plan directly so the critic reviews the complete revised version.
 
 Available from: `gated`, `evaluated`, or `critiqued` states.
 

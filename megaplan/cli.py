@@ -1035,6 +1035,7 @@ def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace)
             valid_next=infer_next_steps(state),
         )
     reason = args.reason or args.note or "Re-entering planning loop"
+    plan_file = latest_plan_path(plan_dir, state)
     state["current_state"] = STATE_PLANNED
     _append_to_meta(state, "overrides", {"action": "replan", "timestamp": now_utc(), "reason": reason})
     if args.note:
@@ -1046,6 +1047,8 @@ def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace)
         "summary": f"Re-entered planning loop at iteration {state['iteration']}. Reason: {reason}",
         "next_step": "critique",
         "state": STATE_PLANNED,
+        "plan_file": str(plan_file),
+        "message": f"Edit {plan_file.name} to incorporate your changes, then run critique. Or run critique directly if the note provides enough context for the loop to address.",
     }
 
 
