@@ -39,8 +39,6 @@ TERMINAL_STATES = {STATE_DONE, STATE_ABORTED}
 
 
 class PlanConfig(TypedDict, total=False):
-    max_iterations: int
-    budget_usd: float
     project_dir: str
     auto_approve: bool
     robustness: str

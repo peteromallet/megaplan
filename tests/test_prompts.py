@@ -31,8 +31,6 @@ def _base_state(project_dir: Path, *, iteration: int = 1) -> PlanState:
         "iteration": iteration,
         "created_at": "2026-03-20T00:00:00Z",
         "config": {
-            "max_iterations": 3,
-            "budget_usd": 25.0,
             "project_dir": str(project_dir),
             "auto_approve": False,
             "robustness": "standard",

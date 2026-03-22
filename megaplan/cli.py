@@ -380,8 +380,6 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
         "iteration": 0,
         "created_at": now_utc(),
         "config": {
-            "max_iterations": args.max_iterations,
-            "budget_usd": args.budget_usd,
             "project_dir": str(project_dir),
             "auto_approve": auto_approve,
             "robustness": robustness,
@@ -467,6 +465,8 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> StepResponse:
         "artifacts": [clarify_filename],
         "next_step": "plan",
         "state": STATE_CLARIFIED,
+        "refined_idea": payload["refined_idea"],
+        "intent_summary": payload["intent_summary"],
         "questions": payload["questions"],
     }
     attach_agent_fallback(response, args)
@@ -524,6 +524,9 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
         "artifacts": [plan_filename, meta_filename],
         "next_step": "critique",
         "state": STATE_PLANNED,
+        "questions": payload["questions"],
+        "assumptions": payload["assumptions"],
+        "success_criteria": payload["success_criteria"],
     }
     attach_agent_fallback(response, args)
     return response
@@ -564,6 +567,10 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     )
     save_state(plan_dir, state)
     scope_flags_list = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
+    open_flags_detail = [
+        {"id": f.get("id"), "concern": f.get("concern", ""), "category": f.get("category", "other"), "severity": f.get("severity", "unknown")}
+        for f in registry["flags"] if f.get("status") == "open"
+    ]
     response = {
         "success": True,
         "step": "critique",
@@ -573,7 +580,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         "next_step": "evaluate",
         "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
-        "open_flags": [flag["id"] for flag in registry["flags"] if flag.get("status") == "open"],
+        "open_flags": open_flags_detail,
         "scope_creep_flags": [flag["id"] for flag in scope_flags_list],
     }
     if scope_flags_list:
@@ -677,6 +684,13 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
+    # Load updated flag registry to show remaining flags
+    updated_registry = load_flag_registry(plan_dir)
+    remaining = [
+        {"id": f.get("id"), "concern": f.get("concern", ""), "category": f.get("category", "other")}
+        for f in updated_registry["flags"]
+        if f.get("status") in FLAG_BLOCKING_STATUSES and f.get("severity") == "significant"
+    ]
     response = {
         "success": True,
         "step": "integrate",
@@ -685,6 +699,10 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
         "artifacts": [plan_filename, meta_filename, "faults.json"],
         "next_step": "critique",
         "state": STATE_PLANNED,
+        "changes_summary": payload["changes_summary"],
+        "flags_addressed": payload["flags_addressed"],
+        "flags_remaining": remaining,
+        "plan_delta_percent": delta,
     }
     attach_agent_fallback(response, args)
     return response
@@ -1258,8 +1276,6 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("--project-dir", required=True)
     init_parser.add_argument("--name")
-    init_parser.add_argument("--max-iterations", type=int, default=3)
-    init_parser.add_argument("--budget-usd", type=float, default=25.0)
     init_parser.add_argument("--auto-approve", action="store_true")
     init_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default="standard")
     init_parser.add_argument("idea")
@@ -1296,6 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")
+    override_parser.add_argument("note_positional", nargs="?", default=None)
 
     return parser
 
@@ -1345,6 +1362,8 @@ def main(argv: list[str] | None = None) -> int:
         handler = COMMAND_HANDLERS.get(args.command)
         if handler is None:
             raise CliError("invalid_command", f"Unknown command {args.command!r}")
+        if args.command == "override":
+            args.note = args.note or getattr(args, "note_positional", None)
         if args.command == "override" and args.override_action == "add-note" and not args.note:
             raise CliError("invalid_args", "override add-note requires a note")
         response = handler(root, args)

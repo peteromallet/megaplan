@@ -31,8 +31,6 @@ def make_args_factory(project_dir: Path):
             "idea": "test idea",
             "name": "test-plan",
             "project_dir": str(project_dir),
-            "max_iterations": 3,
-            "budget_usd": 25.0,
             "auto_approve": False,
             "robustness": "standard",
             "agent": None,
@@ -96,8 +94,6 @@ def eval_scaffold(
     sig_history: list[int] | None = None,
     weighted_scores: list[float] | None = None,
     total_cost_usd: float = 0.0,
-    budget_usd: float = 25.0,
-    max_iterations: int = 3,
     robustness: str = "standard",
 ) -> tuple[Path, dict]:
     plan_dir = tmp_path / "plan"
@@ -150,8 +146,6 @@ def eval_scaffold(
         "current_state": megaplan.STATE_CRITIQUED,
         "iteration": iteration,
         "config": {
-            "budget_usd": budget_usd,
-            "max_iterations": max_iterations,
             "project_dir": str(tmp_path / "project"),
             "auto_approve": False,
             "robustness": robustness,
@@ -495,18 +489,6 @@ def test_normalize_flag_record_defaults() -> None:
     assert normalized["severity_hint"] == "uncertain"
 
 
-def test_eval_abort_over_budget(tmp_path: Path) -> None:
-    plan_dir, state = eval_scaffold(
-        tmp_path,
-        flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
-        total_cost_usd=30.0,
-        budget_usd=25.0,
-    )
-    evaluation = megaplan.build_evaluation(plan_dir, state)
-    assert evaluation["recommendation"] == "ABORT"
-    assert evaluation["confidence"] == "high"
-
-
 def test_eval_skip_no_significant_flags(tmp_path: Path) -> None:
     plan_dir, state = eval_scaffold(tmp_path, flags=[])
     evaluation = megaplan.build_evaluation(plan_dir, state)
@@ -661,19 +643,6 @@ def test_eval_surfaces_scope_creep_warning(tmp_path: Path) -> None:
 
     assert evaluation["signals"]["scope_creep_flags"] == ["FLAG-007"]
     assert "Scope creep detected" in evaluation["warnings"][0]
-
-
-def test_eval_escalate_max_iterations_with_unresolved(tmp_path: Path) -> None:
-    plan_dir, state = eval_scaffold(
-        tmp_path,
-        iteration=3,
-        max_iterations=3,
-        flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
-        sig_history=[2],
-    )
-    evaluation = megaplan.build_evaluation(plan_dir, state)
-    assert evaluation["recommendation"] == "ESCALATE"
-    assert evaluation["confidence"] == "high"
 
 
 def test_full_mock_lifecycle(plan_fixture: PlanFixture) -> None:
@@ -1126,18 +1095,6 @@ def test_eval_weighted_security_flags_escalate(tmp_path: Path) -> None:
     evaluation = megaplan.build_evaluation(plan_dir, state)
     assert evaluation["recommendation"] == "ESCALATE"
     assert evaluation["suggested_override"] == "add-note"
-
-
-def test_eval_override_guidance_abort_on_budget(tmp_path: Path) -> None:
-    plan_dir, state = eval_scaffold(
-        tmp_path,
-        flags=[{"id": "FLAG-001", "status": "open", "severity": "significant"}],
-        total_cost_usd=30.0,
-        budget_usd=25.0,
-    )
-    evaluation = megaplan.build_evaluation(plan_dir, state)
-    assert evaluation["recommendation"] == "ABORT"
-    assert evaluation["suggested_override"] == "abort"
 
 
 def test_eval_no_override_on_continue(tmp_path: Path) -> None:

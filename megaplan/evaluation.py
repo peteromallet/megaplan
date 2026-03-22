@@ -70,11 +70,6 @@ def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
 # Predicate functions for the decision table
 # ---------------------------------------------------------------------------
 
-def _is_over_budget(total_cost: float, budget: float, **_: Any) -> bool:
-    """Cost has exceeded the configured budget."""
-    return total_cost > budget
-
-
 def _is_all_flags_resolved(significant_count: int, unresolved: list[Any], **_: Any) -> bool:
     """No unresolved significant flags remain."""
     return significant_count == 0 and not unresolved
@@ -141,13 +136,6 @@ def _is_score_improving(
     )
 
 
-def _is_max_iterations_with_unresolved(
-    iteration: int, state: PlanState, unresolved: list[Any], **_: Any,
-) -> bool:
-    """Reached max iterations with unresolved significant risks."""
-    return iteration >= int(state["config"].get("max_iterations", 3)) and bool(unresolved)
-
-
 # Decision table: evaluated in priority order; first match wins.
 # Each entry is (predicate, recommendation, confidence, rationale_template).
 # rationale_template may be a str or a callable(signals -> str) for dynamic messages.
@@ -159,11 +147,6 @@ _EVALUATION_DECISION_TABLE: list[
         str | Any,  # rationale (str or callable)
     ]
 ] = [
-    (
-        _is_over_budget,
-        "ABORT", "high",
-        lambda s: f"Cost ${s['total_cost']:.3f} exceeded configured budget ${s['budget']:.3f}.",
-    ),
     (
         _is_all_flags_resolved,
         "SKIP", "high",
@@ -204,11 +187,6 @@ _EVALUATION_DECISION_TABLE: list[
         "CONTINUE", "medium",
         "Weighted flag score is trending down.",
     ),
-    (
-        _is_max_iterations_with_unresolved,
-        "ESCALATE", "high",
-        "Reached max iterations with unresolved significant risks.",
-    ),
 ]
 
 
@@ -222,22 +200,18 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> EvaluationResult:
     open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
     significant_count = len([flag for flag in flag_registry["flags"] if flag.get("severity") == "significant" and flag.get("status") != "verified"])
     weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
-    weighted_history = state["meta"].get("weighted_scores", [])
+    weighted_history = list(state["meta"].get("weighted_scores", []))
     latest_plan_text = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     previous_text = None
     if iteration > 1:
         previous_text = (plan_dir / f"plan_v{iteration - 1}.md").read_text(encoding="utf-8")
     plan_delta = compute_plan_delta_percent(previous_text, latest_plan_text)
     recurring = compute_recurring_critiques(plan_dir, iteration)
-    budget = float(state["config"].get("budget_usd", 25.0))
-    total_cost = float(state["meta"].get("total_cost_usd", 0.0))
-
     # Bundle all signals into a dict so predicates can pick what they need.
     signals = dict(
         iteration=iteration, unresolved=unresolved, significant_count=significant_count,
         weighted_score=weighted_score, weighted_history=weighted_history,
-        plan_delta=plan_delta, recurring=recurring, total_cost=total_cost,
-        budget=budget, skip_threshold=skip_threshold,
+        plan_delta=plan_delta, recurring=recurring, skip_threshold=skip_threshold,
         stagnation_factor=stagnation_factor, state=state,
     )
 
@@ -261,28 +235,59 @@ def build_evaluation(plan_dir: Path, state: PlanState) -> EvaluationResult:
         "robustness": robustness,
         "signals": {
             "iteration": iteration,
-            "max_iterations": state["config"].get("max_iterations"),
             "significant_flags": significant_count,
+            "unresolved_flags": [
+                {"id": f.get("id"), "concern": f.get("concern", ""), "category": f.get("category", "other")}
+                for f in unresolved
+            ],
             "weighted_score": weighted_score,
             "weighted_history": weighted_history,
             "plan_delta_from_previous": plan_delta,
             "recurring_critiques": recurring,
-            "cost_so_far_usd": total_cost,
             "scope_creep_flags": [flag["id"] for flag in open_scope_creep],
         },
+        "idea": state.get("idea", ""),
         "rationale": rationale,
         "valid_next_steps": valid_next,
     }
-    if open_scope_creep:
-        result["warnings"] = [
-            "Scope creep detected: the plan appears to be expanding beyond the original idea or recorded user notes."
-        ]
+    # Build a concise loop summary so the orchestrator has full context
+    # even if earlier conversation turns were compressed away.
+    resolved_flags = [
+        {"id": f.get("id"), "concern": f.get("concern", ""), "resolution": f.get("resolution", "")}
+        for f in flag_registry["flags"] if f.get("status") == "verified"
+    ]
+    if resolved_flags:
+        result["resolved_flags"] = resolved_flags
+    if weighted_history:
+        trajectory = " → ".join(str(s) for s in weighted_history) + f" → {weighted_score}"
+        deltas = state["meta"].get("plan_deltas", [])
+        delta_str = ", ".join(f"{d:.1f}%" for d in deltas) if deltas else "n/a"
+        result["loop_summary"] = (
+            f"Iteration {iteration}. Score trajectory: {trajectory}. "
+            f"Plan deltas: {delta_str}. "
+            f"Flags resolved: {len(resolved_flags)}. "
+            f"Flags still open: {significant_count}."
+        )
 
-    if recommendation in ("ESCALATE", "ABORT"):
-        if recommendation == "ABORT":
-            result["suggested_override"] = "abort"
-            result["override_rationale"] = "Budget exceeded. Abort or increase budget."
-        elif all(flag_weight(f) <= 1.0 for f in unresolved):
+    if open_scope_creep:
+        result.setdefault("warnings", []).append(
+            "Scope creep detected: the plan appears to be expanding beyond the original idea or recorded user notes."
+        )
+
+    if iteration >= 5:
+        result.setdefault("warnings", []).append(
+            f"Iteration {iteration}: high iteration count."
+        )
+
+    if iteration >= 12:
+        recommendation = "ESCALATE"
+        result["recommendation"] = "ESCALATE"
+        result["confidence"] = "high"
+        result["rationale"] = f"Reached {iteration} iterations — hard limit. Proceed or abort."
+        result["valid_next_steps"] = ["override add-note", "override force-proceed", "override abort"]
+
+    if recommendation == "ESCALATE":
+        if all(flag_weight(f) <= 1.0 for f in unresolved):
             result["suggested_override"] = "force-proceed"
             result["override_rationale"] = (
                 "Remaining flags are implementation details (pseudocode accuracy, "

@@ -9,7 +9,6 @@ import pytest
 from megaplan.evaluation import (
     build_evaluation,
     flag_weight,
-    _is_over_budget,
     _is_all_flags_resolved,
     _is_low_weight_trending_down,
     _is_stagnant_with_unresolved,
@@ -18,7 +17,6 @@ from megaplan.evaluation import (
     _has_recurring_critiques,
     _is_score_stagnating,
     _is_score_improving,
-    _is_max_iterations_with_unresolved,
     compute_plan_delta_percent,
 )
 
@@ -35,8 +33,6 @@ def _eval_scaffold(
     flags: list[dict] | None = None,
     weighted_scores: list[float] | None = None,
     total_cost_usd: float = 0.0,
-    budget_usd: float = 25.0,
-    max_iterations: int = 3,
     robustness: str = "standard",
 ) -> tuple[Path, dict]:
     """Set up filesystem state for build_evaluation."""
@@ -70,8 +66,6 @@ def _eval_scaffold(
         "current_state": "critiqued",
         "iteration": iteration,
         "config": {
-            "budget_usd": budget_usd,
-            "max_iterations": max_iterations,
             "project_dir": str(tmp_path / "project"),
             "auto_approve": False,
             "robustness": robustness,
@@ -176,13 +170,6 @@ class TestBuildEvaluationIntegration:
         assert result["recommendation"] == "SKIP"
         assert result["valid_next_steps"] == ["gate"]
 
-    def test_over_budget_returns_abort(self, tmp_path: Path) -> None:
-        plan_dir, state = _eval_scaffold(
-            tmp_path, total_cost_usd=30.0, budget_usd=25.0,
-        )
-        result = build_evaluation(plan_dir, state)
-        assert result["recommendation"] == "ABORT"
-
     def test_robustness_affects_result(self, tmp_path: Path) -> None:
         plan_dir, state = _eval_scaffold(tmp_path, robustness="thorough")
         result = build_evaluation(plan_dir, state)
@@ -219,17 +206,6 @@ class TestBuildEvaluationIntegration:
 # ---------------------------------------------------------------------------
 # Decision-table predicate tests with explicit input/output pairs
 # ---------------------------------------------------------------------------
-
-class TestIsOverBudget:
-    def test_over_budget(self) -> None:
-        assert _is_over_budget(total_cost=30.0, budget=25.0) is True
-
-    def test_under_budget(self) -> None:
-        assert _is_over_budget(total_cost=10.0, budget=25.0) is False
-
-    def test_exactly_at_budget(self) -> None:
-        assert _is_over_budget(total_cost=25.0, budget=25.0) is False
-
 
 class TestIsAllFlagsResolved:
     def test_all_resolved(self) -> None:
@@ -353,26 +329,6 @@ class TestIsScoreImproving:
     def test_empty_history(self) -> None:
         assert _is_score_improving(
             weighted_score=5.0, weighted_history=[], stagnation_factor=0.9,
-        ) is False
-
-
-class TestIsMaxIterationsWithUnresolved:
-    def test_at_max_with_unresolved(self) -> None:
-        state = {"config": {"max_iterations": 3}}
-        assert _is_max_iterations_with_unresolved(
-            iteration=3, state=state, unresolved=[{"id": "F"}],
-        ) is True
-
-    def test_below_max(self) -> None:
-        state = {"config": {"max_iterations": 3}}
-        assert _is_max_iterations_with_unresolved(
-            iteration=2, state=state, unresolved=[{"id": "F"}],
-        ) is False
-
-    def test_at_max_no_unresolved(self) -> None:
-        state = {"config": {"max_iterations": 3}}
-        assert _is_max_iterations_with_unresolved(
-            iteration=3, state=state, unresolved=[],
         ) is False
 
 
