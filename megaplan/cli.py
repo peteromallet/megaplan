@@ -226,10 +226,10 @@ def infer_next_steps(state: PlanState) -> list[str]:
         if recommendation in {"SKIP", "CONTINUE"}:
             valid.append("gate")
         if recommendation in {"ESCALATE", "ABORT"}:
-            valid.extend(["override add-note", "override force-proceed", "override abort"])
+            valid.extend(["override replan", "override add-note", "override force-proceed", "override abort"])
         return valid or ["override add-note", "override abort"]
     if current == STATE_GATED:
-        return ["execute"]
+        return ["execute", "override replan"]
     if current == STATE_EXECUTED:
         return ["review"]
     return []
@@ -1026,11 +1026,35 @@ def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -
     }
 
 
+def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+    allowed = {STATE_GATED, STATE_EVALUATED, STATE_CRITIQUED}
+    if state["current_state"] not in allowed:
+        raise CliError(
+            "invalid_transition",
+            f"replan requires state {', '.join(sorted(allowed))}, got '{state['current_state']}'",
+            valid_next=infer_next_steps(state),
+        )
+    reason = args.reason or args.note or "Re-entering planning loop"
+    state["current_state"] = STATE_PLANNED
+    _append_to_meta(state, "overrides", {"action": "replan", "timestamp": now_utc(), "reason": reason})
+    if args.note:
+        _append_to_meta(state, "notes", {"timestamp": now_utc(), "note": args.note})
+    save_state(plan_dir, state)
+    return {
+        "success": True,
+        "step": "override",
+        "summary": f"Re-entered planning loop at iteration {state['iteration']}. Reason: {reason}",
+        "next_step": "critique",
+        "state": STATE_PLANNED,
+    }
+
+
 _OVERRIDE_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], StepResponse]] = {
     "add-note": _override_add_note,
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
     "skip": _override_skip,
+    "replan": _override_replan,
 }
 
 
@@ -1308,11 +1332,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("reset")
 
     override_parser = subparsers.add_parser("override")
-    override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note"])
+    override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note", "replan"])
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")
-    override_parser.add_argument("note_positional", nargs="?", default=None)
 
     return parser
 
@@ -1346,7 +1369,7 @@ def cli_entry() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, remaining = parser.parse_known_args(argv)
     try:
         if args.command == "setup":
             response = handle_setup(args)
@@ -1362,8 +1385,12 @@ def main(argv: list[str] | None = None) -> int:
         handler = COMMAND_HANDLERS.get(args.command)
         if handler is None:
             raise CliError("invalid_command", f"Unknown command {args.command!r}")
-        if args.command == "override":
-            args.note = args.note or getattr(args, "note_positional", None)
+        if args.command == "override" and remaining:
+            if not args.note:
+                args.note = " ".join(remaining)
+            remaining = []
+        if remaining:
+            parser.error(f"unrecognized arguments: {' '.join(remaining)}")
         if args.command == "override" and args.override_action == "add-note" and not args.note:
             raise CliError("invalid_args", "override add-note requires a note")
         response = handler(root, args)

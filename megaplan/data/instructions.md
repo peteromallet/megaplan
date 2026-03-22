@@ -95,6 +95,18 @@ Tell the user why (include `override_rationale`, score, recurring critiques, war
 
 Otherwise: show evaluation details and ask the user — force-proceed, add-note, or abort?
 
+## Re-entering the planning loop
+
+If the user wants to expand scope or revise the plan after gate (or at any post-critique stage), use `replan` to re-enter the loop without losing history:
+
+```bash
+megaplan override replan --plan <name> --reason "expanding scope" --note "Also clean up the display layer"
+```
+
+This moves the plan back to `planned` state so you can run critique → evaluate → integrate again. All prior flags, plan versions, and notes are preserved. Much better than aborting and starting fresh.
+
+Available from: `gated`, `evaluated`, or `critiqued` states.
+
 ## Minor edits
 
 Use `megaplan override add-note --note "..."` for context additions. Edit plan artifacts directly for trivial fixes. Reserve the full loop for substantive changes.
@@ -114,5 +126,6 @@ megaplan audit --plan <name>
 megaplan list
 megaplan override add-note --plan <name> --note "..."
 megaplan override force-proceed --plan <name>
+megaplan override replan --plan <name> --reason "..." [--note "..."]
 megaplan override abort --plan <name>
 ```

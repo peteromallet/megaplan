@@ -299,7 +299,7 @@ def test_compute_recurring_critiques(tmp_path: Path) -> None:
         (megaplan.STATE_CLARIFIED, {}, ["clarify", "plan"]),
         (megaplan.STATE_PLANNED, {}, ["critique"]),
         (megaplan.STATE_CRITIQUED, {}, ["evaluate"]),
-        (megaplan.STATE_GATED, {}, ["execute"]),
+        (megaplan.STATE_GATED, {}, ["execute", "override replan"]),
         (megaplan.STATE_EXECUTED, {}, ["review"]),
         (megaplan.STATE_DONE, {}, []),
         (megaplan.STATE_ABORTED, {}, []),
@@ -314,8 +314,8 @@ def test_infer_next_steps_non_evaluated_states(current_state: str, last_evaluati
     [
         ("CONTINUE", ["integrate", "gate"]),
         ("SKIP", ["gate"]),
-        ("ESCALATE", ["override add-note", "override force-proceed", "override abort"]),
-        ("ABORT", ["override add-note", "override force-proceed", "override abort"]),
+        ("ESCALATE", ["override replan", "override add-note", "override force-proceed", "override abort"]),
+        ("ABORT", ["override replan", "override add-note", "override force-proceed", "override abort"]),
         (None, ["override add-note", "override abort"]),
     ],
 )
