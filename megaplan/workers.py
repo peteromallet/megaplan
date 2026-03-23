@@ -200,19 +200,34 @@ def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     payload = {
         "plan": textwrap.dedent(
             f"""
-            # Implementation Plan
+            # Implementation Plan: Mock Planning Pass
 
-            ## Goal
-            Implement: {state['idea']}
+            ## Overview
+            Produce a concrete plan for: {state['idea']}. Keep the scope grounded in the repository and define validation before execution.
 
-            ## Steps
-            1. Inspect the repository and identify the touch points.
-            2. Implement the feature with tests or local verification hooks.
-            3. Validate success criteria before finishing.
+            ## Step 1: Inspect the current flow (`megaplan/workers.py`)
+            **Scope:** Small
+            1. **Inspect** the planner and prompt touch points before editing (`megaplan/workers.py:199`, `megaplan/prompts.py:29`).
 
-            ## Risks
-            - Repository reality may differ from the initial assumption.
-            - Missing verification would block execution.
+            ## Step 2: Implement the smallest viable change (`megaplan/handlers.py`)
+            **Scope:** Medium
+            1. **Update** the narrowest set of files required to implement the idea (`megaplan/handlers.py:400`).
+            2. **Capture** any non-obvious behavior with a short example.
+               ```python
+               result = "keep the plan structure consistent"
+               ```
+
+            ## Step 3: Verify the behavior (`tests/test_megaplan.py`)
+            **Scope:** Small
+            1. **Run** focused checks that prove the change works (`tests/test_megaplan.py:1`).
+
+            ## Execution Order
+            1. Inspect before editing so the plan stays repo-specific.
+            2. Implement before expanding verification.
+
+            ## Validation Order
+            1. Run targeted tests first.
+            2. Run broader checks after the core change lands.
             """
         ).strip(),
         "questions": ["Are there existing patterns in the repo that should be preserved?"],
@@ -257,21 +272,34 @@ def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
     payload = {
         "plan": textwrap.dedent(
             f"""
-            # Implementation Plan
+            # Implementation Plan: Mock Revision Pass
 
-            ## Goal
-            Implement: {state['idea']}
+            ## Overview
+            Refine the plan for: {state['idea']}. Tighten file-level scope and keep validation explicit.
 
-            ## Concrete Scope
-            1. Inspect the repository and identify the exact files to touch before editing.
-            2. Implement the change in the smallest viable slice.
-            3. Run a concrete verification command and capture the result.
+            ## Step 1: Reconfirm file scope (`megaplan/handlers.py`)
+            **Scope:** Small
+            1. **Inspect** the exact edit points before changing the plan (`megaplan/handlers.py:540`).
 
-            ## Verification
-            - Run a repo-specific smoke test or command before closing the task.
+            ## Step 2: Tighten the implementation slice (`megaplan/workers.py`)
+            **Scope:** Medium
+            1. **Limit** the plan to the smallest coherent change set (`megaplan/workers.py:256`).
+            2. **Illustrate** the intended shape when it helps reviewers.
+               ```python
+               changes_summary = "Added explicit scope and verification details."
+               ```
 
-            ## Risks
-            - If the repo shape differs from expectations, adapt and record the deviation.
+            ## Step 3: Reconfirm verification (`tests/test_workers.py`)
+            **Scope:** Small
+            1. **Run** a concrete verification command and record the expected proof point (`tests/test_workers.py:251`).
+
+            ## Execution Order
+            1. Re-scope the plan before adjusting implementation details.
+            2. Re-run validation after the plan is tightened.
+
+            ## Validation Order
+            1. Start with the focused worker and handler tests.
+            2. End with the broader suite if the focused checks pass.
             """
         ).strip(),
         "changes_summary": "Added explicit repo-scoping and verification steps.",

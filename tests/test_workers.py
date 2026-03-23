@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from megaplan.evaluation import validate_plan_structure
 from megaplan.types import CliError
 from megaplan.workers import (
     extract_session_id,
@@ -256,6 +257,7 @@ def test_mock_plan_returns_valid_payload(tmp_path: Path) -> None:
     assert "questions" in result.payload
     assert "success_criteria" in result.payload
     assert "assumptions" in result.payload
+    assert validate_plan_structure(result.payload["plan"]) == []
 
 
 def test_mock_critique_returns_valid_payload(tmp_path: Path) -> None:
@@ -273,6 +275,7 @@ def test_mock_revise_returns_valid_payload(tmp_path: Path) -> None:
     assert "plan" in result.payload
     assert "changes_summary" in result.payload
     assert "flags_addressed" in result.payload
+    assert validate_plan_structure(result.payload["plan"]) == []
 
 
 def test_mock_gate_returns_valid_payload(tmp_path: Path) -> None:

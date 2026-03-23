@@ -6,11 +6,14 @@ import json
 from pathlib import Path
 
 from megaplan.evaluation import (
+    PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
+    _strip_fenced_blocks,
     build_orchestrator_guidance,
     build_gate_signals,
     compute_plan_delta_percent,
     compute_recurring_critiques,
     flag_weight,
+    validate_plan_structure,
 )
 
 
@@ -210,6 +213,136 @@ def test_compute_recurring_critiques_iteration_less_than_2(tmp_path: Path) -> No
     plan_dir.mkdir()
     assert compute_recurring_critiques(plan_dir, 1) == []
     assert compute_recurring_critiques(plan_dir, 0) == []
+
+
+# ---------------------------------------------------------------------------
+# plan structure validation tests
+# ---------------------------------------------------------------------------
+
+
+def test_strip_fenced_blocks_removes_only_fenced_content() -> None:
+    text = """before
+```python
+inside
+```
+after
+"""
+    assert _strip_fenced_blocks(text) == "before\nafter\n"
+
+
+def test_validate_plan_structure_accepts_valid_plan() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+**Scope:** Small
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Step 2: Add tests (`tests/test_evaluation.py`)
+**Scope:** Small
+1. **Cover** the expected plan shapes (`tests/test_evaluation.py:1`).
+
+## Execution Order
+1. Land the validator before wiring it.
+
+## Validation Order
+1. Run unit tests first.
+"""
+    assert validate_plan_structure(plan) == []
+
+
+def test_validate_plan_structure_warns_when_overview_missing() -> None:
+    plan = """# Implementation Plan: Example
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Validation Order
+1. Run unit tests first.
+"""
+    issues = validate_plan_structure(plan)
+    assert "Plan should include a `## Overview` section." in issues
+
+
+def test_validate_plan_structure_errors_when_step_sections_missing() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Validation Order
+1. Run unit tests first.
+"""
+    assert validate_plan_structure(plan) == [PLAN_STRUCTURE_REQUIRED_STEP_ISSUE]
+
+
+def test_validate_plan_structure_warns_when_substeps_missing() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+No numbered substeps here.
+
+## Validation Order
+1. Run unit tests first.
+"""
+    issues = validate_plan_structure(plan)
+    assert "Each `## Step N:` section should include at least one numbered substep." in issues
+
+
+def test_validate_plan_structure_warns_when_ordering_sections_missing() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+"""
+    issues = validate_plan_structure(plan)
+    assert "Plan should include `## Execution Order` or `## Validation Order`." in issues
+
+
+def test_validate_plan_structure_ignores_headings_inside_fenced_blocks() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+```md
+## Step 99: Fake step (`fake.py`)
+1. **Ignore** this heading (`fake.py:1`).
+```
+
+## Step 1: Real step (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Validation Order
+1. Run unit tests first.
+"""
+    assert validate_plan_structure(plan) == []
+
+
+def test_validate_plan_structure_accepts_small_plan_with_single_ordering_section() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Step 2: Add tests (`tests/test_evaluation.py`)
+1. **Cover** the change (`tests/test_evaluation.py:1`).
+
+## Validation Order
+1. Run unit tests first.
+"""
+    assert validate_plan_structure(plan) == []
 
 
 # ---------------------------------------------------------------------------

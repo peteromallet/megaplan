@@ -47,12 +47,14 @@ from megaplan._core import (
     slugify,
 )
 from megaplan.evaluation import (
+    PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
     build_gate_artifact,
     build_gate_signals,
     build_orchestrator_guidance,
     compute_plan_delta_percent,
     compute_recurring_critiques,
     run_gate_checks,
+    validate_plan_structure,
 )
 from megaplan._core import find_command, infer_next_steps, require_state
 from megaplan.workers import WorkerResult, update_session_state, validate_payload
@@ -329,6 +331,35 @@ def record_step_failure(
     save_state(plan_dir, state)
 
 
+def _validate_generated_plan_or_raise(
+    *,
+    plan_dir: Path,
+    state: PlanState,
+    step: str,
+    iteration: int,
+    worker: WorkerResult,
+    plan_text: str,
+) -> list[str]:
+    structure_warnings = validate_plan_structure(plan_text)
+    if PLAN_STRUCTURE_REQUIRED_STEP_ISSUE in structure_warnings:
+        error = CliError(
+            "structure_error",
+            f"{step.title()} output failed structural validation: {PLAN_STRUCTURE_REQUIRED_STEP_ISSUE}",
+            valid_next=infer_next_steps(state),
+            extra={"raw_output": worker.raw_output},
+        )
+        record_step_failure(
+            plan_dir,
+            state,
+            step=step,
+            iteration=iteration,
+            error=error,
+            duration_ms=worker.duration_ms,
+        )
+        raise error
+    return structure_warnings
+
+
 def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
     ensure_runtime_layout(root)
     project_dir = Path(args.project_dir).expanduser().resolve()
@@ -413,6 +444,14 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     if plan_filename != f"plan_v{version}.md":
         meta_filename = plan_filename.replace(".md", ".meta.json")
     plan_text = payload["plan"].rstrip() + "\n"
+    structure_warnings = _validate_generated_plan_or_raise(
+        plan_dir=plan_dir,
+        state=state,
+        step="plan",
+        iteration=version,
+        worker=worker,
+        plan_text=plan_text,
+    )
     atomic_write_text(plan_dir / plan_filename, plan_text)
     meta = {
         "version": version,
@@ -421,6 +460,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
         "questions": payload["questions"],
         "success_criteria": payload["success_criteria"],
         "assumptions": payload["assumptions"],
+        "structure_warnings": structure_warnings,
     }
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
@@ -558,6 +598,14 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_filename = f"plan_v{version}.md"
     meta_filename = f"plan_v{version}.meta.json"
     plan_text = payload["plan"].rstrip() + "\n"
+    structure_warnings = _validate_generated_plan_or_raise(
+        plan_dir=plan_dir,
+        state=state,
+        step="revise",
+        iteration=version,
+        worker=worker,
+        plan_text=plan_text,
+    )
     atomic_write_text(plan_dir / plan_filename, plan_text)
     delta = compute_plan_delta_percent(previous_plan, plan_text)
     meta = {
@@ -569,6 +617,7 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
         "questions": payload.get("questions", []),
         "success_criteria": payload.get("success_criteria", []),
         "assumptions": payload.get("assumptions", []),
+        "structure_warnings": structure_warnings,
         "delta_from_previous_percent": delta,
     }
     atomic_write_json(plan_dir / meta_filename, meta)

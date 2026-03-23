@@ -221,12 +221,42 @@ def test_plan_prompt_is_nonempty(tmp_path: Path) -> None:
     assert len(prompt) > 100
 
 
+def test_plan_prompt_includes_concrete_template(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert "# Implementation Plan: [Title]" in prompt
+    assert "## Overview" in prompt
+    assert "## Step 1: Audit the current behavior" in prompt
+    assert "## Execution Order" in prompt
+    assert "## Validation Order" in prompt
+
+
 def test_critique_prompt_contains_intent_and_robustness(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("critique", state, plan_dir)
     assert state["idea"] in prompt
     assert "Robustness level" in prompt
     assert "thorough" in prompt
+
+
+def test_critique_prompt_includes_structure_guidance_and_warnings(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "plan_v1.meta.json",
+        {
+            "version": 1,
+            "timestamp": "2026-03-20T00:00:00Z",
+            "hash": "sha256:test",
+            "success_criteria": ["criterion"],
+            "questions": ["question"],
+            "assumptions": ["assumption"],
+            "structure_warnings": ["Plan should include a `## Overview` section."],
+        },
+    )
+    prompt = create_claude_prompt("critique", state, plan_dir)
+    assert "Plan structure warnings from validator" in prompt
+    assert "Plan should include a `## Overview` section." in prompt
+    assert "Verify that the plan follows the expected structure" in prompt
 
 
 def test_critique_light_robustness(tmp_path: Path) -> None:

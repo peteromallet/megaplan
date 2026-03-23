@@ -26,6 +26,53 @@ from megaplan._core import (
 from megaplan.types import FlagRegistry
 
 
+PLAN_TEMPLATE = textwrap.dedent(
+    """
+    Plan template (adapt to the actual repo and scope):
+    ````md
+    # Implementation Plan: [Title]
+
+    ## Overview
+    Summarize the goal, current repository shape, and the constraints that matter.
+
+    ## Step 1: Audit the current behavior (`megaplan/prompts.py`)
+    **Scope:** Small
+    1. **Inspect** the current implementation and call out the exact insertion points (`megaplan/prompts.py:29`).
+
+    ## Step 2: Add the first change (`megaplan/evaluation.py`)
+    **Scope:** Medium
+    1. **Implement** the smallest viable change with exact file references (`megaplan/evaluation.py:1`).
+    2. **Capture** any tricky behavior with a short example.
+       ```python
+       issues = validate_plan_structure(plan_text)
+       ```
+
+    ## Step 3: Wire downstream behavior (`megaplan/handlers.py`, `megaplan/workers.py`)
+    **Scope:** Medium
+    1. **Update** the runtime flow in the touched files (`megaplan/handlers.py:400`, `megaplan/workers.py:199`).
+
+    ## Step 4: Prove the change (`tests/test_evaluation.py`, `tests/test_megaplan.py`)
+    **Scope:** Small
+    1. **Run** the cheapest targeted checks first (`tests/test_evaluation.py:1`).
+    2. **Finish** with broader verification once the wiring is in place (`tests/test_megaplan.py:1`).
+
+    ## Execution Order
+    1. Update prompts and mocks before enforcing stricter validation.
+    2. Land higher-risk wiring after the validator and tests are ready.
+
+    ## Validation Order
+    1. Start with focused unit tests.
+    2. Run the broader suite after the flow changes are in place.
+    ````
+
+    Template guidance:
+    - Plans with 2-3 steps can collapse `## Execution Order` and `## Validation Order` into one ordering section.
+    - Plans with 15+ steps should use the full structure and group work into coherent phases when helpful.
+    - Key invariants: one H1 title, one `## Overview`, numbered `## Step N:` sections, and at least one ordering section.
+    """
+).strip()
+
+
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     clarification = state.get("clarification", {})
@@ -57,6 +104,8 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         - Use the `assumptions` field for defaults you are making so planning can proceed now.
         - Prefer cheap validation steps early.
         - If user notes answer earlier questions, incorporate them into the draft plan instead of re-asking them.
+
+        {PLAN_TEMPLATE}
         """
     ).strip()
 
@@ -105,6 +154,9 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         - Preserve or improve success criteria quality.
         - Verify that the plan remains aligned with the user's original intent, not just internal plan quality.
         - Remove unjustified scope growth. If critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
+        - Maintain the structural template: H1 title, ## Overview, numbered ## Step N sections, ## Execution Order or ## Validation Order.
+
+        {PLAN_TEMPLATE}
         """
     ).strip()
 
@@ -113,6 +165,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    structure_warnings = latest_meta.get("structure_warnings", [])
     flag_registry = load_flag_registry(plan_dir)
     robustness = configured_robustness(state)
     unresolved = [
@@ -140,6 +193,9 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         Plan metadata:
         {json_dump(latest_meta).strip()}
 
+        Plan structure warnings from validator:
+        {json_dump(structure_warnings).strip()}
+
         Existing flags:
         {json_dump(unresolved).strip()}
 
@@ -150,6 +206,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         - Focus on concrete issues that would cause real problems.
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
         - Verify that the plan remains aligned with the user's original intent.
+        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered `## Step N:` sections with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`. Missing structure should be flagged as category `completeness` with severity_hint `likely-significant`.
         - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
         - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
         """

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,9 @@ from megaplan._core import (
     scope_creep_flags,
     unresolved_significant_flags,
 )
+
+
+PLAN_STRUCTURE_REQUIRED_STEP_ISSUE = "Plan must include at least one `## Step N:` section."
 
 
 def flag_weight(flag: FlagRecord) -> float:
@@ -74,6 +78,57 @@ def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
     previous_concerns = {normalize_text(flag["concern"]) for flag in previous.get("flags", [])}
     current_concerns = {normalize_text(flag["concern"]) for flag in current.get("flags", [])}
     return sorted(previous_concerns.intersection(current_concerns))
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    kept_lines: list[str] = []
+    inside_fence = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("```"):
+            inside_fence = not inside_fence
+            continue
+        if not inside_fence:
+            kept_lines.append(line)
+    return "".join(kept_lines)
+
+
+def validate_plan_structure(plan_text: str) -> list[str]:
+    issues: list[str] = []
+    stripped = _strip_fenced_blocks(plan_text)
+
+    if len(re.findall(r"(?mi)^#\s+.+$", stripped)) != 1:
+        issues.append("Plan should have exactly one H1 title.")
+    if not re.search(r"(?mi)^##\s+Overview\s*$", stripped):
+        issues.append("Plan should include a `## Overview` section.")
+
+    step_matches = list(re.finditer(r"(?im)^##\s+Step\s+\d+:\s+.+$", stripped))
+    if not step_matches:
+        issues.append(PLAN_STRUCTURE_REQUIRED_STEP_ISSUE)
+        return issues
+
+    if not (
+        re.search(r"(?mi)^##\s+Execution Order\s*$", stripped)
+        or re.search(r"(?mi)^##\s+Validation Order\s*$", stripped)
+    ):
+        issues.append("Plan should include `## Execution Order` or `## Validation Order`.")
+
+    missing_substeps = False
+    missing_file_refs = False
+    for index, match in enumerate(step_matches):
+        start = match.end()
+        next_heading = re.search(r"(?im)^##\s+.+$", stripped[start:])
+        end = start + next_heading.start() if next_heading else len(stripped)
+        section = stripped[match.start():end]
+        if not re.search(r"(?m)^\d+\.\s+", stripped[start:end]):
+            missing_substeps = True
+        if not re.search(r"`[^`]+`", section):
+            missing_file_refs = True
+
+    if missing_substeps:
+        issues.append("Each `## Step N:` section should include at least one numbered substep.")
+    if missing_file_refs:
+        issues.append("Each `## Step N:` section should reference at least one file in backticks.")
+    return issues
 
 
 def _previous_iteration_plan_path(plan_dir: Path, state: PlanState) -> Path | None:

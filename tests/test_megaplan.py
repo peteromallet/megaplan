@@ -14,6 +14,7 @@ import megaplan.handlers
 import megaplan.cli
 import megaplan._core
 import megaplan.workers
+from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE
 from megaplan._core import ensure_runtime_layout, load_plan
 from megaplan.workers import WorkerResult
 
@@ -168,6 +169,8 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     review = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     finalized_after_review = read_json(plan_fixture.plan_dir / "finalize.json")
     final_md_after_review = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
+    plan_meta = read_json(plan_fixture.plan_dir / "plan_v1.meta.json")
+    revise_meta = read_json(plan_fixture.plan_dir / "plan_v2.meta.json")
     state = load_state(plan_fixture.plan_dir)
 
     assert plan["state"] == megaplan.STATE_PLANNED
@@ -178,6 +181,8 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert gate2["state"] == megaplan.STATE_GATED
     assert gate2["recommendation"] == "PROCEED"
     assert finalize["state"] == megaplan.STATE_FINALIZED
+    assert plan_meta["structure_warnings"] == []
+    assert revise_meta["structure_warnings"] == []
     assert (plan_fixture.plan_dir / "final.md").exists()
     assert (plan_fixture.plan_dir / "finalize.json").exists()
     assert finalized_tracking["tasks"][0]["status"] == "pending"
@@ -196,6 +201,74 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert execute_entry["finalize_hash"].startswith("sha256:")
     assert review_entry["finalize_hash"].startswith("sha256:")
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
+
+
+def test_handle_plan_stores_nonblocking_structure_warnings(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = WorkerResult(
+        payload={
+            "plan": """# Implementation Plan: Warning Case
+
+## Step 1: Touch one file (`megaplan/evaluation.py`)
+1. **Implement** the change (`megaplan/evaluation.py:1`).
+
+## Validation Order
+1. Run a focused test.
+""",
+            "questions": [],
+            "success_criteria": ["warn but continue"],
+            "assumptions": [],
+        },
+        raw_output="warning case",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="plan-warning",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    meta = read_json(plan_fixture.plan_dir / "plan_v1.md".replace(".md", ".meta.json"))
+
+    assert response["success"] is True
+    assert meta["structure_warnings"] == ["Plan should include a `## Overview` section."]
+
+
+def test_handle_plan_rejects_zero_step_structure_error(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = WorkerResult(
+        payload={
+            "plan": """# Implementation Plan: Invalid
+
+## Overview
+No numbered step sections here.
+
+## Validation Order
+1. Run a focused test.
+""",
+            "questions": [],
+            "success_criteria": ["should fail"],
+            "assumptions": [],
+        },
+        raw_output="invalid plan output",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="plan-invalid",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    with pytest.raises(megaplan.CliError, match="structural validation"):
+        megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    error_entry = state["history"][-1]
+    assert error_entry["result"] == "error"
+    assert PLAN_STRUCTURE_REQUIRED_STEP_ISSUE in error_entry["message"]
 
 
 def test_handle_revise_requires_prior_iterate_gate(plan_fixture: PlanFixture) -> None:
