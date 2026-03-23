@@ -76,6 +76,16 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["flags"],
     },
+    "finalize.json": {
+        "type": "object",
+        "properties": {
+            "final_plan": {"type": "string"},
+            "task_count": {"type": "integer"},
+            "watch_items": {"type": "array", "items": {"type": "string"}},
+            "meta_commentary": {"type": "string"},
+        },
+        "required": ["final_plan", "task_count", "watch_items", "meta_commentary"],
+    },
     "execution.json": {
         "type": "object",
         "properties": {

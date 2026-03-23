@@ -18,8 +18,9 @@ Run the loop in this order:
 2. `critique`
 3. `gate`
 4. `revise` when gate recommends iteration
-5. `execute`
-6. `review`
+5. `finalize`
+6. `execute`
+7. `review`
 Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
 ## Step Rules
 - `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`.
@@ -32,8 +33,9 @@ The gate response tells the orchestrator what to do next. Follow `orchestrator_g
 Investigate before disagreeing: read the current plan and critique artifacts, check the project code to verify whether a flagged issue is real, or use `megaplan status --plan <name>` / `megaplan audit --plan <name>`.
 If you disagree with the guidance, explain why briefly and use an override. Do not manually reinterpret score trajectory, flag quality, or loop state when the gate already did that work for you.
 ## Execute
-- In auto-approve mode, run `megaplan execute --confirm-destructive` after a successful gate.
-- In review mode, pause at the gate checkpoint and wait for explicit approval before running:
+- After a successful gate, run `megaplan finalize` to produce the execution-ready briefing document.
+- In auto-approve mode, run `megaplan execute --confirm-destructive` after finalize.
+- In review mode, pause at the finalize-to-execute checkpoint and wait for explicit approval before running:
 ```bash
 megaplan execute --confirm-destructive --user-approved
 ```
@@ -42,7 +44,7 @@ megaplan execute --confirm-destructive --user-approved
 - `megaplan override force-proceed --plan <name> --reason "..."`
 - `megaplan override replan --plan <name> --reason "..." [--note "..."]`
 - `megaplan override abort --plan <name> --reason "..."`
-`force-proceed` is available from `critiqued`. `replan` is available from `gated` or `critiqued`. `add-note` is safe from any active state.
+`force-proceed` is available from `critiqued` (routes to finalize, not execute). `replan` is available from `gated`, `finalized`, or `critiqued`. `add-note` is safe from any active state.
 ## Replan
 Use `replan` when the orchestrator itself needs to edit the plan directly instead of asking the revise worker to do it.
 ```bash
@@ -55,7 +57,7 @@ After `replan`, read the returned plan file, edit it directly, then run `megapla
 - `--ephemeral`: one-off call with no saved session.
 - `--persist`: explicit persistent mode.
 - Keep moving and show results at each step.
-- Only pause at gate to execute in review mode.
+- Only pause at finalize to execute in review mode.
 ## Commands
 ```bash
 megaplan status --plan <name>
@@ -65,6 +67,7 @@ megaplan plan --plan <name>
 megaplan critique --plan <name>
 megaplan revise --plan <name>
 megaplan gate --plan <name>
+megaplan finalize --plan <name>
 megaplan execute --plan <name> --confirm-destructive
 megaplan review --plan <name>
 megaplan override add-note --plan <name> --note "..."

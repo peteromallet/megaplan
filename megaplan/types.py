@@ -13,6 +13,7 @@ STATE_INITIALIZED = "initialized"
 STATE_PLANNED = "planned"
 STATE_CRITIQUED = "critiqued"
 STATE_GATED = "gated"
+STATE_FINALIZED = "finalized"
 STATE_EXECUTED = "executed"
 STATE_DONE = "done"
 STATE_ABORTED = "aborted"
@@ -223,6 +224,7 @@ DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "critique": "codex",
     "revise": "claude",
     "gate": "claude",
+    "finalize": "claude",
     "execute": "codex",
     "review": "codex",
 }

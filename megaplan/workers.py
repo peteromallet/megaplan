@@ -45,6 +45,7 @@ STEP_SCHEMA_FILENAMES: dict[str, str] = {
     "revise": "revise.json",
     "critique": "critique.json",
     "gate": "gate.json",
+    "finalize": "finalize.json",
     "execute": "execution.json",
     "review": "review.json",
 }
@@ -304,6 +305,33 @@ def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(payload)
 
 
+def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
+    latest_plan = (plan_dir / f"plan_v{state['iteration']}.md").read_text(encoding="utf-8")
+    payload = {
+        "final_plan": (
+            f"## Checklist\n\n"
+            f"- [ ] Implement: {state['idea']}\n"
+            f"  > _notes:_\n"
+            f"- [ ] Verify success criteria\n"
+            f"  > _notes:_\n\n"
+            f"## Watch Items\n\n"
+            f"- Ensure repository state matches plan assumptions\n\n"
+            f"## Review Sense-Check\n\n"
+            f"- [ ] Verify: implementation matches the stated idea\n"
+            f"  > _verdict:_\n"
+            f"- [ ] Verify: success criteria are testable\n"
+            f"  > _verdict:_\n\n"
+            f"## Meta\n\n"
+            f"This is a mock finalize output.\n\n"
+            f"---\n\n{latest_plan}"
+        ),
+        "task_count": 2,
+        "watch_items": ["Ensure repository state matches plan assumptions"],
+        "meta_commentary": "This is a mock finalize output.",
+    }
+    return _mock_result(payload)
+
+
 def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
     target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
     target.write_text("mock execution completed\n", encoding="utf-8")
@@ -333,6 +361,7 @@ _MOCK_DISPATCH: dict[str, _MockHandler] = {
     "critique": _mock_critique,
     "revise": _mock_revise,
     "gate": _mock_gate,
+    "finalize": _mock_finalize,
     "execute": _mock_execute,
     "review": _mock_review,
 }
@@ -352,6 +381,8 @@ def session_key_for(step: str, agent: str) -> str:
         return f"{agent}_critic"
     if step == "gate":
         return f"{agent}_gatekeeper"
+    if step == "finalize":
+        return f"{agent}_finalizer"
     if step == "execute":
         return f"{agent}_executor"
     if step == "review":

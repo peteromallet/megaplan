@@ -156,6 +156,7 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     revise = megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     critique2 = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     gate2 = megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    finalize = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     execute = megaplan.handle_execute(
         plan_fixture.root,
         make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
@@ -169,6 +170,9 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert critique2["iteration"] == 2
     assert gate2["state"] == megaplan.STATE_GATED
     assert gate2["recommendation"] == "PROCEED"
+    assert finalize["state"] == megaplan.STATE_FINALIZED
+    assert (plan_fixture.plan_dir / "final.md").exists()
+    assert (plan_fixture.plan_dir / "finalize.json").exists()
     assert execute["state"] == megaplan.STATE_EXECUTED
     assert review["state"] == megaplan.STATE_DONE
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
@@ -201,10 +205,10 @@ def test_force_proceed_from_critiqued_writes_override_gate(plan_fixture: PlanFix
     state = load_state(plan_fixture.plan_dir)
 
     assert response["state"] == megaplan.STATE_GATED
-    assert response["orchestrator_guidance"] == "Force-proceed override applied. Proceed to execute."
+    assert response["orchestrator_guidance"] == "Force-proceed override applied. Proceed to finalize."
     assert gate["override_forced"] is True
     assert gate["recommendation"] == "PROCEED"
-    assert gate["orchestrator_guidance"] == "Force-proceed override applied. Proceed to execute."
+    assert gate["orchestrator_guidance"] == "Force-proceed override applied. Proceed to finalize."
     assert state["last_gate"] == {}
 
 
@@ -545,6 +549,7 @@ def test_execute_requires_confirm_destructive(plan_fixture: PlanFixture) -> None
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
     )
+    megaplan.handle_finalize(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     with pytest.raises(megaplan.CliError, match="confirm-destructive"):
         megaplan.handle_execute(
             plan_fixture.root,
@@ -559,6 +564,7 @@ def test_execute_requires_user_approval_in_review_mode(plan_fixture: PlanFixture
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
     )
+    megaplan.handle_finalize(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     with pytest.raises(megaplan.CliError, match="user approval"):
         megaplan.handle_execute(
             plan_fixture.root,
@@ -573,6 +579,7 @@ def test_execute_succeeds_with_user_approval(plan_fixture: PlanFixture) -> None:
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
     )
+    megaplan.handle_finalize(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     response = megaplan.handle_execute(
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
@@ -598,6 +605,7 @@ def test_execute_succeeds_in_auto_approve_mode(tmp_path: Path, monkeypatch: pyte
     megaplan.handle_plan(root, make_args(plan="test-plan"))
     megaplan.handle_critique(root, make_args(plan="test-plan"))
     megaplan.handle_override(root, make_args(plan="test-plan", override_action="force-proceed", reason="test"))
+    megaplan.handle_finalize(root, make_args(plan="test-plan"))
     response = megaplan.handle_execute(
         root,
         make_args(plan="test-plan", confirm_destructive=True, user_approved=False),

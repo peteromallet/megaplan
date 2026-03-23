@@ -26,6 +26,7 @@ from megaplan.types import (
     SCOPE_CREEP_TERMS,
     STATE_CRITIQUED,
     STATE_EXECUTED,
+    STATE_FINALIZED,
     STATE_GATED,
     STATE_INITIALIZED,
     STATE_PLANNED,
@@ -373,6 +374,8 @@ def infer_next_steps(state: PlanState) -> list[str]:
             return ["revise", "override force-proceed"]
         return ["gate"]
     if current == STATE_GATED:
+        return ["finalize", "override replan"]
+    if current == STATE_FINALIZED:
         return ["execute", "override replan"]
     if current == STATE_EXECUTED:
         return ["review"]

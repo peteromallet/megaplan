@@ -23,6 +23,7 @@ from megaplan._core import (
     robustness_critique_instruction,
     unresolved_significant_flags,
 )
+from megaplan.types import FlagRegistry
 
 
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
@@ -210,9 +211,84 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
+def _collect_critique_summaries(plan_dir: Path, iteration: int) -> list[dict[str, object]]:
+    """Gather a compact list of all critique rounds for the finalize prompt."""
+    summaries: list[dict[str, object]] = []
+    for i in range(1, iteration + 1):
+        path = plan_dir / f"critique_v{i}.json"
+        if path.exists():
+            data = read_json(path)
+            summaries.append({
+                "iteration": i,
+                "flag_count": len(data.get("flags", [])),
+                "verified": data.get("verified_flag_ids", []),
+            })
+    return summaries
+
+
+def _flag_summary(registry: FlagRegistry) -> list[dict[str, object]]:
+    """Compact flag list for the finalize prompt."""
+    return [
+        {
+            "id": f["id"],
+            "concern": f["concern"],
+            "status": f["status"],
+            "severity": f.get("severity", "unknown"),
+        }
+        for f in registry["flags"]
+    ]
+
+
+def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    gate = read_json(plan_dir / "gate.json")
+    flag_registry = load_flag_registry(plan_dir)
+    critique_history = _collect_critique_summaries(plan_dir, state["iteration"])
+    return textwrap.dedent(
+        f"""
+        You are preparing an execution-ready briefing document from the approved plan.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Approved plan:
+        {latest_plan}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Gate summary:
+        {json_dump(gate).strip()}
+
+        Flag registry:
+        {json_dump(_flag_summary(flag_registry)).strip()}
+
+        Critique history:
+        {json_dump(critique_history).strip()}
+
+        Requirements:
+        - Produce an execution-ready markdown document in the `final_plan` field.
+        - Start with a task checklist: `- [ ] Task description` items, ordered by execution sequence, with dependencies or sequencing notes where relevant.
+        - Each checklist item MUST be followed by an indented comment line: `  > _notes:_` — the executor is required to fill this in during execution with what they actually did, any deviations, or confirmation.
+        - Follow the checklist with a "Watch Items" section listing edge cases from critique, gate warnings, and assumptions that need runtime verification.
+        - After Watch Items, add a "Review Sense-Check" section with one `- [ ]` item per checklist task, worded as a verification question (e.g., "Verify: STATE_FINALIZED is exported and used in all routing tables"). The reviewer will check these off after reading the executor's notes and verifying the work. Each sense-check item must also have a `  > _verdict:_` line for the reviewer to fill in.
+        - End with a "Meta" section: brief commentary to help the executor succeed — context, gotchas, or judgment calls that aren't obvious from the plan alone.
+        - The document should be self-contained: an executor reading only this document should have everything they need.
+        - `task_count` should equal the number of checklist items.
+        - `watch_items` should list the watch items as an array of strings.
+        - `meta_commentary` should contain the meta section text.
+        """
+    ).strip()
+
+
+def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    final_md = plan_dir / "final.md"
+    latest_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
@@ -234,7 +310,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {intent_and_notes_block(state)}
 
-        Approved plan:
+        Execution-ready plan:
         {latest_plan}
 
         Plan metadata:
@@ -251,6 +327,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
         - Output concrete files changed and commands run.
+        - IMPORTANT: The execution-ready plan contains a task checklist. As you complete each task, update final.md: change `- [ ]` to `- [x]` and fill in the `> _notes:_` line with what you actually did, any deviations, or confirmation that it went as planned. Every checklist item must be checked off and commented before execution is complete.
         """
     ).strip()
 
@@ -262,6 +339,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     execution = read_json(plan_dir / "execution.json")
     gate = read_json(plan_dir / "gate.json")
     diff_summary = collect_git_diff_summary(project_dir)
+    final_md = plan_dir / "final.md"
+    finalized_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
     return textwrap.dedent(
         f"""
         Review the execution critically against user intent and observable success criteria.
@@ -273,6 +352,9 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
 
         Approved plan:
         {latest_plan}
+
+        Finalized plan (execution-ready document with checklist):
+        {finalized_plan}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -290,6 +372,9 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         - Judge against the success criteria, not plan elegance.
         - Be critical and call out real misses.
         - If there are failures, describe them as issues.
+        - Verify the finalized plan checklist: every `- [ ]` item in the Checklist section should be `- [x]` with a filled-in `> _notes:_` comment. Flag any unchecked or uncommented items as issues.
+        - Sense-check each executor comment: does the note actually describe completing the task? Does it make sense given the git diff? Flag vague, copy-pasted, or contradictory notes as issues.
+        - Fill in the "Review Sense-Check" section in final.md: for each sense-check item, change `- [ ]` to `- [x]` if the work checks out or leave it unchecked if it doesn't, and fill in the `> _verdict:_` line with your assessment.
         """
     ).strip()
 
@@ -300,6 +385,8 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     execution = read_json(plan_dir / "execution.json")
     diff_summary = collect_git_diff_summary(project_dir)
+    final_md = plan_dir / "final.md"
+    finalized_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
     return textwrap.dedent(
         f"""
         Review the implementation against the success criteria.
@@ -311,6 +398,9 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
 
         Approved plan:
         {latest_plan}
+
+        Finalized plan (execution-ready document with checklist):
+        {finalized_plan}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -325,6 +415,9 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         - Be critical.
         - Verify each success criterion explicitly.
         - Call out any concrete gaps or regressions in issues.
+        - Verify the finalized plan checklist: every `- [ ]` item in the Checklist section should be `- [x]` with a filled-in `> _notes:_` comment. Flag any unchecked or uncommented items as issues.
+        - Sense-check each executor comment: does the note actually describe completing the task? Does it make sense given the git diff? Flag vague, copy-pasted, or contradictory notes as issues.
+        - Fill in the "Review Sense-Check" section in final.md: for each sense-check item, change `- [ ]` to `- [x]` if the work checks out or leave it unchecked if it doesn't, and fill in the `> _verdict:_` line with your assessment.
         """
     ).strip()
 
@@ -336,6 +429,7 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
+    "finalize": _finalize_prompt,
     "execute": _execute_prompt,
     "review": _review_claude_prompt,
 }
@@ -345,6 +439,7 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
+    "finalize": _finalize_prompt,
     "execute": _execute_prompt,
     "review": _review_codex_prompt,
 }

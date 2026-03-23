@@ -11,6 +11,7 @@ def test_schema_registry_matches_5_step_workflow() -> None:
         "revise.json",
         "gate.json",
         "critique.json",
+        "finalize.json",
         "execution.json",
         "review.json",
     }
@@ -94,7 +95,7 @@ def test_strict_schema_non_object_untouched() -> None:
 
 
 def test_schema_registry_has_all_expected_steps() -> None:
-    expected_schemas = {"plan.json", "revise.json", "gate.json", "critique.json", "execution.json", "review.json"}
+    expected_schemas = {"plan.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
     assert set(SCHEMAS.keys()) == expected_schemas
 
 

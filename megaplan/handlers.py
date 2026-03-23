@@ -20,6 +20,7 @@ from megaplan.types import (
     STATE_CRITIQUED,
     STATE_DONE,
     STATE_EXECUTED,
+    STATE_FINALIZED,
     STATE_GATED,
     STATE_INITIALIZED,
     STATE_PLANNED,
@@ -638,12 +639,9 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     artifacts = [signals_filename, "gate.json"]
     summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
     if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
-        final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-        atomic_write_text(plan_dir / "final.md", final_plan)
-        artifacts.append("final.md")
         state["current_state"] = STATE_GATED
         state["meta"].pop("user_approved_gate", None)
-        next_step = "execute"
+        next_step = "finalize"
     elif gate_summary["recommendation"] == "PROCEED":
         result = "blocked"
         next_step = "revise"
@@ -701,9 +699,53 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     return response
 
 
+def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    require_state(state, "finalize", {STATE_GATED})
+    try:
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("finalize", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="finalize", iteration=state["iteration"], error=error)
+        raise
+    payload = worker.payload
+    atomic_write_text(plan_dir / "final.md", payload["final_plan"])
+    atomic_write_json(plan_dir / "finalize.json", {
+        "task_count": payload["task_count"],
+        "watch_items": payload["watch_items"],
+        "meta_commentary": payload["meta_commentary"],
+    })
+    state["current_state"] = STATE_FINALIZED
+    apply_session_update(state, "finalize", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    append_history(
+        state,
+        make_history_entry(
+            "finalize",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file="finalize.json",
+            artifact_hash=sha256_file(plan_dir / "finalize.json"),
+        ),
+    )
+    save_state(plan_dir, state)
+    response: StepResponse = {
+        "success": True,
+        "step": "finalize",
+        "summary": f"Finalized plan with {payload['task_count']} tasks and {len(payload['watch_items'])} watch items.",
+        "artifacts": ["final.md", "finalize.json"],
+        "next_step": "execute",
+        "state": STATE_FINALIZED,
+    }
+    attach_agent_fallback(response, args)
+    return response
+
+
 def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "execute", {STATE_GATED})
+    require_state(state, "execute", {STATE_FINALIZED})
     if not args.confirm_destructive:
         raise CliError("missing_confirmation", "Execute requires --confirm-destructive")
     auto_approve = bool(state["config"].get("auto_approve", False))
@@ -775,8 +817,6 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="review", iteration=state["iteration"], error=error)
         raise
     atomic_write_json(plan_dir / "review.json", worker.payload)
-    final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    atomic_write_text(plan_dir / "final.md", final_plan)
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
     state["current_state"] = STATE_DONE
@@ -800,7 +840,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         "success": True,
         "step": "review",
         "summary": f"Review complete: {passed}/{total} success criteria passed.",
-        "artifacts": ["review.json", "final.md"],
+        "artifacts": ["review.json"],
         "next_step": None,
         "state": STATE_DONE,
         "issues": worker.payload.get("issues", []),
@@ -869,11 +909,9 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
             "warnings": signals.get("warnings", []),
         },
         override_forced=True,
-        orchestrator_guidance="Force-proceed override applied. Proceed to execute.",
+        orchestrator_guidance="Force-proceed override applied. Proceed to finalize.",
     )
     atomic_write_json(plan_dir / "gate.json", gate)
-    final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
     state["meta"].pop("user_approved_gate", None)
     state["last_gate"] = {}
@@ -883,14 +921,14 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
         "success": True,
         "step": "override",
         "summary": "Force-proceeded past gate judgment into gated state.",
-        "next_step": "execute",
+        "next_step": "finalize",
         "state": STATE_GATED,
         "orchestrator_guidance": gate["orchestrator_guidance"],
     }
 
 
 def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    allowed = {STATE_GATED, STATE_CRITIQUED}
+    allowed = {STATE_GATED, STATE_FINALIZED, STATE_CRITIQUED}
     if state["current_state"] not in allowed:
         raise CliError(
             "invalid_transition",

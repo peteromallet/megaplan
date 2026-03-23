@@ -51,6 +51,7 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
         ("plan", {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}),
         ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
         ("gate", {"recommendation": "PROCEED", "rationale": "ok", "signals_assessment": "ok", "warnings": []}),
+        ("finalize", {"final_plan": "# Plan", "task_count": 1, "watch_items": [], "meta_commentary": "ok"}),
     ],
 )
 def test_validate_payload_accepts_current_worker_steps(step: str, payload: dict[str, object]) -> None:
@@ -209,6 +210,18 @@ def test_mock_gate_returns_valid_payload(tmp_path: Path) -> None:
     assert "warnings" in result.payload
 
 
+def test_mock_finalize_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("finalize", state, plan_dir)
+    assert "final_plan" in result.payload
+    assert "task_count" in result.payload
+    assert "watch_items" in result.payload
+    assert "meta_commentary" in result.payload
+    assert isinstance(result.payload["watch_items"], list)
+    assert result.payload["task_count"] == 2
+
+
 def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
     from megaplan.workers import mock_worker_output
     plan_dir, state = _mock_state(tmp_path)
@@ -265,7 +278,7 @@ def test_session_key_for_unknown_step_uses_step_name() -> None:
 
 def test_step_schema_filenames_cover_all_steps() -> None:
     from megaplan.workers import STEP_SCHEMA_FILENAMES
-    expected_steps = {"plan", "revise", "critique", "gate", "execute", "review"}
+    expected_steps = {"plan", "revise", "critique", "gate", "finalize", "execute", "review"}
     assert set(STEP_SCHEMA_FILENAMES.keys()) == expected_steps
 
 

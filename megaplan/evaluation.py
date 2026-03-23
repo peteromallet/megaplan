@@ -258,7 +258,7 @@ def build_orchestrator_guidance(
     if iteration == 1:
         guidance = f"First iteration; follow gate recommendation: {recommendation}."
     elif recommendation == "PROCEED" and preflight_passed:
-        guidance = "Plan passed gate and preflight. Proceed to execute."
+        guidance = "Plan passed gate and preflight. Proceed to finalize."
     elif recommendation == "PROCEED":
         failing_checks = ", ".join(
             name for name, passed in preflight_results.items() if not passed

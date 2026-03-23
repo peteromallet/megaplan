@@ -298,7 +298,7 @@ def test_build_orchestrator_guidance_proceed_with_preflight_passed() -> None:
         robustness="standard",
         plan_name="demo-plan",
     )
-    assert guidance == "Plan passed gate and preflight. Proceed to execute."
+    assert guidance == "Plan passed gate and preflight. Proceed to finalize."
 
 
 def test_build_orchestrator_guidance_proceed_with_preflight_failure_lists_checks() -> None:
