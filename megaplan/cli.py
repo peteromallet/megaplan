@@ -37,6 +37,7 @@ from megaplan.handlers import (
     handle_plan,
     handle_review,
     handle_revise,
+    handle_step,
 )
 
 
@@ -298,6 +299,23 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("value")
     config_sub.add_parser("reset")
 
+    step_parser = subparsers.add_parser("step", help="Edit plan step sections without hand-editing markdown")
+    step_subparsers = step_parser.add_subparsers(dest="step_action", required=True)
+
+    step_add_parser = step_subparsers.add_parser("add", help="Insert a new step after an existing step")
+    step_add_parser.add_argument("--plan")
+    step_add_parser.add_argument("--after")
+    step_add_parser.add_argument("description")
+
+    step_remove_parser = step_subparsers.add_parser("remove", help="Remove a step and renumber the plan")
+    step_remove_parser.add_argument("--plan")
+    step_remove_parser.add_argument("step_id")
+
+    step_move_parser = step_subparsers.add_parser("move", help="Move a step after another step and renumber")
+    step_move_parser.add_argument("--plan")
+    step_move_parser.add_argument("step_id")
+    step_move_parser.add_argument("--after", required=True)
+
     override_parser = subparsers.add_parser("override")
     override_parser.add_argument("override_action", choices=["abort", "force-proceed", "add-note", "replan"])
     override_parser.add_argument("--plan")
@@ -319,6 +337,7 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "status": handle_status,
     "audit": handle_audit,
     "list": handle_list,
+    "step": handle_step,
     "override": handle_override,
 }
 

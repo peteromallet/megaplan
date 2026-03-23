@@ -13,6 +13,9 @@ from megaplan.evaluation import (
     compute_plan_delta_percent,
     compute_recurring_critiques,
     flag_weight,
+    parse_plan_sections,
+    reassemble_plan,
+    renumber_steps,
     validate_plan_structure,
 )
 
@@ -228,6 +231,96 @@ inside
 after
 """
     assert _strip_fenced_blocks(text) == "before\nafter\n"
+
+
+def test_parse_plan_sections_basic() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summarize the work.
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Notes
+Keep this section in place.
+
+## Step 2: Add tests (`tests/test_evaluation.py`)
+1. **Cover** the parser (`tests/test_evaluation.py:1`).
+"""
+    sections = parse_plan_sections(plan)
+
+    assert [section.id for section in sections] == [None, None, "S1", None, "S2"]
+    assert sections[0].heading == ""
+    assert sections[0].start_line == 1
+    assert sections[0].end_line == 2
+    assert sections[2].heading == "## Step 1: Update validation (`megaplan/evaluation.py`)"
+    assert sections[2].start_line == 6
+    assert sections[2].end_line == 8
+    assert sections[3].heading == "## Notes"
+    assert sections[4].start_line == 12
+    assert sections[4].end_line == 13
+
+
+def test_parse_plan_sections_fenced() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+```md
+## Step 99: Fake step (`fake.py`)
+1. **Ignore** this heading (`fake.py:1`).
+```
+
+## Step 1: Real step (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+
+## Validation Order
+1. Run tests.
+"""
+    sections = parse_plan_sections(plan)
+
+    assert [section.heading for section in sections] == [
+        "",
+        "## Overview",
+        "## Step 1: Real step (`megaplan/evaluation.py`)",
+        "## Validation Order",
+    ]
+    assert [section.id for section in sections] == [None, None, "S1", None]
+
+
+def test_renumber_steps() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summary.
+
+## Step 1: First step (`a.py`)
+1. **Do** the first part (`a.py:1`).
+
+## Step 3: Third step (`c.py`)
+1. **Do** the third part (`c.py:1`).
+"""
+    sections = parse_plan_sections(plan)
+    renumbered = renumber_steps(sections)
+
+    assert [section.id for section in renumbered if section.id is not None] == ["S1", "S2"]
+    assert "## Step 2: Third step (`c.py`)" in renumbered[-1].body
+
+
+def test_reassemble_roundtrip() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Intro text.
+
+```python
+print("## Step 42: not real")
+```
+
+## Step 1: Update validation (`megaplan/evaluation.py`)
+1. **Add** the validator (`megaplan/evaluation.py:1`).
+"""
+    assert reassemble_plan(parse_plan_sections(plan)) == plan
 
 
 def test_validate_plan_structure_accepts_valid_plan() -> None:

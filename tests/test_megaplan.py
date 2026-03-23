@@ -14,7 +14,7 @@ import megaplan.handlers
 import megaplan.cli
 import megaplan._core
 import megaplan.workers
-from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE
+from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
 from megaplan._core import ensure_runtime_layout, load_plan
 from megaplan.workers import WorkerResult
 
@@ -89,6 +89,10 @@ def load_state(plan_dir: Path) -> dict:
     return read_json(plan_dir / "state.json")
 
 
+def latest_plan_name(plan_dir: Path) -> str:
+    return load_state(plan_dir)["plan_versions"][-1]["file"]
+
+
 def test_init_sets_last_gate_and_next_step_plan(plan_fixture: PlanFixture) -> None:
     state = load_state(plan_fixture.plan_dir)
     assert state["current_state"] == megaplan.STATE_INITIALIZED
@@ -112,17 +116,28 @@ def test_init_response_points_to_plan(tmp_path: Path, monkeypatch: pytest.Monkey
 
 def test_infer_next_steps_matches_new_state_machine() -> None:
     assert megaplan.infer_next_steps({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}) == ["plan"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}) == ["plan", "critique"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}) == ["gate"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}) == ["revise"]
+    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}) == ["plan", "critique", "step"]
+    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}) == ["gate", "step"]
+    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}) == ["revise", "step"]
     assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ESCALATE"}}) == [
         "override add-note",
         "override force-proceed",
         "override abort",
+        "step",
     ]
     assert megaplan.infer_next_steps(
         {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "PROCEED", "passed": False}}
-    ) == ["revise", "override force-proceed"]
+    ) == ["revise", "override force-proceed", "step"]
+    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_GATED, "last_gate": {}}) == [
+        "finalize",
+        "override replan",
+        "step",
+    ]
+    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}}) == [
+        "execute",
+        "override replan",
+        "step",
+    ]
 
 
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
@@ -330,6 +345,168 @@ def test_replan_from_gated_resets_to_planned(plan_fixture: PlanFixture) -> None:
     assert response["state"] == megaplan.STATE_PLANNED
     assert state["last_gate"] == {}
     assert response["next_step"] == "critique"
+
+
+def test_step_add(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    response = megaplan.handle_step(
+        plan_fixture.root,
+        plan_fixture.make_args(
+            plan=plan_fixture.plan_name,
+            step_action="add",
+            after="S2",
+            description="Add parser edge-case coverage",
+        ),
+    )
+    state = load_state(plan_fixture.plan_dir)
+    plan_name = latest_plan_name(plan_fixture.plan_dir)
+    plan_text = (plan_fixture.plan_dir / plan_name).read_text(encoding="utf-8")
+    latest_meta = read_json(plan_fixture.plan_dir / plan_name.replace(".md", ".meta.json"))
+    previous_meta = read_json(plan_fixture.plan_dir / "plan_v1.meta.json")
+
+    assert response["state"] == megaplan.STATE_PLANNED
+    assert state["iteration"] == 1
+    assert plan_name == "plan_v1a.md"
+    assert state["last_gate"] == {}
+    assert "## Step 3: Add parser edge-case coverage" in plan_text
+    assert "## Step 4: Verify the behavior" in plan_text
+    assert latest_meta["questions"] == previous_meta["questions"]
+    assert latest_meta["success_criteria"] == previous_meta["success_criteria"]
+    assert latest_meta["assumptions"] == previous_meta["assumptions"]
+    assert latest_meta["step_edit"]["action"] == "add"
+
+
+def test_step_add_scaffold_passes_validation(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_step(
+        plan_fixture.root,
+        plan_fixture.make_args(
+            plan=plan_fixture.plan_name,
+            step_action="add",
+            after="S1",
+            description="Document the handler change",
+        ),
+    )
+
+    plan_name = latest_plan_name(plan_fixture.plan_dir)
+    plan_text = (plan_fixture.plan_dir / plan_name).read_text(encoding="utf-8")
+
+    assert validate_plan_structure(plan_text) == []
+    assert "1. **TODO** Fill in implementation details (`path/to/file`)." in plan_text
+
+
+def test_step_remove(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    response = megaplan.handle_step(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, step_action="remove", step_id="S2"),
+    )
+    state = load_state(plan_fixture.plan_dir)
+    plan_name = latest_plan_name(plan_fixture.plan_dir)
+    plan_text = (plan_fixture.plan_dir / plan_name).read_text(encoding="utf-8")
+
+    assert response["state"] == megaplan.STATE_PLANNED
+    assert plan_name == "plan_v1a.md"
+    assert state["iteration"] == 1
+    assert "## Step 2: Verify the behavior" in plan_text
+    assert "Implement the smallest viable change" not in plan_text
+
+
+def test_step_move(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    response = megaplan.handle_step(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, step_action="move", step_id="S3", after="S1"),
+    )
+    plan_name = latest_plan_name(plan_fixture.plan_dir)
+    plan_text = (plan_fixture.plan_dir / plan_name).read_text(encoding="utf-8")
+    step_two_index = plan_text.index("## Step 2: Verify the behavior")
+    step_three_index = plan_text.index("## Step 3: Implement the smallest viable change")
+
+    assert response["state"] == megaplan.STATE_PLANNED
+    assert plan_name == "plan_v1a.md"
+    assert step_two_index < step_three_index
+
+
+def test_step_remove_last_step_rejected(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = WorkerResult(
+        payload={
+            "plan": """# Implementation Plan: Single Step
+
+## Overview
+Keep the plan small.
+
+## Step 1: Only step (`megaplan/handlers.py`)
+1. **Implement** the change (`megaplan/handlers.py:1`).
+
+## Validation Order
+1. Run a focused test.
+""",
+            "questions": ["q"],
+            "success_criteria": ["c"],
+            "assumptions": ["a"],
+        },
+        raw_output="single-step plan",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="plan-single-step",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    with pytest.raises(megaplan.CliError, match="last remaining step"):
+        megaplan.handle_step(
+            plan_fixture.root,
+            plan_fixture.make_args(plan=plan_fixture.plan_name, step_action="remove", step_id="S1"),
+        )
+
+
+@pytest.mark.parametrize("state_name", [megaplan.STATE_DONE, megaplan.STATE_ABORTED])
+def test_step_invalid_state(plan_fixture: PlanFixture, state_name: str) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+    state["current_state"] = state_name
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(megaplan.CliError, match="Cannot run 'step'"):
+        megaplan.handle_step(
+            plan_fixture.root,
+            plan_fixture.make_args(
+                plan=plan_fixture.plan_name,
+                step_action="add",
+                after="S1",
+                description="Should fail",
+            ),
+        )
+
+
+def test_step_preserves_meta(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    meta_path = plan_fixture.plan_dir / "plan_v1.meta.json"
+    meta = read_json(meta_path)
+    meta["questions"] = ["What should happen next?"]
+    meta["success_criteria"] = ["Ship the step editor."]
+    meta["assumptions"] = ["The existing plan file is valid."]
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    megaplan.handle_step(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, step_action="move", step_id="S3", after="S1"),
+    )
+
+    plan_name = latest_plan_name(plan_fixture.plan_dir)
+    new_meta = read_json(plan_fixture.plan_dir / plan_name.replace(".md", ".meta.json"))
+
+    assert new_meta["questions"] == ["What should happen next?"]
+    assert new_meta["success_criteria"] == ["Ship the step editor."]
+    assert new_meta["assumptions"] == ["The existing plan file is valid."]
 
 
 def test_gate_retry_does_not_duplicate_weighted_scores(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -834,6 +1011,26 @@ def test_setup_global_writes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 # ---------------------------------------------------------------------------
 # CLI parsing tests
 # ---------------------------------------------------------------------------
+
+
+def test_step_command_help_and_parser_shape(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = megaplan.cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["step", "--help"])
+
+    help_text = capsys.readouterr().out
+    parsed = parser.parse_args(["step", "add", "--plan", "demo", "--after", "S3", "Add docs"])
+
+    assert "add" in help_text
+    assert "remove" in help_text
+    assert "move" in help_text
+    assert parsed.command == "step"
+    assert parsed.step_action == "add"
+    assert parsed.plan == "demo"
+    assert parsed.after == "S3"
+    assert parsed.description == "Add docs"
+    assert megaplan.cli.COMMAND_HANDLERS["step"] is megaplan.handle_step
 
 
 def test_parse_claude_envelope_valid_with_result_block() -> None:

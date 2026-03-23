@@ -51,6 +51,14 @@ Use `replan` when the orchestrator itself needs to edit the plan directly instea
 megaplan override replan --plan <name> --reason "expanding scope" --note "Also clean up the display layer"
 ```
 After `replan`, read the returned plan file, edit it directly, then run `megaplan critique`.
+## Step Editing
+Use `step` when you need to insert, remove, or reorder `## Step N:` sections without hand-editing the markdown.
+```bash
+megaplan step add --plan <name> --after S3 "Add regression coverage for the parser"
+megaplan step remove --plan <name> S4
+megaplan step move --plan <name> S4 --after S2
+```
+Each edit writes a new same-iteration plan artifact, preserves the latest plan meta questions/success criteria/assumptions, and resets the plan to `planned` so it re-enters critique.
 ## Sessions And Autonomy
 - Agents default to persistent sessions.
 - `--fresh`: start a new persistent session.
@@ -70,6 +78,9 @@ megaplan gate --plan <name>
 megaplan finalize --plan <name>
 megaplan execute --plan <name> --confirm-destructive
 megaplan review --plan <name>
+megaplan step add --plan <name> [--after S<N>] "description"
+megaplan step remove --plan <name> S<N>
+megaplan step move --plan <name> S<N> --after S<M>
 megaplan override add-note --plan <name> --note "..."
 megaplan override force-proceed --plan <name> --reason "..."
 megaplan override replan --plan <name> --reason "..." [--note "..."]

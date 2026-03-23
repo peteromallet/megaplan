@@ -405,23 +405,23 @@ def infer_next_steps(state: PlanState) -> list[str]:
     if current == STATE_INITIALIZED:
         return ["plan"]
     if current == STATE_PLANNED:
-        return ["plan", "critique"]
+        return ["plan", "critique", "step"]
     if current == STATE_CRITIQUED:
         gate = state.get("last_gate", {})
         recommendation = gate.get("recommendation")
         if not recommendation:
-            return ["gate"]
+            return ["gate", "step"]
         if recommendation == "ITERATE":
-            return ["revise"]
+            return ["revise", "step"]
         if recommendation == "ESCALATE":
-            return ["override add-note", "override force-proceed", "override abort"]
+            return ["override add-note", "override force-proceed", "override abort", "step"]
         if recommendation == "PROCEED" and not gate.get("passed", False):
-            return ["revise", "override force-proceed"]
-        return ["gate"]
+            return ["revise", "override force-proceed", "step"]
+        return ["gate", "step"]
     if current == STATE_GATED:
-        return ["finalize", "override replan"]
+        return ["finalize", "override replan", "step"]
     if current == STATE_FINALIZED:
-        return ["execute", "override replan"]
+        return ["execute", "override replan", "step"]
     if current == STATE_EXECUTED:
         return ["review"]
     return []

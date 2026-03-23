@@ -30,6 +30,7 @@ from megaplan.handlers import (
     handle_finalize,
     handle_execute,
     handle_review,
+    handle_step,
     normalize_flag_record,
     update_flags_after_critique,
     update_flags_after_revise,
@@ -53,7 +54,7 @@ __all__ = [
     # Handlers
     "handle_init", "handle_plan", "handle_critique",
     "handle_revise", "handle_gate", "handle_finalize", "handle_execute",
-    "handle_review", "handle_status", "handle_audit", "handle_list",
+    "handle_review", "handle_step", "handle_status", "handle_audit", "handle_list",
     "handle_override", "handle_setup", "handle_setup_global", "handle_config",
     # Key utilities
     "slugify", "build_gate_signals", "mock_worker_output",

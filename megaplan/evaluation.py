@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +32,17 @@ from megaplan._core import (
 
 
 PLAN_STRUCTURE_REQUIRED_STEP_ISSUE = "Plan must include at least one `## Step N:` section."
+_PLAN_HEADING_RE = re.compile(r"^##\s+.+$")
+_PLAN_STEP_RE = re.compile(r"^##\s+Step\s+(\d+):\s+.+$")
+
+
+@dataclass(frozen=True)
+class PlanSection:
+    heading: str
+    body: str
+    id: str | None
+    start_line: int
+    end_line: int
 
 
 def flag_weight(flag: FlagRecord) -> float:
@@ -90,6 +102,79 @@ def _strip_fenced_blocks(text: str) -> str:
         if not inside_fence:
             kept_lines.append(line)
     return "".join(kept_lines)
+
+
+def parse_plan_sections(plan_text: str) -> list[PlanSection]:
+    lines = plan_text.splitlines(keepends=True)
+    if not lines:
+        return [PlanSection(heading="", body="", id=None, start_line=1, end_line=0)]
+
+    boundaries: list[tuple[int, int, str, str | None]] = []
+    inside_fence = False
+    for index, line in enumerate(lines):
+        if line.startswith("```"):
+            inside_fence = not inside_fence
+            continue
+        if inside_fence or not _PLAN_HEADING_RE.match(line):
+            continue
+        step_match = _PLAN_STEP_RE.match(line)
+        section_id = f"S{step_match.group(1)}" if step_match else None
+        boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
+
+    if not boundaries:
+        return [PlanSection(heading="", body=plan_text, id=None, start_line=1, end_line=len(lines))]
+
+    sections: list[PlanSection] = []
+    first_index, first_line, _, _ = boundaries[0]
+    if first_index > 0:
+        sections.append(
+            PlanSection(
+                heading="",
+                body="".join(lines[:first_index]),
+                id=None,
+                start_line=1,
+                end_line=first_line - 1,
+            )
+        )
+
+    for boundary_index, (start_index, start_line, heading, section_id) in enumerate(boundaries):
+        next_start_index = boundaries[boundary_index + 1][0] if boundary_index + 1 < len(boundaries) else len(lines)
+        sections.append(
+            PlanSection(
+                heading=heading,
+                body="".join(lines[start_index:next_start_index]),
+                id=section_id,
+                start_line=start_line,
+                end_line=next_start_index,
+            )
+        )
+    return sections
+
+
+def reassemble_plan(sections: list[PlanSection]) -> str:
+    return "".join(section.body for section in sections)
+
+
+def renumber_steps(sections: list[PlanSection]) -> list[PlanSection]:
+    renumbered: list[PlanSection] = []
+    step_number = 1
+    for section in sections:
+        if section.id is None:
+            renumbered.append(section)
+            continue
+        new_heading = re.sub(r"^##\s+Step\s+\d+:", f"## Step {step_number}:", section.heading, count=1)
+        new_body = re.sub(r"^##\s+Step\s+\d+:", f"## Step {step_number}:", section.body, count=1, flags=re.MULTILINE)
+        renumbered.append(
+            PlanSection(
+                heading=new_heading,
+                body=new_body,
+                id=f"S{step_number}",
+                start_line=section.start_line,
+                end_line=section.end_line,
+            )
+        )
+        step_number += 1
+    return renumbered
 
 
 def validate_plan_structure(plan_text: str) -> list[str]:
