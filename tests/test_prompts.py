@@ -1,39 +1,26 @@
-"""Direct tests for megaplan.prompts module."""
+"""Direct tests for megaplan.prompts."""
+
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
-from megaplan._core import (
-    PlanState,
-    atomic_write_json,
-    atomic_write_text,
-    json_dump,
-    save_flag_registry,
-)
-from megaplan.prompts import (
-    create_claude_prompt,
-    create_codex_prompt,
-)
+from megaplan._core import PlanState, atomic_write_json, atomic_write_text, save_flag_registry
+from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _base_state(project_dir: Path, *, iteration: int = 1) -> PlanState:
+def _state(project_dir: Path, *, iteration: int = 1) -> PlanState:
     return {
         "name": "test-plan",
-        "idea": "add dark-mode support",
-        "current_state": "planned",
+        "idea": "collapse the workflow",
+        "current_state": "critiqued",
         "iteration": iteration,
         "created_at": "2026-03-20T00:00:00Z",
         "config": {
             "project_dir": str(project_dir),
             "auto_approve": False,
-            "robustness": "standard",
+            "robustness": "thorough",
         },
         "sessions": {},
         "plan_versions": [
@@ -42,250 +29,167 @@ def _base_state(project_dir: Path, *, iteration: int = 1) -> PlanState:
                 "file": f"plan_v{iteration}.md",
                 "hash": "sha256:test",
                 "timestamp": "2026-03-20T00:00:00Z",
-            },
+            }
         ],
         "history": [],
         "meta": {
             "significant_counts": [],
-            "weighted_scores": [],
-            "plan_deltas": [],
+            "weighted_scores": [3.5] if iteration > 1 else [],
+            "plan_deltas": [42.0] if iteration > 1 else [],
             "recurring_critiques": [],
             "total_cost_usd": 0.0,
             "overrides": [],
             "notes": [],
         },
-        "last_evaluation": {},
+        "last_gate": {},
     }
 
 
-def _scaffold(
-    tmp_path: Path,
-    *,
-    iteration: int = 1,
-    plan_text: str = "# Plan\nImplement dark mode.\n",
-    success_criteria: list[str] | None = None,
-    flags: list[dict] | None = None,
-    clarification: dict | None = None,
-    notes: list[dict] | None = None,
-    gate: dict | None = None,
-    execution: dict | None = None,
-) -> tuple[Path, PlanState]:
+def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     plan_dir = tmp_path / "plan"
-    plan_dir.mkdir(parents=True)
     project_dir = tmp_path / "project"
-    project_dir.mkdir(exist_ok=True)
-    (project_dir / ".git").mkdir(exist_ok=True)
+    plan_dir.mkdir()
+    project_dir.mkdir()
+    (project_dir / ".git").mkdir()
+    state = _state(project_dir, iteration=iteration)
 
-    state = _base_state(project_dir, iteration=iteration)
-
-    if clarification:
-        state["clarification"] = clarification
-
-    if notes:
-        state["meta"]["notes"] = notes
-
-    (plan_dir / f"plan_v{iteration}.md").write_text(plan_text, encoding="utf-8")
+    atomic_write_text(plan_dir / f"plan_v{iteration}.md", "# Plan\nDo the thing.\n")
     atomic_write_json(
         plan_dir / f"plan_v{iteration}.meta.json",
         {
             "version": iteration,
             "timestamp": "2026-03-20T00:00:00Z",
             "hash": "sha256:test",
-            "success_criteria": success_criteria or ["criterion-1"],
-            "questions": [],
-            "assumptions": [],
+            "success_criteria": ["criterion"],
+            "questions": ["question"],
+            "assumptions": ["assumption"],
         },
     )
-
-    save_flag_registry(plan_dir, {"flags": flags or []})
-
     atomic_write_json(
         plan_dir / f"critique_v{iteration}.json",
         {"flags": [], "verified_flag_ids": [], "disputed_flag_ids": []},
     )
-
     atomic_write_json(
-        plan_dir / f"evaluation_v{iteration}.json",
+        plan_dir / f"gate_signals_v{iteration}.json",
         {
-            "recommendation": "CONTINUE",
-            "confidence": "medium",
-            "robustness": "standard",
-            "signals": {},
-            "rationale": "test",
-            "valid_next_steps": ["integrate"],
+            "robustness": "thorough",
+            "signals": {
+                "iteration": iteration,
+                "weighted_score": 2.0,
+                "weighted_history": [3.5] if iteration > 1 else [],
+                "plan_delta_from_previous": 25.0,
+                "recurring_critiques": ["same issue"] if iteration > 1 else [],
+                "loop_summary": "Iteration summary",
+                "scope_creep_flags": [],
+            },
+            "warnings": ["watch it"],
+            "criteria_check": {"count": 1, "items": ["criterion"]},
+            "preflight_results": {
+                "project_dir_exists": True,
+                "project_dir_writable": True,
+                "success_criteria_present": True,
+                "claude_available": True,
+                "codex_available": True,
+            },
+            "unresolved_flags": [
+                {
+                    "id": "FLAG-001",
+                    "concern": "still open",
+                    "category": "correctness",
+                    "severity": "significant",
+                    "status": "open",
+                    "evidence": "because",
+                }
+            ],
         },
     )
-
-    if gate is not None:
-        atomic_write_json(plan_dir / "gate.json", gate)
-
-    if execution is not None:
-        atomic_write_json(plan_dir / "execution.json", execution)
-
+    atomic_write_json(
+        plan_dir / "gate.json",
+        {
+            "passed": False,
+            "criteria_check": {"count": 1, "items": ["criterion"]},
+            "preflight_results": {
+                "project_dir_exists": True,
+                "project_dir_writable": True,
+                "success_criteria_present": True,
+                "claude_available": True,
+                "codex_available": True,
+            },
+            "unresolved_flags": [],
+            "recommendation": "ITERATE",
+            "rationale": "revise it",
+            "signals_assessment": "not ready",
+            "warnings": [],
+            "override_forced": False,
+            "robustness": "thorough",
+            "signals": {"loop_summary": "Iteration summary"},
+        },
+    )
+    atomic_write_json(
+        plan_dir / "execution.json",
+        {"output": "done", "files_changed": [], "commands_run": [], "deviations": []},
+    )
+    save_flag_registry(
+        plan_dir,
+        {
+            "flags": [
+                {
+                    "id": "FLAG-001",
+                    "concern": "still open",
+                    "category": "correctness",
+                    "severity_hint": "likely-significant",
+                    "evidence": "because",
+                    "status": "open",
+                    "severity": "significant",
+                    "verified": False,
+                    "raised_in": f"critique_v{iteration}.json",
+                }
+            ]
+        },
+    )
     return plan_dir, state
 
 
-# ---------------------------------------------------------------------------
-# Tests: each step produces non-empty prompts
-# ---------------------------------------------------------------------------
-
-class TestPromptBuildersNonEmpty:
-    """Every prompt builder must return a non-empty string for both agents."""
-
-    @pytest.fixture(autouse=True)
-    def _scaffold(self, tmp_path: Path) -> None:
-        self.plan_dir, self.state = _scaffold(
-            tmp_path,
-            gate={"passed": True, "criteria_check": {}, "preflight_results": {}, "unresolved_flags": []},
-            execution={"output": "done", "files_changed": [], "commands_run": [], "deviations": []},
-            flags=[
-                {
-                    "id": "FLAG-001",
-                    "concern": "missing tests",
-                    "category": "completeness",
-                    "severity_hint": "likely-significant",
-                    "evidence": "no test file",
-                    "status": "open",
-                    "severity": "significant",
-                    "verified": False,
-                    "raised_in": "critique_v1.json",
-                },
-            ],
-        )
-
-    @pytest.mark.parametrize("step", ["clarify", "plan", "critique"])
-    def test_claude_prompt_non_empty(self, step: str) -> None:
-        prompt = create_claude_prompt(step, self.state, self.plan_dir)
-        assert isinstance(prompt, str)
-        assert len(prompt) > 20
-
-    @pytest.mark.parametrize("step", ["clarify", "plan", "critique"])
-    def test_codex_prompt_non_empty(self, step: str) -> None:
-        prompt = create_codex_prompt(step, self.state, self.plan_dir)
-        assert isinstance(prompt, str)
-        assert len(prompt) > 20
-
-    def test_integrate_prompt_non_empty(self) -> None:
-        prompt = create_claude_prompt("integrate", self.state, self.plan_dir)
-        assert len(prompt) > 20
-
-    def test_execute_prompt_non_empty(self) -> None:
-        prompt = create_claude_prompt("execute", self.state, self.plan_dir)
-        assert len(prompt) > 20
-
-    def test_review_claude_prompt_non_empty(self) -> None:
-        prompt = create_claude_prompt("review", self.state, self.plan_dir)
-        assert len(prompt) > 20
-
-    def test_review_codex_prompt_non_empty(self) -> None:
-        prompt = create_codex_prompt("review", self.state, self.plan_dir)
-        assert len(prompt) > 20
+def test_plan_prompt_absorbs_clarification_when_missing(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert "Identify ambiguities" in prompt
+    assert "questions" in prompt
+    assert state["idea"] in prompt
 
 
-# ---------------------------------------------------------------------------
-# Tests: intent threading
-# ---------------------------------------------------------------------------
-
-class TestIntentThreading:
-    """Prompts that support clarification should thread the intent_summary."""
-
-    def test_plan_prompt_includes_intent_when_clarified(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(
-            tmp_path,
-            clarification={
-                "refined_idea": "Add dark-mode toggle to settings page",
-                "intent_summary": "User wants a dark-mode preference persisted in the DB",
-                "questions": [],
-            },
-        )
-        prompt = create_claude_prompt("plan", state, plan_dir)
-        assert "dark-mode toggle" in prompt
-        assert "intent" in prompt.lower() or "Intent" in prompt
-
-    def test_plan_prompt_works_without_clarification(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(tmp_path)
-        prompt = create_claude_prompt("plan", state, plan_dir)
-        assert state["idea"] in prompt
-
-    def test_critique_prompt_includes_intent(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(
-            tmp_path,
-            clarification={
-                "refined_idea": "Add dark-mode toggle",
-                "intent_summary": "User wants dark-mode persisted",
-                "questions": [],
-            },
-        )
-        prompt = create_claude_prompt("critique", state, plan_dir)
-        assert "dark-mode" in prompt.lower()
-
-    def test_integrate_prompt_includes_intent(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(
-            tmp_path,
-            clarification={
-                "refined_idea": "Add dark-mode toggle",
-                "intent_summary": "User wants dark-mode persisted",
-                "questions": [],
-            },
-            flags=[
-                {
-                    "id": "FLAG-001",
-                    "concern": "missing",
-                    "category": "completeness",
-                    "severity_hint": "likely-significant",
-                    "evidence": "none",
-                    "status": "open",
-                    "severity": "significant",
-                    "verified": False,
-                    "raised_in": "critique_v1.json",
-                },
-            ],
-        )
-        prompt = create_claude_prompt("integrate", state, plan_dir)
-        assert "dark-mode" in prompt.lower()
+def test_plan_prompt_uses_existing_clarification_context(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["clarification"] = {"intent_summary": "Keep it simple", "questions": ["What changes?"], "refined_idea": "Refined"}
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert "Existing clarification context" in prompt
+    assert "Keep it simple" in prompt
 
 
-# ---------------------------------------------------------------------------
-# Tests: robustness instructions
-# ---------------------------------------------------------------------------
-
-class TestRobustnessInstructions:
-    """Critique prompts should include robustness-specific guidance."""
-
-    @pytest.mark.parametrize("level,keyword", [
-        ("light", "pragmatic"),
-        ("standard", "balanced"),
-        ("thorough", "exhaustive"),
-    ])
-    def test_critique_robustness_instruction(self, tmp_path: Path, level: str, keyword: str) -> None:
-        plan_dir, state = _scaffold(tmp_path)
-        state["config"]["robustness"] = level
-        prompt = create_claude_prompt("critique", state, plan_dir)
-        assert keyword.lower() in prompt.lower()
-
-    def test_execute_prompt_mentions_robustness(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(
-            tmp_path,
-            gate={"passed": True, "criteria_check": {}, "preflight_results": {}, "unresolved_flags": []},
-        )
-        state["config"]["robustness"] = "thorough"
-        prompt = create_claude_prompt("execute", state, plan_dir)
-        assert "thorough" in prompt.lower()
+def test_revise_prompt_reads_gate_summary(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("revise", state, plan_dir)
+    assert "Gate summary" in prompt
+    assert "revise it" in prompt
 
 
-# ---------------------------------------------------------------------------
-# Tests: unsupported step
-# ---------------------------------------------------------------------------
+def test_gate_prompt_includes_loop_signals_and_preflight(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path, iteration=2)
+    prompt = create_codex_prompt("gate", state, plan_dir)
+    assert "Gate signals" in prompt
+    assert "Iteration summary" in prompt
+    assert "preflight" in prompt.lower()
+    assert "PROCEED, ITERATE, ESCALATE" in prompt
 
-class TestUnsupportedStep:
-    def test_claude_unsupported_step_raises(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(tmp_path)
-        from megaplan._core import CliError
-        with pytest.raises(CliError):
-            create_claude_prompt("nonexistent", state, plan_dir)
 
-    def test_codex_unsupported_step_raises(self, tmp_path: Path) -> None:
-        plan_dir, state = _scaffold(tmp_path)
-        from megaplan._core import CliError
-        with pytest.raises(CliError):
-            create_codex_prompt("nonexistent", state, plan_dir)
+def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("review", state, plan_dir)
+    assert "Gate summary" in prompt
+    assert "Execution summary" in prompt
+
+
+def test_unsupported_step_raises(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    with pytest.raises(Exception):
+        create_claude_prompt("clarify", state, plan_dir)

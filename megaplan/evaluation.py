@@ -1,31 +1,28 @@
-"""Evaluation logic: build_evaluation(), decision table, predicates, and scoring."""
+"""Gate-signal scoring and loop diagnostics."""
 
 from __future__ import annotations
 
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
 
 from megaplan._core import (
+    FLAG_BLOCKING_STATUSES,
     PlanState,
     FlagRecord,
-    EvaluationResult,
-    current_iteration_artifact,
-    read_json,
-    normalize_text,
-    load_flag_registry,
-    unresolved_significant_flags,
+    GateSignals,
     configured_robustness,
-    scope_creep_flags,
+    current_iteration_artifact,
     latest_plan_path,
-    FLAG_BLOCKING_STATUSES,
-    ROBUSTNESS_SKIP_THRESHOLDS,
-    ROBUSTNESS_STAGNATION_FACTORS,
+    load_flag_registry,
+    normalize_text,
+    read_json,
+    scope_creep_flags,
+    unresolved_significant_flags,
 )
 
 
 def flag_weight(flag: FlagRecord) -> float:
-    """Weight a flag for evaluation scoring. Higher = more blocking."""
+    """Weight a flag for gate context. Higher = more blocking."""
     category = flag.get("category", "other")
     concern = flag.get("concern", "").lower()
 
@@ -33,8 +30,13 @@ def flag_weight(flag: FlagRecord) -> float:
         return 3.0
 
     implementation_detail_signals = [
-        "column", "schema", "field", "as written",
-        "pseudocode", "seed sql", "placeholder",
+        "column",
+        "schema",
+        "field",
+        "as written",
+        "pseudocode",
+        "seed sql",
+        "placeholder",
     ]
     if any(signal in concern for signal in implementation_detail_signals):
         return 0.5
@@ -66,242 +68,104 @@ def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
     return sorted(previous_concerns.intersection(current_concerns))
 
 
-# ---------------------------------------------------------------------------
-# Predicate functions for the decision table
-# ---------------------------------------------------------------------------
-
-def _is_all_flags_resolved(significant_count: int, unresolved: list[Any], **_: Any) -> bool:
-    """No unresolved significant flags remain."""
-    return significant_count == 0 and not unresolved
-
-
-def _is_low_weight_trending_down(
-    iteration: int, weighted_score: float, skip_threshold: float,
-    weighted_history: list[float], **_: Any,
-) -> bool:
-    """Past first iteration, score below threshold and improving."""
-    return (
-        iteration > 1
-        and weighted_score < skip_threshold
-        and len(weighted_history) >= 1
-        and weighted_score < weighted_history[-1]
-    )
-
-
-def _is_stagnant_with_unresolved(
-    plan_delta: float | None, unresolved: list[Any], **_: Any,
-) -> bool:
-    """Plan text barely changed but significant risks remain."""
-    return plan_delta is not None and plan_delta < 5.0 and bool(unresolved)
-
-
-def _is_stagnant_all_addressed(
-    plan_delta: float | None, unresolved: list[Any], **_: Any,
-) -> bool:
-    """Plan text barely changed and all significant risks addressed."""
-    return plan_delta is not None and plan_delta < 5.0 and not unresolved
-
-
-def _is_first_iteration_with_flags(
-    iteration: int, significant_count: int, **_: Any,
-) -> bool:
-    """First critique iteration and significant flags exist."""
-    return iteration == 1 and significant_count > 0
-
-
-def _has_recurring_critiques(recurring: list[Any], **_: Any) -> bool:
-    """Same critique concerns repeated across iterations."""
-    return bool(recurring)
-
-
-def _is_score_stagnating(
-    weighted_score: float, weighted_history: list[float],
-    stagnation_factor: float, **_: Any,
-) -> bool:
-    """Weighted flag score is not improving relative to stagnation factor."""
-    return (
-        len(weighted_history) >= 1
-        and weighted_score >= weighted_history[-1] * stagnation_factor
-    )
-
-
-def _is_score_improving(
-    weighted_score: float, weighted_history: list[float],
-    stagnation_factor: float, **_: Any,
-) -> bool:
-    """Weighted flag score is trending down past the stagnation factor."""
-    return (
-        len(weighted_history) >= 1
-        and weighted_score < weighted_history[-1] * stagnation_factor
-    )
-
-
-# Decision table: evaluated in priority order; first match wins.
-# Each entry is (predicate, recommendation, confidence, rationale_template).
-# rationale_template may be a str or a callable(signals -> str) for dynamic messages.
-_EVALUATION_DECISION_TABLE: list[
-    tuple[
-        Any,  # predicate function
-        str,  # recommendation
-        str,  # confidence
-        str | Any,  # rationale (str or callable)
+def _previous_iteration_plan_path(plan_dir: Path, state: PlanState) -> Path | None:
+    current_version = state["iteration"]
+    previous_version = current_version - 1
+    if previous_version < 1:
+        return None
+    matching = [
+        record
+        for record in state["plan_versions"]
+        if record.get("version") == previous_version
     ]
-] = [
-    (
-        _is_all_flags_resolved,
-        "SKIP", "high",
-        "No unresolved significant flags remain.",
-    ),
-    (
-        _is_low_weight_trending_down,
-        "SKIP", "medium",
-        lambda s: f"Remaining flags are low-weight ({s['weighted_score']}) and trending down. Executor can resolve.",
-    ),
-    (
-        _is_stagnant_with_unresolved,
-        "ESCALATE", "high",
-        "Plan stagnated with unresolved significant risks.",
-    ),
-    (
-        _is_stagnant_all_addressed,
-        "SKIP", "high",
-        "Plan changes are small and all significant risks appear addressed.",
-    ),
-    (
-        _is_first_iteration_with_flags,
-        "CONTINUE", "high",
-        lambda s: f"First iteration still has {s['significant_count']} significant flags.",
-    ),
-    (
-        _has_recurring_critiques,
-        "ESCALATE", "high",
-        "The same critique concerns repeated across iterations.",
-    ),
-    (
-        _is_score_stagnating,
-        "ESCALATE", "medium",
-        "Weighted flag score is not improving.",
-    ),
-    (
-        _is_score_improving,
-        "CONTINUE", "medium",
-        "Weighted flag score is trending down.",
-    ),
-]
+    if not matching:
+        return None
+    return plan_dir / matching[-1]["file"]
 
 
-def build_evaluation(plan_dir: Path, state: PlanState) -> EvaluationResult:
+def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
     robustness = configured_robustness(state)
-    skip_threshold = ROBUSTNESS_SKIP_THRESHOLDS.get(robustness, 2.0)
-    stagnation_factor = ROBUSTNESS_STAGNATION_FACTORS.get(robustness, 0.9)
     open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
-    significant_count = len([flag for flag in flag_registry["flags"] if flag.get("severity") == "significant" and flag.get("status") != "verified"])
-    weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
+    significant_count = len(
+        [
+            flag
+            for flag in flag_registry["flags"]
+            if flag.get("severity") == "significant" and flag.get("status") != "verified"
+        ]
+    )
+    weighted_score = round(sum(flag_weight(flag) for flag in unresolved), 2)
     weighted_history = list(state["meta"].get("weighted_scores", []))
     latest_plan_text = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    previous_plan_path = _previous_iteration_plan_path(plan_dir, state)
     previous_text = None
-    if iteration > 1:
-        previous_text = (plan_dir / f"plan_v{iteration - 1}.md").read_text(encoding="utf-8")
+    if previous_plan_path is not None and previous_plan_path.exists():
+        previous_text = previous_plan_path.read_text(encoding="utf-8")
     plan_delta = compute_plan_delta_percent(previous_text, latest_plan_text)
     recurring = compute_recurring_critiques(plan_dir, iteration)
-    # Bundle all signals into a dict so predicates can pick what they need.
-    signals = dict(
-        iteration=iteration, unresolved=unresolved, significant_count=significant_count,
-        weighted_score=weighted_score, weighted_history=weighted_history,
-        plan_delta=plan_delta, recurring=recurring, skip_threshold=skip_threshold,
-        stagnation_factor=stagnation_factor, state=state,
+    resolved_flags = [
+        {
+            "id": flag.get("id"),
+            "concern": flag.get("concern", ""),
+            "resolution": flag.get("evidence", ""),
+        }
+        for flag in flag_registry["flags"]
+        if flag.get("status") == "verified"
+    ]
+
+    delta_history = state["meta"].get("plan_deltas", [])
+    if weighted_history:
+        trajectory = " -> ".join(str(score) for score in weighted_history) + f" -> {weighted_score}"
+    else:
+        trajectory = str(weighted_score)
+    delta_summary = ", ".join(
+        "n/a" if delta is None else f"{delta:.1f}%"
+        for delta in delta_history
+    ) or "n/a"
+    loop_summary = (
+        f"Iteration {iteration}. Weighted score trajectory: {trajectory}. "
+        f"Plan deltas: {delta_summary}. "
+        f"Recurring critiques: {len(recurring)}. "
+        f"Resolved flags: {len(resolved_flags)}. "
+        f"Open significant flags: {len(unresolved)}."
     )
 
-    # Walk the decision table — first matching predicate wins.
-    recommendation = "CONTINUE"
-    confidence = "medium"
-    rationale = "Continue refining the plan."
-
-    for predicate, rec, conf, rationale_tmpl in _EVALUATION_DECISION_TABLE:
-        if predicate(**signals):
-            recommendation = rec
-            confidence = conf
-            rationale = rationale_tmpl(signals) if callable(rationale_tmpl) else rationale_tmpl
-            break
-
-    valid_next = ["integrate"] if recommendation == "CONTINUE" else ["gate"] if recommendation == "SKIP" else ["override add-note", "override force-proceed", "override abort"]
-
-    result: EvaluationResult = {
-        "recommendation": recommendation,
-        "confidence": confidence,
+    result: GateSignals = {
         "robustness": robustness,
         "signals": {
             "iteration": iteration,
+            "idea": state.get("idea", ""),
             "significant_flags": significant_count,
             "unresolved_flags": [
-                {"id": f.get("id"), "concern": f.get("concern", ""), "category": f.get("category", "other")}
-                for f in unresolved
+                {
+                    "id": flag.get("id"),
+                    "concern": flag.get("concern", ""),
+                    "category": flag.get("category", "other"),
+                    "severity": flag.get("severity", "unknown"),
+                    "status": flag.get("status", "unknown"),
+                }
+                for flag in unresolved
             ],
+            "resolved_flags": resolved_flags,
             "weighted_score": weighted_score,
             "weighted_history": weighted_history,
             "plan_delta_from_previous": plan_delta,
             "recurring_critiques": recurring,
             "scope_creep_flags": [flag["id"] for flag in open_scope_creep],
+            "loop_summary": loop_summary,
         },
-        "idea": state.get("idea", ""),
-        "rationale": rationale,
-        "valid_next_steps": valid_next,
+        "warnings": [],
     }
-    # Build a concise loop summary so the orchestrator has full context
-    # even if earlier conversation turns were compressed away.
-    resolved_flags = [
-        {"id": f.get("id"), "concern": f.get("concern", ""), "resolution": f.get("resolution", "")}
-        for f in flag_registry["flags"] if f.get("status") == "verified"
-    ]
-    if resolved_flags:
-        result["resolved_flags"] = resolved_flags
-    if weighted_history:
-        trajectory = " → ".join(str(s) for s in weighted_history) + f" → {weighted_score}"
-        deltas = state["meta"].get("plan_deltas", [])
-        delta_str = ", ".join(f"{d:.1f}%" for d in deltas) if deltas else "n/a"
-        result["loop_summary"] = (
-            f"Iteration {iteration}. Score trajectory: {trajectory}. "
-            f"Plan deltas: {delta_str}. "
-            f"Flags resolved: {len(resolved_flags)}. "
-            f"Flags still open: {significant_count}."
-        )
-
     if open_scope_creep:
-        result.setdefault("warnings", []).append(
+        result["warnings"].append(
             "Scope creep detected: the plan appears to be expanding beyond the original idea or recorded user notes."
         )
-
     if iteration >= 5:
-        result.setdefault("warnings", []).append(
-            f"Iteration {iteration}: high iteration count."
-        )
-
+        result["warnings"].append(f"Iteration {iteration}: high iteration count.")
     if iteration >= 12:
-        recommendation = "ESCALATE"
-        result["recommendation"] = "ESCALATE"
-        result["confidence"] = "high"
-        result["rationale"] = f"Reached {iteration} iterations — hard limit. Proceed or abort."
-        result["valid_next_steps"] = ["override add-note", "override force-proceed", "override abort"]
-
-    if recommendation == "ESCALATE":
-        if all(flag_weight(f) <= 1.0 for f in unresolved):
-            result["suggested_override"] = "force-proceed"
-            result["override_rationale"] = (
-                "Remaining flags are implementation details (pseudocode accuracy, "
-                "schema column names) that the executor will resolve by reading "
-                "the actual code. Safe to proceed."
-            )
-        elif len(weighted_history) >= 1 and weighted_score > weighted_history[-1] * 1.5:
-            result["suggested_override"] = "abort"
-            result["override_rationale"] = "Weighted flag score is increasing — the plan may be fundamentally misaligned."
-        else:
-            result["suggested_override"] = "add-note"
-            result["override_rationale"] = (
-                "Significant flags remain. Add context to help the next iteration, "
-                "or force-proceed if you believe the executor can handle them."
-            )
-
+        result["warnings"].append(
+            f"Iteration {iteration}: hard iteration limit reached. Escalation is likely warranted."
+        )
     return result

@@ -7,107 +7,63 @@ from pathlib import Path
 from typing import Any
 
 from megaplan._core import (
-    PlanState,
     CliError,
-    latest_plan_path,
-    read_json,
-    latest_plan_meta_path,
-    load_flag_registry,
-    unresolved_significant_flags,
+    PlanState,
+    collect_git_diff_summary,
+    configured_robustness,
+    current_iteration_artifact,
     intent_and_notes_block,
     json_dump,
-    current_iteration_artifact,
-    configured_robustness,
+    latest_plan_meta_path,
+    latest_plan_path,
+    load_flag_registry,
+    read_json,
     robustness_critique_instruction,
-    collect_git_diff_summary,
+    unresolved_significant_flags,
 )
-
-
-def _clarify_prompt(state: PlanState, plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    notes = state["meta"].get("notes", [])
-    notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
-    return textwrap.dedent(
-        f"""
-        You are a planning assistant. The user has proposed the following idea:
-
-        Idea:
-        {state['idea']}
-
-        Project directory:
-        {project_dir}
-
-        User notes:
-        {notes_block}
-
-        Requirements:
-        - Read the project directory to understand the codebase.
-        - Restate the idea in your own words as a precise intent summary.
-        - Identify ambiguities, underspecified aspects, or implicit assumptions.
-        - For each ambiguity, produce a question that, if answered, would materially change the implementation plan.
-        - Propose a refined version of the idea that resolves obvious ambiguities.
-        - Do NOT plan the implementation - only clarify the intent.
-        """
-    ).strip()
 
 
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
-    notes = state["meta"].get("notes", [])
-    notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
     clarification = state.get("clarification", {})
-    refined = clarification.get("refined_idea", "")
-    intent = clarification.get("intent_summary", "")
-    if refined:
-        clarify_block = textwrap.dedent(
+    if clarification:
+        clarification_block = textwrap.dedent(
             f"""
-            Refined idea (from clarification):
-            {refined}
-
-            Intent summary:
-            {intent}
-
-            Original idea (for reference):
-            {state['idea']}
+            Existing clarification context:
+            {json_dump(clarification).strip()}
             """
         ).strip()
     else:
-        clarify_block = textwrap.dedent(
-            f"""
-            Idea:
-            {state['idea']}
-            """
-        ).strip()
+        clarification_block = "No prior clarification artifact exists. Identify ambiguities, ask clarifying questions, and state your assumptions inside the plan output."
     return textwrap.dedent(
         f"""
         You are creating an implementation plan for the following idea.
 
-        {clarify_block}
+        {intent_and_notes_block(state)}
 
         Project directory:
         {project_dir}
 
-        User notes:
-        {notes_block}
+        {clarification_block}
 
         Requirements:
         - Inspect the actual repository before planning.
         - Produce a concrete implementation plan in markdown.
         - Define observable success criteria.
-        - Call out assumptions and open questions.
+        - Use the `questions` field for ambiguities that would materially change implementation.
+        - Use the `assumptions` field for defaults you are making so planning can proceed now.
         - Prefer cheap validation steps early.
+        - If user notes answer earlier questions, incorporate them into the draft plan instead of re-asking them.
         """
     ).strip()
 
 
-def _integrate_prompt(state: PlanState, plan_dir: Path) -> str:
+def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    flag_registry = load_flag_registry(plan_dir)
-    evaluate_path = current_iteration_artifact(plan_dir, "evaluation", state["iteration"])
-    evaluation = read_json(evaluate_path)
-    unresolved = unresolved_significant_flags(flag_registry)
+    gate = read_json(plan_dir / "gate.json")
+    unresolved = unresolved_significant_flags(load_flag_registry(plan_dir))
     open_flags = [
         {
             "id": flag["id"],
@@ -120,7 +76,7 @@ def _integrate_prompt(state: PlanState, plan_dir: Path) -> str:
     ]
     return textwrap.dedent(
         f"""
-        You are updating an implementation plan based on critique and evaluation.
+        You are revising an implementation plan after critique and gate feedback.
 
         Project directory:
         {project_dir}
@@ -133,8 +89,8 @@ def _integrate_prompt(state: PlanState, plan_dir: Path) -> str:
         Current plan metadata:
         {json_dump(latest_meta).strip()}
 
-        Evaluation:
-        {json_dump(evaluation).strip()}
+        Gate summary:
+        {json_dump(gate).strip()}
 
         Open significant flags:
         {json_dump(open_flags).strip()}
@@ -144,9 +100,8 @@ def _integrate_prompt(state: PlanState, plan_dir: Path) -> str:
         - Keep the plan readable and executable.
         - Return flags_addressed with the exact flag IDs you addressed.
         - Preserve or improve success criteria quality.
-        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-        - Remove unjustified scope growth. If the critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
-        - If a broader change is truly necessary, explain that dependency explicitly in changes_summary instead of silently expanding the plan.
+        - Verify that the plan remains aligned with the user's original intent, not just internal plan quality.
+        - Remove unjustified scope growth. If critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
         """
     ).strip()
 
@@ -186,23 +141,69 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         {json_dump(unresolved).strip()}
 
         Requirements:
-        - Consider whether the plan is at the right level of abstraction. If it
-          patches multiple systems for one goal, it may be too low — flag whether
-          a simpler design would eliminate the problem class. If it redesigns
-          architecture for a simple bug, it may be too high. Push the plan up or
-          down the abstraction ladder as needed.
+        - Consider whether the plan is at the right level of abstraction.
         - Reuse existing flag IDs when the same concern is still open.
-        - verified_flag_ids should list previously addressed flags that now appear resolved.
+        - `verified_flag_ids` should list previously addressed flags that now appear resolved.
         - Focus on concrete issues that would cause real problems.
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
-        - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
-        - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern so the orchestrator can surface it.
-        - Do not rubber-stamp the plan.
-        - Assign severity_hint carefully: "likely-significant" for issues that would
-          cause real product or implementation problems. "likely-minor" for cosmetic,
-          nice-to-have, issues already covered elsewhere, or implementation details
-          the executor will naturally resolve by reading the actual code (e.g. exact
-          line numbers, missing boilerplate, export lists).
+        - Verify that the plan remains aligned with the user's original intent.
+        - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
+        - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
+        """
+    ).strip()
+
+
+def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    gate_signals = read_json(current_iteration_artifact(plan_dir, "gate_signals", state["iteration"]))
+    flag_registry = load_flag_registry(plan_dir)
+    unresolved = unresolved_significant_flags(flag_registry)
+    open_flags = [
+        {
+            "id": flag.get("id"),
+            "concern": flag.get("concern", ""),
+            "category": flag.get("category", "other"),
+            "severity": flag.get("severity", "unknown"),
+            "status": flag.get("status", "unknown"),
+            "weight": flag.get("weight"),
+        }
+        for flag in unresolved
+    ]
+    robustness = configured_robustness(state)
+    return textwrap.dedent(
+        f"""
+        You are the gatekeeper for the megaplan workflow. Make the continuation decision directly.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Plan:
+        {latest_plan}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Gate signals:
+        {json_dump(gate_signals).strip()}
+
+        Unresolved significant flags:
+        {json_dump(open_flags).strip()}
+
+        Robustness level:
+        {robustness}
+
+        Requirements:
+        - Decide exactly one of: PROCEED, ITERATE, ESCALATE.
+        - Use the weighted score, flag details, plan delta, recurring critiques, loop summary, and preflight results as judgment context, not as a fixed decision table.
+        - PROCEED when execution should move forward now.
+        - ITERATE when revising the plan is the best next move.
+        - ESCALATE when the loop is stuck, churn is recurring, or user intervention is needed.
+        - `signals_assessment` should summarize the score trajectory, plan delta, recurring critiques, unresolved flag weight, and preflight posture in one compact paragraph.
+        - Put any cautionary notes in `warnings`.
         """
     ).strip()
 
@@ -214,7 +215,10 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
     if state["config"].get("auto_approve"):
-        approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
+        approval_note = (
+            "Note: User chose auto-approve mode. This execution was not manually "
+            "reviewed at the gate. Exercise extra caution on destructive operations."
+        )
     elif state["meta"].get("user_approved_gate"):
         approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
     else:
@@ -323,22 +327,20 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-# Step-to-builder dispatch tables per agent.
-# Steps shared across agents point to the same builder function.
 _CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
-    "clarify": _clarify_prompt,
     "plan": _plan_prompt,
-    "integrate": _integrate_prompt,
     "critique": _critique_prompt,
+    "revise": _revise_prompt,
+    "gate": _gate_prompt,
     "execute": _execute_prompt,
     "review": _review_claude_prompt,
 }
 
 _CODEX_PROMPT_BUILDERS: dict[str, Any] = {
-    "clarify": _clarify_prompt,
     "plan": _plan_prompt,
-    "integrate": _integrate_prompt,
     "critique": _critique_prompt,
+    "revise": _revise_prompt,
+    "gate": _gate_prompt,
     "execute": _execute_prompt,
     "review": _review_codex_prompt,
 }

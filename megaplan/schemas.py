@@ -6,25 +6,6 @@ from typing import Any
 
 
 SCHEMAS: dict[str, dict[str, Any]] = {
-    "clarify.json": {
-        "type": "object",
-        "properties": {
-            "questions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string"},
-                        "context": {"type": "string"},
-                    },
-                    "required": ["question", "context"],
-                },
-            },
-            "refined_idea": {"type": "string"},
-            "intent_summary": {"type": "string"},
-        },
-        "required": ["questions", "refined_idea", "intent_summary"],
-    },
     "plan.json": {
         "type": "object",
         "properties": {
@@ -35,7 +16,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["plan", "questions", "success_criteria", "assumptions"],
     },
-    "integrate.json": {
+    "revise.json": {
         "type": "object",
         "properties": {
             "plan": {"type": "string"},
@@ -46,6 +27,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "questions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["plan", "changes_summary", "flags_addressed"],
+    },
+    "gate.json": {
+        "type": "object",
+        "properties": {
+            "recommendation": {
+                "type": "string",
+                "enum": ["PROCEED", "ITERATE", "ESCALATE"],
+            },
+            "rationale": {"type": "string"},
+            "signals_assessment": {"type": "string"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["recommendation", "rationale", "signals_assessment", "warnings"],
     },
     "critique.json": {
         "type": "object",

@@ -39,10 +39,10 @@ WORKER_TIMEOUT_SECONDS = 3600
 # Shared mapping from step name to schema filename, used by both
 # run_claude_step and run_codex_step.
 STEP_SCHEMA_FILENAMES: dict[str, str] = {
-    "clarify": "clarify.json",
     "plan": "plan.json",
-    "integrate": "integrate.json",
+    "revise": "revise.json",
     "critique": "critique.json",
+    "gate": "gate.json",
     "execute": "execution.json",
     "review": "review.json",
 }
@@ -178,20 +178,6 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
 
-def _mock_clarify(state: PlanState, plan_dir: Path) -> WorkerResult:
-    payload = {
-        "questions": [
-            {
-                "question": "Should the feature be behind a flag?",
-                "context": "No feature flags exist in the repo currently.",
-            },
-        ],
-        "refined_idea": f"Refined: {state['idea']}",
-        "intent_summary": f"The user wants to {state['idea']}.",
-    }
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
-
-
 def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     payload = {
         "plan": textwrap.dedent(
@@ -249,7 +235,7 @@ def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
     return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
 
-def _mock_integrate(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
     payload = {
         "plan": textwrap.dedent(
             f"""
@@ -282,6 +268,25 @@ def _mock_integrate(state: PlanState, plan_dir: Path) -> WorkerResult:
     return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
 
+def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
+    recommendation = "ITERATE" if state["iteration"] == 1 else "PROCEED"
+    payload = {
+        "recommendation": recommendation,
+        "rationale": (
+            "First critique cycle still needs another pass."
+            if recommendation == "ITERATE"
+            else "Signals are strong enough to move into execution."
+        ),
+        "signals_assessment": (
+            "Iteration 1 still carries unresolved significant flags and should revise."
+            if recommendation == "ITERATE"
+            else "Weighted score and loop trajectory support proceeding."
+        ),
+        "warnings": [],
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+
+
 def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
     target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
     target.write_text("mock execution completed\n", encoding="utf-8")
@@ -305,10 +310,10 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
 
 
 _MOCK_DISPATCH: dict[str, Any] = {
-    "clarify": _mock_clarify,
     "plan": _mock_plan,
     "critique": _mock_critique,
-    "integrate": _mock_integrate,
+    "revise": _mock_revise,
+    "gate": _mock_gate,
     "execute": _mock_execute,
     "review": _mock_review,
 }
@@ -322,10 +327,12 @@ def mock_worker_output(step: str, state: PlanState, plan_dir: Path) -> WorkerRes
 
 
 def session_key_for(step: str, agent: str) -> str:
-    if step in {"clarify", "plan", "integrate"}:
+    if step in {"plan", "revise"}:
         return f"{agent}_planner"
     if step == "critique":
         return f"{agent}_critic"
+    if step == "gate":
+        return f"{agent}_gatekeeper"
     if step == "execute":
         return f"{agent}_executor"
     if step == "review":

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import os
 import re
 import shutil  # noqa: F401 — tests monkeypatch megaplan.cli.shutil.which
@@ -16,7 +15,7 @@ from typing import Any, Callable
 from megaplan._core import (
     PlanState, PlanConfig, PlanMeta, FlagRecord, FlagRegistry,
     HistoryEntry, StepResponse,
-    STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED, STATE_EVALUATED,
+    STATE_INITIALIZED, STATE_PLANNED, STATE_CRITIQUED,
     STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, FLAG_BLOCKING_STATUSES,
     DEFAULT_AGENT_ROUTING, KNOWN_AGENTS,
@@ -37,7 +36,7 @@ from megaplan._core import (
 
 # Re-export from sub-modules for backward compatibility (tests import via megaplan.cli).
 from megaplan.evaluation import (  # noqa: F401
-    build_evaluation,
+    build_gate_signals,
     compute_plan_delta_percent,
     compute_recurring_critiques,
 )
@@ -60,18 +59,18 @@ __all__ = [
     # Types
     "PlanState", "PlanConfig", "PlanMeta", "FlagRecord", "StepResponse",
     # State constants
-    "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED",
-    "STATE_EVALUATED", "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
+    "STATE_INITIALIZED", "STATE_PLANNED", "STATE_CRITIQUED",
+    "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
     "TERMINAL_STATES",
     # Error and result types
     "CliError", "CommandResult", "WorkerResult",
     # Handlers
-    "handle_init", "handle_clarify", "handle_plan", "handle_critique",
-    "handle_evaluate", "handle_integrate", "handle_gate", "handle_execute",
+    "handle_init", "handle_plan", "handle_critique",
+    "handle_revise", "handle_gate", "handle_execute",
     "handle_review", "handle_status", "handle_audit", "handle_list",
     "handle_override", "handle_setup", "handle_setup_global", "handle_config",
     # Key utilities
-    "slugify", "build_evaluation", "mock_worker_output",
+    "slugify", "build_gate_signals", "mock_worker_output",
     "main", "cli_entry",
 ]
 
@@ -210,24 +209,21 @@ def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> N
 def infer_next_steps(state: PlanState) -> list[str]:
     current = state["current_state"]
     if current == STATE_INITIALIZED:
-        return ["clarify"]
-    if current == STATE_CLARIFIED:
-        return ["clarify", "plan"]
+        return ["plan"]
     if current == STATE_PLANNED:
-        return ["critique"]
+        return ["plan", "critique"]
     if current == STATE_CRITIQUED:
-        return ["evaluate"]
-    if current == STATE_EVALUATED:
-        evaluation = state["last_evaluation"]
-        recommendation = evaluation.get("recommendation")
-        valid = []
-        if recommendation == "CONTINUE":
-            valid.append("integrate")
-        if recommendation in {"SKIP", "CONTINUE"}:
-            valid.append("gate")
-        if recommendation in {"ESCALATE", "ABORT"}:
-            valid.extend(["override replan", "override add-note", "override force-proceed", "override abort"])
-        return valid or ["override add-note", "override abort"]
+        gate = state.get("last_gate", {})
+        recommendation = gate.get("recommendation")
+        if not recommendation:
+            return ["gate"]
+        if recommendation == "ITERATE":
+            return ["revise"]
+        if recommendation == "ESCALATE":
+            return ["override add-note", "override force-proceed", "override abort"]
+        if recommendation == "PROCEED" and not gate.get("passed", False):
+            return ["revise", "override force-proceed"]
+        return ["gate"]
     if current == STATE_GATED:
         return ["execute", "override replan"]
     if current == STATE_EXECUTED:
@@ -311,7 +307,7 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
     return registry
 
 
-def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> FlagRegistry:
+def update_flags_after_revise(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> FlagRegistry:
     registry = load_flag_registry(plan_dir)
     for flag in registry["flags"]:
         if flag["id"] in flags_addressed:
@@ -320,6 +316,43 @@ def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, 
             flag["evidence"] = summary
     save_flag_registry(plan_dir, registry)
     return registry
+
+
+def next_plan_artifact_name(plan_dir: Path, version: int) -> str:
+    base = f"plan_v{version}"
+    candidate = f"{base}.md"
+    if not (plan_dir / candidate).exists():
+        return candidate
+    suffix_ord = ord("a")
+    while True:
+        candidate = f"{base}{chr(suffix_ord)}.md"
+        if not (plan_dir / candidate).exists():
+            return candidate
+        suffix_ord += 1
+
+
+def build_gate_artifact(
+    signals: dict[str, Any],
+    gate_payload: dict[str, Any],
+    *,
+    override_forced: bool,
+) -> dict[str, Any]:
+    preflight = signals["preflight_results"]
+    recommendation = gate_payload["recommendation"]
+    warnings = list(signals.get("warnings", [])) + list(gate_payload.get("warnings", []))
+    return {
+        "passed": recommendation == "PROCEED" and all(preflight.values()),
+        "criteria_check": signals["criteria_check"],
+        "preflight_results": preflight,
+        "unresolved_flags": signals["unresolved_flags"],
+        "recommendation": recommendation,
+        "rationale": gate_payload["rationale"],
+        "signals_assessment": gate_payload["signals_assessment"],
+        "warnings": warnings,
+        "override_forced": override_forced,
+        "robustness": signals.get("robustness"),
+        "signals": signals["signals"],
+    }
 
 
 def store_raw_worker_output(plan_dir: Path, step: str, iteration: int, content: str) -> str:
@@ -396,7 +429,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
             "overrides": [],
             "notes": [],
         },
-        "last_evaluation": {},
+        "last_gate": {},
     }
     append_history(
         state,
@@ -419,72 +452,27 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
         "state": STATE_INITIALIZED,
         "summary": f"Initialized plan '{plan_name}' for project {project_dir}",
         "artifacts": ["state.json"],
-        "next_step": "clarify",
+        "next_step": "plan",
         "auto_approve": auto_approve,
         "robustness": robustness,
     }
 
 
-def handle_clarify(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "clarify", {STATE_INITIALIZED, STATE_CLARIFIED})
-    try:
-        worker, agent, mode, refreshed = run_step_with_worker("clarify", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="clarify", iteration=state["iteration"], error=error)
-        raise
-    payload = worker.payload
-    clarify_filename = "clarify.json"
-    atomic_write_json(plan_dir / clarify_filename, payload)
-    state["clarification"] = {
-        "refined_idea": payload["refined_idea"],
-        "intent_summary": payload["intent_summary"],
-        "questions": payload["questions"],
-    }
-    state["current_state"] = STATE_CLARIFIED
-    apply_session_update(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "clarify",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=clarify_filename,
-            artifact_hash=sha256_file(plan_dir / clarify_filename),
-        ),
-    )
-    save_state(plan_dir, state)
-    response = {
-        "success": True,
-        "step": "clarify",
-        "summary": f"Captured clarification with {len(payload['questions'])} questions.",
-        "artifacts": [clarify_filename],
-        "next_step": "plan",
-        "state": STATE_CLARIFIED,
-        "refined_idea": payload["refined_idea"],
-        "intent_summary": payload["intent_summary"],
-        "questions": payload["questions"],
-    }
-    attach_agent_fallback(response, args)
-    return response
-
-
 def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "plan", {STATE_INITIALIZED, STATE_CLARIFIED})
+    require_state(state, "plan", {STATE_INITIALIZED, STATE_PLANNED})
+    rerun = state["current_state"] == STATE_PLANNED
+    version = state["iteration"] if rerun else state["iteration"] + 1
     try:
         worker, agent, mode, refreshed = run_step_with_worker("plan", state, plan_dir, args, root=root)
     except CliError as error:
-        record_step_failure(plan_dir, state, step="plan", iteration=state["iteration"] + 1, error=error)
+        record_step_failure(plan_dir, state, step="plan", iteration=version, error=error)
         raise
     payload = worker.payload
-    version = state["iteration"] + 1
-    plan_filename = f"plan_v{version}.md"
+    plan_filename = next_plan_artifact_name(plan_dir, version)
     meta_filename = f"plan_v{version}.meta.json"
+    if plan_filename != f"plan_v{version}.md":
+        meta_filename = plan_filename.replace(".md", ".meta.json")
     plan_text = payload["plan"].rstrip() + "\n"
     atomic_write_text(plan_dir / plan_filename, plan_text)
     meta = {
@@ -499,7 +487,10 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
     state["meta"].pop("user_approved_gate", None)
-    state["plan_versions"].append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
+    state["last_gate"] = {}
+    state["plan_versions"].append(
+        {"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
+    )
     apply_session_update(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
@@ -520,7 +511,10 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
         "success": True,
         "step": "plan",
         "iteration": version,
-        "summary": f"Generated plan v{version} with {len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria.",
+        "summary": (
+            f"{'Refined' if rerun else 'Generated'} plan v{version} with "
+            f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
+        ),
         "artifacts": [plan_filename, meta_filename],
         "next_step": "critique",
         "state": STATE_PLANNED,
@@ -536,6 +530,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "critique", {STATE_PLANNED})
     iteration = state["iteration"]
+    state["last_gate"] = {}
     try:
         worker, agent, mode, refreshed = run_step_with_worker("critique", state, plan_dir, args, root=root)
     except CliError as error:
@@ -577,7 +572,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         "iteration": iteration,
         "summary": f"Recorded {len(worker.payload.get('flags', []))} critique flags.",
         "artifacts": [critique_filename, "faults.json"],
-        "next_step": "evaluate",
+        "next_step": "gate",
         "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
         "open_flags": open_flags_detail,
@@ -591,58 +586,23 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     return response
 
 
-def handle_evaluate(root: Path, args: argparse.Namespace) -> StepResponse:
+def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "evaluate", {STATE_CRITIQUED})
-    evaluation = build_evaluation(plan_dir, state)
-    iteration = state["iteration"]
-    _append_to_meta(state, "weighted_scores", evaluation["signals"]["weighted_score"])
-    filename = f"evaluation_v{iteration}.json"
-    atomic_write_json(plan_dir / filename, evaluation)
-    state["current_state"] = STATE_EVALUATED
-    state["last_evaluation"] = evaluation
-    append_history(
-        state,
-        make_history_entry(
-            "evaluate",
-            duration_ms=0,
-            cost_usd=0.0,
-            result="success",
-            output_file=filename,
-            artifact_hash=sha256_file(plan_dir / filename),
-            recommendation=evaluation["recommendation"],
-        ),
-    )
-    save_state(plan_dir, state)
-    return {
-        "success": True,
-        "step": "evaluate",
-        "iteration": iteration,
-        "summary": f"Recommendation {evaluation['recommendation']}: {evaluation['rationale']}",
-        "artifacts": [filename],
-        "next_step": evaluation["valid_next_steps"][0] if evaluation["valid_next_steps"] else None,
-        "state": STATE_EVALUATED,
-        "evaluation": evaluation,
-    }
-
-
-def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "integrate", {STATE_EVALUATED})
-    if state["last_evaluation"].get("recommendation") != "CONTINUE":
+    require_state(state, "revise", {STATE_CRITIQUED})
+    if state["last_gate"].get("recommendation") != "ITERATE":
         raise CliError(
             "invalid_transition",
-            "Integrate requires an evaluation recommendation of CONTINUE",
+            "Revise requires a gate recommendation of ITERATE",
             valid_next=infer_next_steps(state),
         )
     previous_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     try:
-        worker, agent, mode, refreshed = run_step_with_worker("integrate", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = run_step_with_worker("revise", state, plan_dir, args, root=root)
     except CliError as error:
-        record_step_failure(plan_dir, state, step="integrate", iteration=state["iteration"] + 1, error=error)
+        record_step_failure(plan_dir, state, step="revise", iteration=state["iteration"] + 1, error=error)
         raise
     payload = worker.payload
-    validate_payload("integrate", payload)
+    validate_payload("revise", payload)
     version = state["iteration"] + 1
     plan_filename = f"plan_v{version}.md"
     meta_filename = f"plan_v{version}.meta.json"
@@ -664,14 +624,17 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
     state["meta"].pop("user_approved_gate", None)
-    state["plan_versions"].append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
+    state["last_gate"] = {}
+    state["plan_versions"].append(
+        {"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
+    )
     _append_to_meta(state, "plan_deltas", delta)
-    update_flags_after_integrate(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
-    apply_session_update(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_flags_after_revise(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
+    apply_session_update(state, "revise", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
-            "integrate",
+            "revise",
             duration_ms=worker.duration_ms,
             cost_usd=worker.cost_usd,
             result="success",
@@ -684,16 +647,15 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
-    # Load updated flag registry to show remaining flags
     updated_registry = load_flag_registry(plan_dir)
     remaining = [
-        {"id": f.get("id"), "concern": f.get("concern", ""), "category": f.get("category", "other")}
-        for f in updated_registry["flags"]
-        if f.get("status") in FLAG_BLOCKING_STATUSES and f.get("severity") == "significant"
+        {"id": flag.get("id"), "concern": flag.get("concern", ""), "category": flag.get("category", "other")}
+        for flag in updated_registry["flags"]
+        if flag.get("status") in FLAG_BLOCKING_STATUSES and flag.get("severity") == "significant"
     ]
     response = {
         "success": True,
-        "step": "integrate",
+        "step": "revise",
         "iteration": version,
         "summary": f"Updated plan to v{version}; addressed {len(payload['flags_addressed'])} flags.",
         "artifacts": [plan_filename, meta_filename, "faults.json"],
@@ -720,7 +682,7 @@ def run_gate_checks(plan_dir: Path, state: PlanState) -> StepResponse:
         "claude_available": bool(find_command("claude")),
         "codex_available": bool(find_command("codex")),
     }
-    passed = all(checks.values()) and not unresolved
+    passed = all(checks.values())
     return {
         "passed": passed,
         "criteria_check": {"count": len(meta.get("success_criteria", [])), "items": meta.get("success_criteria", [])},
@@ -731,67 +693,90 @@ def run_gate_checks(plan_dir: Path, state: PlanState) -> StepResponse:
 
 def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "gate", {STATE_EVALUATED})
-    recommendation = state["last_evaluation"].get("recommendation")
-    if recommendation not in {"SKIP", "CONTINUE"}:
-        raise CliError(
-            "invalid_transition",
-            f"Gate requires evaluation recommendation SKIP or CONTINUE, got {recommendation!r}",
-            valid_next=infer_next_steps(state),
-        )
-    gate = run_gate_checks(plan_dir, state)
-    atomic_write_json(plan_dir / "gate.json", gate)
-    if not gate["passed"]:
-        append_history(
-            state,
-            make_history_entry(
-                "gate",
-                duration_ms=0,
-                cost_usd=0.0,
-                result="blocked",
-                output_file="gate.json",
-                artifact_hash=sha256_file(plan_dir / "gate.json"),
-            ),
-        )
-        save_state(plan_dir, state)
-        return {
-            "success": False,
-            "step": "gate",
-            "summary": "Gate blocked: unresolved flags or failed preflight checks remain.",
-            "artifacts": ["gate.json"],
-            "next_step": "integrate" if recommendation == "CONTINUE" else "override force-proceed",
-            "state": state["current_state"],
-            "auto_approve": bool(state["config"].get("auto_approve", False)),
-            "robustness": configured_robustness(state),
-            **gate,
-        }
-    final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    atomic_write_text(plan_dir / "final.md", final_plan)
-    state["current_state"] = STATE_GATED
-    state["meta"].pop("user_approved_gate", None)
+    require_state(state, "gate", {STATE_CRITIQUED})
+    iteration = state["iteration"]
+    gate_signals = build_gate_signals(plan_dir, state)
+    gate_checks = run_gate_checks(plan_dir, state)
+    signals_artifact = {
+        "robustness": gate_signals["robustness"],
+        "signals": gate_signals["signals"],
+        "warnings": gate_signals.get("warnings", []),
+        "criteria_check": gate_checks["criteria_check"],
+        "preflight_results": gate_checks["preflight_results"],
+        "unresolved_flags": gate_checks["unresolved_flags"],
+    }
+    signals_filename = f"gate_signals_v{iteration}.json"
+    atomic_write_json(plan_dir / signals_filename, signals_artifact)
+    try:
+        worker, agent, mode, refreshed = run_step_with_worker("gate", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="gate", iteration=iteration, error=error)
+        raise
+    gate_summary = build_gate_artifact(signals_artifact, worker.payload, override_forced=False)
+    atomic_write_json(plan_dir / "gate.json", gate_summary)
+    state["last_gate"] = {
+        "recommendation": gate_summary["recommendation"],
+        "rationale": gate_summary["rationale"],
+        "signals_assessment": gate_summary["signals_assessment"],
+        "warnings": gate_summary["warnings"],
+        "passed": gate_summary["passed"],
+        "preflight_results": gate_summary["preflight_results"],
+    }
+    if len(state["meta"].get("weighted_scores", [])) < iteration:
+        _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
+
+    result = "success"
+    next_step = None
+    artifacts = [signals_filename, "gate.json"]
+    summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
+    if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
+        final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+        atomic_write_text(plan_dir / "final.md", final_plan)
+        artifacts.append("final.md")
+        state["current_state"] = STATE_GATED
+        state["meta"].pop("user_approved_gate", None)
+        next_step = "execute"
+    elif gate_summary["recommendation"] == "PROCEED":
+        result = "blocked"
+        next_step = "revise"
+        summary = "Gate recommended PROCEED, but preflight checks are still blocking execution."
+    elif gate_summary["recommendation"] == "ITERATE":
+        next_step = "revise"
+    else:
+        next_step = "override add-note"
+
+    apply_session_update(state, "gate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
             "gate",
-            duration_ms=0,
-            cost_usd=0.0,
-            result="success",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result=result,
+            worker=worker,
+            agent=agent,
+            mode=mode,
             output_file="gate.json",
             artifact_hash=sha256_file(plan_dir / "gate.json"),
+            recommendation=gate_summary["recommendation"],
         ),
     )
     save_state(plan_dir, state)
-    return {
-        "success": True,
+    response = {
+        "success": gate_summary["recommendation"] != "PROCEED" or gate_summary["passed"],
         "step": "gate",
-        "summary": "Gate passed. Plan is ready for execution.",
-        "artifacts": ["gate.json", "final.md"],
-        "next_step": "execute",
-        "state": STATE_GATED,
+        "summary": summary,
+        "artifacts": artifacts,
+        "next_step": next_step,
+        "state": state["current_state"],
         "auto_approve": bool(state["config"].get("auto_approve", False)),
         "robustness": configured_robustness(state),
-        **gate,
+        "gate_recommendation": gate_summary["recommendation"],
+        "gate_rationale": gate_summary["rationale"],
+        **gate_summary,
     }
+    attach_agent_fallback(response, args)
+    return response
 
 
 def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -984,50 +969,53 @@ def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) 
 
 
 def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    if state["current_state"] != STATE_EVALUATED:
+    if state["current_state"] != STATE_CRITIQUED:
         raise CliError(
             "invalid_transition",
-            "force-proceed is only supported from evaluated state",
+            "force-proceed is only supported from critiqued state",
             valid_next=infer_next_steps(state),
         )
-    gate = run_gate_checks(plan_dir, state)
-    if not gate["preflight_results"]["project_dir_exists"] or not gate["preflight_results"]["success_criteria_present"]:
+    gate_checks = run_gate_checks(plan_dir, state)
+    if not gate_checks["preflight_results"]["project_dir_exists"] or not gate_checks["preflight_results"]["success_criteria_present"]:
         raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
+    signals = build_gate_signals(plan_dir, state)
+    merged_signals = {
+        "robustness": signals["robustness"],
+        "signals": signals["signals"],
+        "warnings": signals.get("warnings", []),
+        "criteria_check": gate_checks["criteria_check"],
+        "preflight_results": gate_checks["preflight_results"],
+        "unresolved_flags": gate_checks["unresolved_flags"],
+    }
+    gate = build_gate_artifact(
+        merged_signals,
+        {
+            "recommendation": "PROCEED",
+            "rationale": args.reason or "User forced execution past the gate.",
+            "signals_assessment": "Forced proceed override applied by the orchestrator.",
+            "warnings": signals.get("warnings", []),
+        },
+        override_forced=True,
+    )
     atomic_write_json(plan_dir / "gate.json", gate)
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
     state["meta"].pop("user_approved_gate", None)
+    state["last_gate"] = {}
     _append_to_meta(state, "overrides", {"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
     return {
         "success": True,
         "step": "override",
-        "summary": "Force-proceeded past evaluation into gated state.",
+        "summary": "Force-proceeded past gate judgment into gated state.",
         "next_step": "execute",
         "state": STATE_GATED,
     }
 
 
-def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    if state["current_state"] != STATE_EVALUATED:
-        raise CliError("invalid_transition", "skip is currently only supported from evaluated state", valid_next=infer_next_steps(state))
-    evaluation = copy.deepcopy(state["last_evaluation"])
-    evaluation["recommendation"] = "SKIP"
-    state["last_evaluation"] = evaluation
-    _append_to_meta(state, "overrides", {"action": "skip", "timestamp": now_utc(), "reason": args.reason})
-    save_state(plan_dir, state)
-    return {
-        "success": True,
-        "step": "override",
-        "summary": "Marked evaluation as SKIP. Run gate next.",
-        "next_step": "gate",
-        "state": state["current_state"],
-    }
-
-
 def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    allowed = {STATE_GATED, STATE_EVALUATED, STATE_CRITIQUED}
+    allowed = {STATE_GATED, STATE_CRITIQUED}
     if state["current_state"] not in allowed:
         raise CliError(
             "invalid_transition",
@@ -1037,6 +1025,7 @@ def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace)
     reason = args.reason or args.note or "Re-entering planning loop"
     plan_file = latest_plan_path(plan_dir, state)
     state["current_state"] = STATE_PLANNED
+    state["last_gate"] = {}
     _append_to_meta(state, "overrides", {"action": "replan", "timestamp": now_utc(), "reason": reason})
     if args.note:
         _append_to_meta(state, "notes", {"timestamp": now_utc(), "note": args.note})
@@ -1056,7 +1045,6 @@ _OVERRIDE_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], Ste
     "add-note": _override_add_note,
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
-    "skip": _override_skip,
     "replan": _override_replan,
 }
 
@@ -1309,11 +1297,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list")
 
-    for name in ["status", "audit", "evaluate", "gate"]:
+    for name in ["status", "audit"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
-    for name in ["clarify", "plan", "critique", "integrate", "execute", "review"]:
+    for name in ["plan", "critique", "revise", "gate", "execute", "review"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
         step_parser.add_argument("--agent", choices=["claude", "codex"])
@@ -1335,7 +1323,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("reset")
 
     override_parser = subparsers.add_parser("override")
-    override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note", "replan"])
+    override_parser.add_argument("override_action", choices=["abort", "force-proceed", "add-note", "replan"])
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")
@@ -1350,11 +1338,9 @@ def build_parser() -> argparse.ArgumentParser:
 # Commands that take (root, args) and return a response dict.
 COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "init": handle_init,
-    "clarify": handle_clarify,
     "plan": handle_plan,
     "critique": handle_critique,
-    "evaluate": handle_evaluate,
-    "integrate": handle_integrate,
+    "revise": handle_revise,
     "gate": handle_gate,
     "execute": handle_execute,
     "review": handle_review,
