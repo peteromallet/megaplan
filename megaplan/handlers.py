@@ -1280,6 +1280,16 @@ def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
     return response
 
 
+def _is_rework_reexecution(state: PlanState) -> bool:
+    """Check if the last completed step was a review with needs_rework."""
+    for entry in reversed(state.get("history", [])):
+        if entry.get("step") == "review" and entry.get("result") == "needs_rework":
+            return True
+        if entry.get("step") == "execute":
+            return False
+    return False
+
+
 def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "execute", {STATE_FINALIZED})
@@ -1295,6 +1305,9 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
         )
     agent, mode, refreshed = worker_module.resolve_agent_mode("execute", args)
+    # Force fresh session after review kickback to avoid prior-context bias
+    if not refreshed and _is_rework_reexecution(state):
+        refreshed = True
     if getattr(args, "batch", None) is not None:
         return dispatch_execute_one_batch(
             root=root,

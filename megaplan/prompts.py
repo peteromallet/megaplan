@@ -639,10 +639,15 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
             "for previously done tasks, preserve their existing status and notes."
         )
     elif done_tasks and not pending_tasks:
+        review_data = read_json(plan_dir / "review.json") if (plan_dir / "review.json").exists() else {}
+        review_issues = review_data.get("issues", [])
+        issue_list = "\n".join(f"  - {issue}" for issue in review_issues) if review_issues else "  (see review.json above for details)"
         rerun_guidance = (
-            "Re-execution: all tasks are already tracked but execution was blocked or kicked back. "
-            "Check the review findings above and address the specific issues raised. "
-            "Return task_updates for all tasks with updated evidence where needed."
+            "REWORK REQUIRED: all tasks are already tracked but the reviewer kicked this back.\n"
+            f"Review issues to fix:\n{issue_list}\n\n"
+            "You MUST make code changes to address each issue — do not return success without modifying files. "
+            "For each issue, either fix it and list the file in files_changed, or explain in deviations why no change is needed with line-level evidence. "
+            "Return task_updates for all tasks with updated evidence."
         )
     else:
         rerun_guidance = ""
@@ -687,7 +692,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         - Implement the intent, not just the text.
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
-        - Output concrete files changed and commands run.
+        - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
         - Use the tasks in `finalize.json` as the execution boundary.
         - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
         - Best-effort sense-check checkpointing: if `{checkpoint_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.

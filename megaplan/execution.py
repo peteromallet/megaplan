@@ -180,18 +180,18 @@ def _observed_batch_paths(
 
 
 def _collect_execute_claimed_paths(payload: dict[str, Any], project_dir: Path | None = None) -> set[str]:
-    claimed_paths = {
+    """Collect top-level files_changed only for git observation comparison.
+
+    Per-task files_changed are intentionally excluded — they often include
+    files the executor read/verified but didn't modify, which causes false
+    phantom-claim deviations when compared against git status deltas.
+    Per-task evidence is validated separately by the audit path.
+    """
+    return {
         _normalize_execute_claimed_path(path, project_dir)
         for path in payload.get("files_changed", [])
         if isinstance(path, str) and path.strip()
     }
-    for task_update in payload.get("task_updates", []):
-        if not isinstance(task_update, dict):
-            continue
-        for path in task_update.get("files_changed", []):
-            if isinstance(path, str) and path.strip():
-                claimed_paths.add(_normalize_execute_claimed_path(path, project_dir))
-    return claimed_paths
 
 
 def _stable_unique_strings(values: list[str]) -> list[str]:
