@@ -115,6 +115,43 @@ def run_command(
     )
 
 
+_CODEX_ERROR_PATTERNS: list[tuple[str, str, str]] = [
+    # (pattern_substring, error_code, human_message)
+    ("rate limit", "rate_limit", "Codex hit a rate limit"),
+    ("rate_limit", "rate_limit", "Codex hit a rate limit"),
+    ("429", "rate_limit", "Codex hit a rate limit (HTTP 429)"),
+    ("quota", "quota_exceeded", "Codex quota exceeded"),
+    ("context length", "context_overflow", "Prompt exceeded Codex context length"),
+    ("context_length", "context_overflow", "Prompt exceeded Codex context length"),
+    ("maximum context", "context_overflow", "Prompt exceeded Codex context length"),
+    ("too many tokens", "context_overflow", "Prompt exceeded Codex context length"),
+    ("timed out", "worker_timeout", "Codex request timed out"),
+    ("timeout", "worker_timeout", "Codex request timed out"),
+    ("connection error", "connection_error", "Codex could not connect to the API"),
+    ("connection refused", "connection_error", "Codex could not connect to the API"),
+    ("internal server error", "api_error", "Codex API returned an internal error"),
+    ("500", "api_error", "Codex API returned an internal error (HTTP 500)"),
+    ("502", "api_error", "Codex API returned a gateway error (HTTP 502)"),
+    ("503", "api_error", "Codex API service unavailable (HTTP 503)"),
+    ("model not found", "model_error", "Codex model not found or unavailable"),
+    ("permission denied", "permission_error", "Codex permission denied"),
+    ("authentication", "auth_error", "Codex authentication failed"),
+    ("unauthorized", "auth_error", "Codex authentication failed"),
+]
+
+
+def _diagnose_codex_failure(raw: str, returncode: int) -> tuple[str, str]:
+    """Parse Codex stderr/stdout for known error patterns. Returns (error_code, message)."""
+    lower = raw.lower()
+    for pattern, code, message in _CODEX_ERROR_PATTERNS:
+        if pattern in lower:
+            return code, f"{message}. Try --agent claude to use a different backend."
+    return "worker_error", (
+        f"Codex step failed with exit code {returncode} (no recognized error pattern in output). "
+        "Try --agent claude to use a different backend."
+    )
+
+
 def extract_session_id(raw: str) -> str | None:
     # Try structured JSONL first (codex --json emits {"type":"thread.started","thread_id":"..."})
     for line in raw.splitlines():
@@ -670,7 +707,8 @@ def run_codex_step(
         raise
     raw = result.stdout + result.stderr
     if result.returncode != 0 and (not output_path.exists() or not output_path.read_text(encoding="utf-8").strip()):
-        raise CliError("worker_error", f"Codex step failed with exit code {result.returncode}", extra={"raw_output": raw})
+        error_code, error_message = _diagnose_codex_failure(raw, result.returncode)
+        raise CliError(error_code, error_message, extra={"raw_output": raw})
     try:
         payload = parse_json_file(output_path)
     except CliError as error:
