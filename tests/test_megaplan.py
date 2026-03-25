@@ -1679,6 +1679,23 @@ def test_duplicate_sense_check_verdict_dedup() -> None:
     assert valid[1]["verdict"] == "Second pass."
 
 
+def test_is_substantive_reviewer_verdict_accepts_real_verdict() -> None:
+    verdict = "Verification work is acceptable and was checked through command evidence captured in the executor notes."
+    assert megaplan.handlers._is_substantive_reviewer_verdict(verdict) is True
+
+
+def test_is_substantive_reviewer_verdict_rejects_short_string() -> None:
+    assert megaplan.handlers._is_substantive_reviewer_verdict("Looks good.") is False
+
+
+def test_is_substantive_reviewer_verdict_rejects_repeated_words() -> None:
+    assert megaplan.handlers._is_substantive_reviewer_verdict("ok ok ok ok ok ok ok") is False
+
+
+def test_is_substantive_reviewer_verdict_accepts_boundary_case() -> None:
+    assert megaplan.handlers._is_substantive_reviewer_verdict("alpha beta beta gamma") is True
+
+
 def test_execute_happy_path_tracks_all_tasks(plan_fixture: PlanFixture) -> None:
     """The default mock execute output still covers every finalized task."""
     make_args = plan_fixture.make_args

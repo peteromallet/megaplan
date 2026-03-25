@@ -261,9 +261,130 @@ def _merge_validated_entries(
     return len(seen)
 
 
+def _validate_and_merge_batch(
+    entries: Any,
+    *,
+    required_fields: tuple[str, ...],
+    targets_by_id: dict[str, dict[str, Any]],
+    id_field: str,
+    merge_fields: tuple[str, ...],
+    issues: list[str],
+    validation_label: str,
+    merge_label: str,
+    incomplete_message: Callable[[int, int], str] | None = None,
+    enum_fields: dict[str, set[str]] | None = None,
+    nonempty_fields: set[str] | None = None,
+    array_fields: tuple[str, ...] = (),
+) -> tuple[int, int]:
+    valid_entries = _validate_merge_inputs(
+        entries,
+        required_fields=required_fields,
+        enum_fields=enum_fields,
+        nonempty_fields=nonempty_fields,
+        array_fields=array_fields,
+        deviations=issues,
+        label=validation_label,
+    )
+    total = len(targets_by_id)
+    merged_count = _merge_validated_entries(
+        valid_entries,
+        targets_by_id=targets_by_id,
+        id_field=id_field,
+        merge_fields=merge_fields,
+        issues=issues,
+        label=merge_label,
+    )
+    if incomplete_message is not None and merged_count < total:
+        issues.append(incomplete_message(merged_count, total))
+    return merged_count, total
+
+
+def _check_done_task_evidence(
+    tasks: list[dict[str, Any]],
+    *,
+    issues: list[str],
+    should_classify: Callable[[dict[str, Any]], bool],
+    has_evidence: Callable[[dict[str, Any]], bool],
+    has_advisory_evidence: Callable[[dict[str, Any]], bool],
+    missing_message: str,
+    advisory_message: str,
+) -> list[str]:
+    missing_task_ids: list[str] = []
+    advisory_task_ids: list[str] = []
+    for task in tasks:
+        if task.get("status") != "done" or not should_classify(task):
+            continue
+        if has_evidence(task):
+            continue
+        if has_advisory_evidence(task):
+            advisory_task_ids.append(task["id"])
+        else:
+            missing_task_ids.append(task["id"])
+    if missing_task_ids:
+        issues.append(missing_message + ", ".join(missing_task_ids))
+    if advisory_task_ids:
+        issues.append(advisory_message + ", ".join(advisory_task_ids))
+    return missing_task_ids
+
+
+def _resolve_execute_approval_mode(*, auto_approve: bool, user_approved_gate: bool) -> str:
+    if auto_approve:
+        return "auto_approve"
+    if user_approved_gate:
+        return "user_approved"
+    return "manual"
+
+
+def _format_execute_tracking_note(
+    *,
+    merged_count: int,
+    total_tasks: int,
+    acknowledged_count: int,
+    total_checks: int,
+) -> str:
+    tracking_bits: list[str] = []
+    if total_tasks > 0:
+        tracking_bits.append(f"{merged_count}/{total_tasks} tasks tracked")
+    if total_checks > 0:
+        tracking_bits.append(f"{acknowledged_count}/{total_checks} sense checks acknowledged")
+    return f" ({', '.join(tracking_bits)})" if tracking_bits else ""
+
+
+def _build_review_blocked_message(
+    *,
+    verdict_count: int,
+    total_tasks: int,
+    check_count: int,
+    total_checks: int,
+    missing_reviewer_evidence: list[str],
+) -> str:
+    if missing_reviewer_evidence:
+        return (
+            "Blocked: done tasks are missing reviewer evidence_files without a substantive reviewer_verdict ("
+            + ", ".join(missing_reviewer_evidence)
+            + "). Re-run review to complete."
+        )
+    return (
+        "Blocked: incomplete review coverage "
+        f"({verdict_count}/{total_tasks} task verdicts, {check_count}/{total_checks} sense checks). "
+        "Re-run review to complete."
+    )
+
+
+_MIN_VERDICT_CHARS = 20
+_MIN_VERDICT_WORDS = 4
+_MIN_VERDICT_UNIQUE_WORDS = 3
+
+
 def _is_substantive_reviewer_verdict(text: str) -> bool:
     stripped = text.strip()
-    return len(stripped) > 20 and len(stripped.split()) >= 4
+    if len(stripped) <= _MIN_VERDICT_CHARS:
+        return False
+    words = stripped.split()
+    if len(words) < _MIN_VERDICT_WORDS:
+        return False
+    unique_words = {word.lower() for word in words}
+    return len(unique_words) >= _MIN_VERDICT_UNIQUE_WORDS
 
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
@@ -1125,75 +1246,56 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     deviations = list(worker.payload.get("deviations", []))
     finalize_data = read_json(plan_dir / "finalize.json")
     project_dir = Path(state["config"]["project_dir"])
-    task_updates = _validate_merge_inputs(
+    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    merged_count, total_tasks = _validate_and_merge_batch(
         worker.payload.get("task_updates"),
         required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
-        enum_fields={"status": {"done", "skipped"}},
-        nonempty_fields={"executor_notes"},
-        array_fields=("files_changed", "commands_run"),
-        deviations=deviations,
-        label="task_updates",
-    )
-    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
-    total_tasks = len(tasks_by_id)
-    merged_count = _merge_validated_entries(
-        task_updates,
         targets_by_id=tasks_by_id,
         id_field="task_id",
         merge_fields=("status", "executor_notes", "files_changed", "commands_run"),
         issues=deviations,
-        label="task_update",
+        validation_label="task_updates",
+        merge_label="task_update",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"{total - merged_count}/{total} tasks have no executor update — tracking is incomplete."
+            )
+        ),
+        enum_fields={"status": {"done", "skipped"}},
+        nonempty_fields={"executor_notes"},
+        array_fields=("files_changed", "commands_run"),
     )
     untracked_tasks = total_tasks - merged_count
-    if untracked_tasks > 0:
-        deviations.append(f"{untracked_tasks}/{total_tasks} tasks have no executor update — tracking is incomplete.")
-    sense_check_acknowledgments = _validate_merge_inputs(
-        worker.payload.get("sense_check_acknowledgments"),
-        required_fields=("sense_check_id", "executor_note"),
-        nonempty_fields={"executor_note"},
-        deviations=deviations,
-        label="sense_check_acknowledgments",
-    )
     sense_checks_by_id = {
         sense_check["id"]: sense_check
         for sense_check in finalize_data.get("sense_checks", [])
     }
-    total_checks = len(sense_checks_by_id)
-    acknowledged_count = _merge_validated_entries(
-        sense_check_acknowledgments,
+    acknowledged_count, total_checks = _validate_and_merge_batch(
+        worker.payload.get("sense_check_acknowledgments"),
+        required_fields=("sense_check_id", "executor_note"),
         targets_by_id=sense_checks_by_id,
         id_field="sense_check_id",
         merge_fields=("executor_note",),
         issues=deviations,
-        label="sense_check_acknowledgment",
+        validation_label="sense_check_acknowledgments",
+        merge_label="sense_check_acknowledgment",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"{total - merged_count}/{total} sense checks have no executor acknowledgment — tracking is incomplete."
+            )
+        ),
+        nonempty_fields={"executor_note"},
     )
     unacked_checks = total_checks - acknowledged_count
-    if unacked_checks > 0:
-        deviations.append(
-            f"{unacked_checks}/{total_checks} sense checks have no executor acknowledgment — tracking is incomplete."
-        )
-
-    missing_task_evidence: list[str] = []
-    advisory_task_evidence: list[str] = []
-    for task in finalize_data.get("tasks", []):
-        if task.get("status") != "done":
-            continue
-        has_files = bool(task.get("files_changed"))
-        has_commands = bool(task.get("commands_run"))
-        if not has_files and not has_commands:
-            missing_task_evidence.append(task["id"])
-        elif not has_files and has_commands:
-            advisory_task_evidence.append(task["id"])
-    if missing_task_evidence:
-        deviations.append(
-            "Done tasks missing both files_changed and commands_run: "
-            + ", ".join(missing_task_evidence)
-        )
-    if advisory_task_evidence:
-        deviations.append(
-            "Advisory: done tasks rely on commands_run without files_changed (FLAG-006 softening): "
-            + ", ".join(advisory_task_evidence)
-        )
+    missing_task_evidence = _check_done_task_evidence(
+        finalize_data.get("tasks", []),
+        issues=deviations,
+        should_classify=lambda task: True,
+        has_evidence=lambda task: bool(task.get("files_changed")),
+        has_advisory_evidence=lambda task: bool(task.get("commands_run")),
+        missing_message="Done tasks missing both files_changed and commands_run: ",
+        advisory_message="Advisory: done tasks rely on commands_run without files_changed (FLAG-006 softening): ",
+    )
 
     execution_audit = validate_execution_evidence(finalize_data, project_dir)
     if execution_audit["skipped"]:
@@ -1220,12 +1322,11 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     if not blocked:
         state["current_state"] = STATE_EXECUTED
     apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    if auto_approve:
-        approval_mode = "auto_approve"
-    elif state["meta"].get("user_approved_gate", False):
-        approval_mode = "user_approved"
-    else:
-        approval_mode = "manual"
+    user_approved_gate = bool(state["meta"].get("user_approved_gate", False))
+    approval_mode = _resolve_execute_approval_mode(
+        auto_approve=auto_approve,
+        user_approved_gate=user_approved_gate,
+    )
     append_history(
         state,
         make_history_entry(
@@ -1246,12 +1347,12 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     artifacts = ["execution.json", "execution_audit.json", "finalize.json", "final.md"]
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
-    tracking_bits: list[str] = []
-    if total_tasks > 0:
-        tracking_bits.append(f"{merged_count}/{total_tasks} tasks tracked")
-    if total_checks > 0:
-        tracking_bits.append(f"{acknowledged_count}/{total_checks} sense checks acknowledged")
-    tracking_note = f" ({', '.join(tracking_bits)})" if tracking_bits else ""
+    tracking_note = _format_execute_tracking_note(
+        merged_count=merged_count,
+        total_tasks=total_tasks,
+        acknowledged_count=acknowledged_count,
+        total_checks=total_checks,
+    )
     blocked_message = "Blocked: " + "; ".join(blocking_reasons) + ". Re-run execute to complete tracking."
     response: StepResponse = {
         "success": not blocked,
@@ -1264,7 +1365,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         "deviations": deviations,
         "warnings": [blocked_message] if blocked else [],
         "auto_approve": auto_approve,
-        "user_approved_gate": bool(state["meta"].get("user_approved_gate", False)),
+        "user_approved_gate": user_approved_gate,
     }
     attach_agent_fallback(response, args)
     return response
@@ -1285,70 +1386,54 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     if review_verdict not in {"approved", "needs_rework"}:
         issues.append("Invalid review_verdict; expected 'approved' or 'needs_rework'.")
         review_verdict = "needs_rework"
-    task_verdicts = _validate_merge_inputs(
+    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    verdict_count, total_tasks = _validate_and_merge_batch(
         worker.payload.get("task_verdicts"),
         required_fields=("task_id", "reviewer_verdict", "evidence_files"),
-        nonempty_fields={"reviewer_verdict"},
-        array_fields=("evidence_files",),
-        deviations=issues,
-        label="task_verdicts",
-    )
-    sense_check_verdicts = _validate_merge_inputs(
-        worker.payload.get("sense_check_verdicts"),
-        required_fields=("sense_check_id", "verdict"),
-        nonempty_fields={"verdict"},
-        deviations=issues,
-        label="sense_check_verdicts",
-    )
-    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
-    total_tasks = len(tasks_by_id)
-    verdict_count = _merge_validated_entries(
-        task_verdicts,
         targets_by_id=tasks_by_id,
         id_field="task_id",
         merge_fields=("reviewer_verdict", "evidence_files"),
         issues=issues,
-        label="task_verdict",
+        validation_label="task_verdicts",
+        merge_label="task_verdict",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"Incomplete review: {merged_count}/{total} tasks received a reviewer verdict."
+            )
+        ),
+        nonempty_fields={"reviewer_verdict"},
+        array_fields=("evidence_files",),
     )
-    if total_tasks > 0 and verdict_count < total_tasks:
-        issues.append(f"Incomplete review: {verdict_count}/{total_tasks} tasks received a reviewer verdict.")
     sense_checks_by_id = {sense_check["id"]: sense_check for sense_check in finalize_data.get("sense_checks", [])}
-    total_checks = len(sense_checks_by_id)
-    check_count = _merge_validated_entries(
-        sense_check_verdicts,
+    check_count, total_checks = _validate_and_merge_batch(
+        worker.payload.get("sense_check_verdicts"),
+        required_fields=("sense_check_id", "verdict"),
         targets_by_id=sense_checks_by_id,
         id_field="sense_check_id",
         merge_fields=("verdict",),
         issues=issues,
-        label="sense_check_verdict",
+        validation_label="sense_check_verdicts",
+        merge_label="sense_check_verdict",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"Incomplete review: {merged_count}/{total} sense checks received a verdict."
+            )
+        ),
+        nonempty_fields={"verdict"},
     )
-    if total_checks > 0 and check_count < total_checks:
-        issues.append(f"Incomplete review: {check_count}/{total_checks} sense checks received a verdict.")
-
-    missing_reviewer_evidence: list[str] = []
-    advisory_reviewer_evidence: list[str] = []
-    for task in finalize_data.get("tasks", []):
-        if task.get("status") != "done":
-            continue
-        reviewer_verdict = task.get("reviewer_verdict", "")
-        if not reviewer_verdict.strip():
-            continue
-        if task.get("evidence_files"):
-            continue
-        if _is_substantive_reviewer_verdict(reviewer_verdict):
-            advisory_reviewer_evidence.append(task["id"])
-        else:
-            missing_reviewer_evidence.append(task["id"])
-    if missing_reviewer_evidence:
-        issues.append(
-            "Done tasks missing reviewer evidence_files without a substantive reviewer_verdict: "
-            + ", ".join(missing_reviewer_evidence)
-        )
-    if advisory_reviewer_evidence:
-        issues.append(
+    missing_reviewer_evidence = _check_done_task_evidence(
+        finalize_data.get("tasks", []),
+        issues=issues,
+        should_classify=lambda task: bool(task.get("reviewer_verdict", "").strip()),
+        has_evidence=lambda task: bool(task.get("evidence_files")),
+        has_advisory_evidence=(
+            lambda task: _is_substantive_reviewer_verdict(task.get("reviewer_verdict", ""))
+        ),
+        missing_message="Done tasks missing reviewer evidence_files without a substantive reviewer_verdict: ",
+        advisory_message=(
             "Advisory: done tasks rely on substantive reviewer_verdict without evidence_files (FLAG-006 softening): "
-            + ", ".join(advisory_reviewer_evidence)
-        )
+        ),
+    )
 
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="review"))
@@ -1382,17 +1467,13 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
-    blocked_message = (
-        "Blocked: incomplete review coverage "
-        f"({verdict_count}/{total_tasks} task verdicts, {check_count}/{total_checks} sense checks). "
-        "Re-run review to complete."
+    blocked_message = _build_review_blocked_message(
+        verdict_count=verdict_count,
+        total_tasks=total_tasks,
+        check_count=check_count,
+        total_checks=total_checks,
+        missing_reviewer_evidence=missing_reviewer_evidence,
     )
-    if missing_reviewer_evidence:
-        blocked_message = (
-            "Blocked: done tasks are missing reviewer evidence_files without a substantive reviewer_verdict ("
-            + ", ".join(missing_reviewer_evidence)
-            + "). Re-run review to complete."
-        )
     reroute_message = "Review requested another execute pass. Re-run execute using the review findings as context."
     response: StepResponse = {
         "success": not blocked and not rework_requested,
