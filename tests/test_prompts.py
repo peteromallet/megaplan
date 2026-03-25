@@ -8,7 +8,7 @@ import pytest
 
 from megaplan.types import PlanState
 from megaplan._core import atomic_write_json, atomic_write_text, save_flag_registry
-from megaplan.prompts import create_claude_prompt, create_codex_prompt
+from megaplan.prompts import _execute_batch_prompt, create_claude_prompt, create_codex_prompt
 from megaplan.workers import _build_mock_payload
 
 
@@ -282,6 +282,9 @@ def test_critique_prompt_contains_intent_and_robustness(tmp_path: Path) -> None:
     assert state["idea"] in prompt
     assert "Robustness level" in prompt
     assert "thorough" in prompt
+    assert "simplest approach" in prompt
+    assert "Over-engineering:" in prompt
+    assert "maintainability" in prompt
 
 
 def test_critique_prompt_includes_structure_guidance_and_warnings(tmp_path: Path) -> None:
@@ -365,11 +368,15 @@ def test_execute_prompt_surfaces_sense_checks_and_watch_items(tmp_path: Path) ->
 def test_execute_prompt_includes_finalize_path_and_checkpoint_instructions(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("execute", state, plan_dir)
-    assert str(plan_dir / "finalize.json") in prompt
+    # Single-batch checkpoint should go to execution_checkpoint.json, NOT finalize.json
+    assert str(plan_dir / "execution_checkpoint.json") in prompt
     assert "Best-effort progress checkpointing" in prompt
     assert "full read-modify-write" in prompt
     assert "Structured output remains the authoritative final summary" in prompt
     assert "Do not create or rewrite tracking artifacts directly." not in prompt
+    # finalize.json should still appear as the source of truth, but NOT as the checkpoint target
+    assert "source of truth" in prompt
+    assert "harness owns" in prompt.lower() or "not `finalize.json`" in prompt.lower()
 
 
 def test_finalize_prompt_requests_structured_tracking_fields(tmp_path: Path) -> None:
@@ -428,6 +435,55 @@ def test_execute_prompt_includes_previous_review_when_present(tmp_path: Path) ->
     assert "Need another execute pass." in prompt
 
 
+def test_execute_batch_prompt_scopes_tasks_and_sense_checks(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "finalize.json",
+        _build_mock_payload(
+            "finalize",
+            state,
+            plan_dir,
+            tasks=[
+                {
+                    "id": "T1",
+                    "description": "First",
+                    "depends_on": [],
+                    "status": "done",
+                    "executor_notes": "Completed already.",
+                    "files_changed": ["megaplan/prompts.py"],
+                    "commands_run": ["pytest tests/test_prompts.py"],
+                    "evidence_files": [],
+                    "reviewer_verdict": "",
+                },
+                {
+                    "id": "T2",
+                    "description": "Second",
+                    "depends_on": ["T1"],
+                    "status": "pending",
+                    "executor_notes": "",
+                    "files_changed": [],
+                    "commands_run": [],
+                    "evidence_files": [],
+                    "reviewer_verdict": "",
+                },
+            ],
+            sense_checks=[
+                {"id": "SC1", "task_id": "T1", "question": "Done?", "executor_note": "Confirmed.", "verdict": ""},
+                {"id": "SC2", "task_id": "T2", "question": "Next?", "executor_note": "", "verdict": ""},
+            ],
+        ),
+    )
+    prompt = _execute_batch_prompt(state, plan_dir, ["T2"], {"T1"})
+    assert "Execute batch 2 of 2." in prompt
+    assert "Only produce `task_updates` for these tasks: [T2]" in prompt
+    assert "Only produce `sense_check_acknowledgments` for these sense checks: [SC2]" in prompt
+    assert '"id": "T2"' in prompt
+    assert '"id": "SC2"' in prompt
+    # Batch prompt checkpoint should reference execution_batch_2.json, not finalize.json
+    assert "execution_batch_2.json" in prompt
+    assert "not `finalize.json`" in prompt.lower() or "harness owns" in prompt.lower()
+
+
 def test_review_prompt_gracefully_handles_missing_audit(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("review", state, plan_dir)
@@ -471,7 +527,7 @@ def test_review_prompt_includes_settled_decisions_when_present(tmp_path: Path) -
         },
     )
     prompt = create_claude_prompt("review", state, plan_dir)
-    assert "do not re-litigate" in prompt
+    assert "verify the executor implemented these correctly" in prompt
     assert "DECISION-001" in prompt
     assert "Treat FLAG-006 softening as settled." in prompt
 
@@ -479,7 +535,7 @@ def test_review_prompt_includes_settled_decisions_when_present(tmp_path: Path) -
 def test_review_prompt_omits_settled_decisions_when_empty(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_codex_prompt("review", state, plan_dir)
-    assert "Settled decisions (from gate approval" not in prompt
+    assert "Settled decisions (verify the executor implemented these correctly)" not in prompt
 
 
 def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:

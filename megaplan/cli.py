@@ -17,6 +17,7 @@ from megaplan.types import (
 from megaplan._core import (
     active_plan_dirs,
     atomic_write_text,
+    compute_global_batches,
     config_dir,
     detect_available_agents,
     ensure_runtime_layout,
@@ -84,6 +85,70 @@ def handle_audit(root: Path, args: argparse.Namespace) -> StepResponse:
         "plan": state["name"],
         "plan_dir": str(plan_dir),
         "state": state,
+    }
+
+
+def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    finalize_path = plan_dir / "finalize.json"
+    if not finalize_path.exists():
+        return {
+            "success": True,
+            "step": "progress",
+            "plan": state["name"],
+            "summary": "No finalize.json yet — plan has not been finalized.",
+            "tasks_total": 0,
+            "tasks_done": 0,
+            "tasks_skipped": 0,
+            "tasks_pending": 0,
+            "batches_total": 0,
+            "batches_completed": 0,
+            "tasks": [],
+        }
+    finalize_data = read_json(finalize_path)
+    global_batches = compute_global_batches(finalize_data)
+    tasks = finalize_data.get("tasks", [])
+    task_id_to_batch: dict[str, int] = {}
+    for batch_idx, batch_ids in enumerate(global_batches, start=1):
+        for task_id in batch_ids:
+            task_id_to_batch[task_id] = batch_idx
+    tasks_done = sum(1 for t in tasks if t.get("status") == "done")
+    tasks_skipped = sum(1 for t in tasks if t.get("status") == "skipped")
+    tasks_pending = sum(1 for t in tasks if t.get("status") == "pending")
+    tasks_total = len(tasks)
+    # A batch is complete when ALL its task IDs have status done or skipped.
+    completed_ids = {
+        t["id"] for t in tasks if t.get("status") in {"done", "skipped"} and isinstance(t.get("id"), str)
+    }
+    batches_completed = sum(
+        1
+        for batch_ids in global_batches
+        if all(tid in completed_ids for tid in batch_ids)
+    )
+    task_status_list = [
+        {
+            "id": t.get("id", ""),
+            "status": t.get("status", "pending"),
+            "batch": task_id_to_batch.get(t.get("id", ""), 0),
+        }
+        for t in tasks
+    ]
+    return {
+        "success": True,
+        "step": "progress",
+        "plan": state["name"],
+        "summary": (
+            f"Execution progress: {tasks_done + tasks_skipped}/{tasks_total} tasks tracked, "
+            f"{batches_completed}/{len(global_batches)} batches completed. "
+            "Progress reflects the last finalize.json write (between-batch granularity)."
+        ),
+        "tasks_total": tasks_total,
+        "tasks_done": tasks_done,
+        "tasks_skipped": tasks_skipped,
+        "tasks_pending": tasks_pending,
+        "batches_total": len(global_batches),
+        "batches_completed": batches_completed,
+        "tasks": task_status_list,
     }
 
 
@@ -274,7 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list")
 
-    for name in ["status", "audit"]:
+    for name in ["status", "audit", "progress"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
@@ -288,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "execute":
             step_parser.add_argument("--confirm-destructive", action="store_true")
             step_parser.add_argument("--user-approved", action="store_true")
+            step_parser.add_argument("--batch", type=int, default=None, help="Execute a specific global batch number (1-indexed)")
         if name == "review":
             step_parser.add_argument("--confirm-self-review", action="store_true")
 
@@ -336,6 +402,7 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "review": handle_review,
     "status": handle_status,
     "audit": handle_audit,
+    "progress": handle_progress,
     "list": handle_list,
     "step": handle_step,
     "override": handle_override,

@@ -17,6 +17,7 @@ from megaplan.evaluation import (
     compute_plan_delta_percent,
     compute_recurring_critiques,
     flag_weight,
+    is_rubber_stamp,
     parse_plan_sections,
     reassemble_plan,
     renumber_steps,
@@ -561,6 +562,34 @@ def test_render_final_md_none_meta_commentary() -> None:
     assert "None." in result  # Should not crash
 
 
+def test_is_rubber_stamp_loose_rejects_generic_ack() -> None:
+    assert is_rubber_stamp("Confirmed.", strict=False) is True
+
+
+def test_is_rubber_stamp_loose_allows_short_specific_text() -> None:
+    # Loose mode is blocklist-only (DECISION-001): short but specific text passes
+    assert is_rubber_stamp("Too short", strict=False) is False
+
+
+def test_is_rubber_stamp_strict_rejects_low_substance_text() -> None:
+    assert is_rubber_stamp("Verified done good", strict=True) is True
+
+
+def test_is_rubber_stamp_accepts_real_note_in_both_modes() -> None:
+    note = (
+        "Confirmed the review prompt still renders the audit fallback and checked that the "
+        "settled-decision wording only changed reviewer framing."
+    )
+    assert is_rubber_stamp(note, strict=False) is False
+    assert is_rubber_stamp(note, strict=True) is False
+
+
+def test_is_rubber_stamp_allows_short_specific_ack_only_in_loose_mode() -> None:
+    note = "Confirmed prompt coverage."
+    assert is_rubber_stamp(note, strict=False) is False
+    assert is_rubber_stamp(note, strict=True) is True
+
+
 def test_validate_execution_evidence_flags_diff_mismatches_and_weak_notes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -643,6 +672,47 @@ def test_validate_execution_evidence_skips_without_git_repo(tmp_path: Path) -> N
 
     assert result["skipped"] is True
     assert result["reason"] == "Project directory is not a git repository."
+
+
+def test_validate_execution_evidence_flags_perfunctory_executor_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    (project_dir / ".git").mkdir(parents=True)
+
+    finalize_data = {
+        "tasks": [
+            {
+                "id": "T1",
+                "status": "done",
+                "files_changed": ["src/main.py"],
+                "executor_notes": "Verified. Done.",
+            },
+            {
+                "id": "T2",
+                "status": "done",
+                "files_changed": [],
+                "executor_notes": "",
+            },
+        ],
+        "sense_checks": [],
+    }
+
+    monkeypatch.setattr(
+        "megaplan.evaluation.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["git", "status", "--short"],
+            returncode=0,
+            stdout=" M src/main.py\n",
+            stderr="",
+        ),
+    )
+
+    result = validate_execution_evidence(finalize_data, project_dir)
+
+    assert any("Task T1 executor_notes are perfunctory" in finding for finding in result["findings"])
+    assert not any("Task T2 executor_notes are perfunctory" in finding for finding in result["findings"])
 
 
 def test_validate_execution_evidence_skips_when_git_missing(

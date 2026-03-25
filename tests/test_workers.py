@@ -336,6 +336,19 @@ def test_build_mock_payload_execute_returns_complete_payload(tmp_path: Path) -> 
     assert payload["sense_check_acknowledgments"]
 
 
+def test_build_mock_payload_execute_scopes_batch_from_prompt_override(tmp_path: Path) -> None:
+    plan_dir, state = _mock_state(tmp_path)
+    payload = _build_mock_payload(
+        "execute",
+        state,
+        plan_dir,
+        prompt_override="Only produce task_updates for these tasks: [T2]",
+    )
+
+    assert [item["task_id"] for item in payload["task_updates"]] == ["T2"]
+    assert [item["sense_check_id"] for item in payload["sense_check_acknowledgments"]] == ["SC2"]
+
+
 def test_mock_critique_returns_valid_payload(tmp_path: Path) -> None:
     from megaplan.workers import mock_worker_output
     plan_dir, state = _mock_state(tmp_path)
@@ -579,6 +592,26 @@ def test_run_claude_step_parses_structured_output(tmp_path: Path) -> None:
     assert result.duration_ms == 500
 
 
+def test_run_claude_step_uses_prompt_override_without_builder(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_claude_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    fake_result = CommandResult(
+        command=["claude"],
+        cwd=tmp_path,
+        returncode=0,
+        stdout=json.dumps({"structured_output": {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}}),
+        stderr="",
+        duration_ms=10,
+    )
+    with patch("megaplan.workers.create_claude_prompt", side_effect=AssertionError("builder should not run")):
+        with patch("megaplan.workers.run_command", return_value=fake_result) as run_command:
+            run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=True, prompt_override="custom prompt")
+    assert run_command.call_args.kwargs["stdin_text"] == "custom prompt"
+
+
 def test_run_claude_step_raises_on_invalid_payload(tmp_path: Path) -> None:
     from megaplan._core import ensure_runtime_layout
     from megaplan.workers import CommandResult, run_claude_step
@@ -623,6 +656,71 @@ def test_run_claude_step_attaches_session_id_on_timeout(tmp_path: Path) -> None:
             run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=False)
 
     assert exc_info.value.extra["session_id"] == "claude-session"
+
+
+def test_run_codex_step_uses_prompt_override_without_builder(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    output_path = tmp_path / "codex-output.json"
+
+    def fake_named_tempfile(*args: object, **kwargs: object):
+        class _TempFile:
+            name = str(output_path)
+
+            def close(self) -> None:
+                return None
+
+        return _TempFile()
+
+    def fake_run_command(*args: object, **kwargs: object) -> CommandResult:
+        output_path.write_text(
+            json.dumps({"plan": "# Plan", "questions": [], "success_criteria": [], "assumptions": []}),
+            encoding="utf-8",
+        )
+        return CommandResult(
+            command=["codex"],
+            cwd=tmp_path,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_ms=10,
+        )
+
+    with patch("megaplan.workers.create_codex_prompt", side_effect=AssertionError("builder should not run")):
+        with patch("megaplan.workers.tempfile.NamedTemporaryFile", side_effect=fake_named_tempfile):
+            with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+                run_codex_step(
+                    "plan",
+                    state,
+                    plan_dir,
+                    root=tmp_path,
+                    persistent=False,
+                    prompt_override="custom prompt",
+                )
+
+
+def test_run_step_with_worker_passes_prompt_override(tmp_path: Path) -> None:
+    from megaplan.workers import run_step_with_worker
+
+    plan_dir, state = _mock_state(tmp_path)
+    payload = {"output": "done", "files_changed": [], "commands_run": [], "deviations": [], "task_updates": [], "sense_check_acknowledgments": []}
+    with patch(
+        "megaplan.workers.run_codex_step",
+        return_value=type("Result", (), {"payload": payload, "raw_output": "", "duration_ms": 1, "cost_usd": 0.0, "session_id": "sess", "trace_output": None})(),
+    ) as run_codex:
+        run_step_with_worker(
+            "execute",
+            state,
+            plan_dir,
+            _make_args(agent="codex"),
+            root=tmp_path,
+            resolved=("codex", "persistent", False),
+            prompt_override="custom execute prompt",
+        )
+    assert run_codex.call_args.kwargs["prompt_override"] == "custom execute prompt"
 
 
 def test_run_codex_step_parses_output_file(tmp_path: Path) -> None:

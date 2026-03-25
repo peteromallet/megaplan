@@ -41,6 +41,24 @@ If you disagree with the guidance, explain why briefly and use an override. Do n
 ```bash
 megaplan execute --confirm-destructive --user-approved
 ```
+## Long-Running Execution
+For plans with multiple batches, use per-batch mode to drive execution incrementally:
+```bash
+megaplan execute --plan <name> --confirm-destructive --user-approved --batch 1
+megaplan execute --plan <name> --confirm-destructive --user-approved --batch 2
+# ... continue until all batches complete
+```
+Between batches, poll progress:
+```bash
+megaplan progress --plan <name>
+```
+Per-batch mode uses global batch numbering (1-indexed, computed from ALL tasks). Each `--batch N` call:
+- Validates that batches 1..N-1 are complete
+- Executes only batch N's tasks
+- Writes `execution_batch_N.json` as evidence
+- On the final batch, produces aggregate `execution.json` and transitions to `executed`
+Timeout recovery: re-run the same `--batch N`. The harness checks prerequisite completion and merges only untracked tasks.
+Note: `progress` shows completed state only (between-batch granularity). With per-batch mode, each batch is a separate CLI call, so the orchestrator has full visibility.
 ## Overrides
 - `megaplan override add-note --plan <name> --note "..."`
 - `megaplan override force-proceed --plan <name> --reason "..."`
@@ -71,6 +89,7 @@ Each edit writes a new same-iteration plan artifact, preserves the latest plan m
 ## Commands
 ```bash
 megaplan status --plan <name>
+megaplan progress --plan <name>
 megaplan audit --plan <name>
 megaplan list
 megaplan plan --plan <name>
@@ -78,7 +97,7 @@ megaplan critique --plan <name>
 megaplan revise --plan <name>
 megaplan gate --plan <name>
 megaplan finalize --plan <name>
-megaplan execute --plan <name> --confirm-destructive
+megaplan execute --plan <name> --confirm-destructive [--batch N]
 megaplan review --plan <name>
 megaplan step add --plan <name> [--after S<N>] "description"
 megaplan step remove --plan <name> S<N>

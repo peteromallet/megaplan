@@ -412,7 +412,7 @@ def _default_mock_finalize_payload(state: PlanState, plan_dir: Path) -> dict[str
             {
                 "id": "T2",
                 "description": "Verify success criteria",
-                "depends_on": ["T1"],
+                "depends_on": [],
                 "status": "pending",
                 "executor_notes": "",
                 "files_changed": [],
@@ -442,10 +442,25 @@ def _default_mock_finalize_payload(state: PlanState, plan_dir: Path) -> dict[str
     }
 
 
-def _default_mock_execute_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+def _task_ids_from_prompt_override(prompt_override: str | None) -> set[str] | None:
+    if prompt_override is None:
+        return None
+    match = re.search(r"Only produce `?task_updates`? for these tasks:\s*\[([^\]]*)\]", prompt_override)
+    if match is None:
+        return None
+    task_ids = {item.strip() for item in match.group(1).split(",") if item.strip()}
+    return task_ids
+
+
+def _default_mock_execute_payload(
+    state: PlanState,
+    plan_dir: Path,
+    *,
+    prompt_override: str | None = None,
+) -> dict[str, Any]:
     target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
     relative_target = str(target.relative_to(Path(state["config"]["project_dir"])))
-    return {
+    payload = {
         "output": "Mock execution completed successfully.",
         "files_changed": [relative_target],
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
@@ -477,6 +492,24 @@ def _default_mock_execute_payload(state: PlanState, plan_dir: Path) -> dict[str,
             },
         ],
     }
+    batch_task_ids = _task_ids_from_prompt_override(prompt_override)
+    if batch_task_ids is None:
+        return payload
+    payload["task_updates"] = [
+        task_update
+        for task_update in payload["task_updates"]
+        if task_update["task_id"] in batch_task_ids
+    ]
+    payload["sense_check_acknowledgments"] = [
+        acknowledgment
+        for acknowledgment in payload["sense_check_acknowledgments"]
+        if acknowledgment["sense_check_id"] in {
+            f"SC{task_id[1:]}"
+            for task_id in batch_task_ids
+            if task_id.startswith("T")
+        }
+    ]
+    return payload
 
 
 def _default_mock_review_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
@@ -526,6 +559,9 @@ def _build_mock_payload(step: str, state: PlanState, plan_dir: Path, **overrides
     builder = _MOCK_DEFAULTS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
+    prompt_override = overrides.pop("prompt_override", None)
+    if step == "execute":
+        return _deep_merge(_default_mock_execute_payload(state, plan_dir, prompt_override=prompt_override), overrides)
     return _deep_merge(builder(state, plan_dir), overrides)
 
 
@@ -549,17 +585,20 @@ def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("finalize", state, plan_dir))
 
 
-def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _mock_execute(state: PlanState, plan_dir: Path, *, prompt_override: str | None = None) -> WorkerResult:
     target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
     target.write_text("mock execution completed\n", encoding="utf-8")
-    return _mock_result(_build_mock_payload("execute", state, plan_dir), trace_output='{"event":"mock-execute"}\n')
+    return _mock_result(
+        _build_mock_payload("execute", state, plan_dir, prompt_override=prompt_override),
+        trace_output='{"event":"mock-execute"}\n',
+    )
 
 
 def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("review", state, plan_dir))
 
 
-_MockHandler = Callable[[PlanState, Path], WorkerResult]
+_MockHandler = Callable[..., WorkerResult]
 
 _MOCK_DISPATCH: dict[str, _MockHandler] = {
     "plan": _mock_plan,
@@ -572,10 +611,18 @@ _MOCK_DISPATCH: dict[str, _MockHandler] = {
 }
 
 
-def mock_worker_output(step: str, state: PlanState, plan_dir: Path) -> WorkerResult:
+def mock_worker_output(
+    step: str,
+    state: PlanState,
+    plan_dir: Path,
+    *,
+    prompt_override: str | None = None,
+) -> WorkerResult:
     handler = _MOCK_DISPATCH.get(step)
     if handler is None:
         raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
+    if step == "execute":
+        return handler(state, plan_dir, prompt_override=prompt_override)
     return handler(state, plan_dir)
 
 
@@ -616,9 +663,17 @@ def update_session_state(step: str, agent: str, session_id: str | None, *, mode:
     return key, entry
 
 
-def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
+def run_claude_step(
+    step: str,
+    state: PlanState,
+    plan_dir: Path,
+    *,
+    root: Path,
+    fresh: bool,
+    prompt_override: str | None = None,
+) -> WorkerResult:
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir)
+        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override)
     project_dir = Path(state["config"]["project_dir"])
     schema_name = STEP_SCHEMA_FILENAMES[step]
     schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
@@ -626,12 +681,14 @@ def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, 
     session = state["sessions"].get(session_key, {})
     session_id = session.get("id")
     command = ["claude", "-p", "--output-format", "json", "--json-schema", schema_text, "--add-dir", str(project_dir)]
+    if step == "execute":
+        command.extend(["--permission-mode", "bypassPermissions"])
     if session_id and not fresh:
         command.extend(["--resume", session_id])
     else:
         session_id = str(uuid.uuid4())
         command.extend(["--session-id", session_id])
-    prompt = create_claude_prompt(step, state, plan_dir)
+    prompt = prompt_override if prompt_override is not None else create_claude_prompt(step, state, plan_dir)
     try:
         result = run_command(command, cwd=project_dir, stdin_text=prompt)
     except CliError as error:
@@ -662,9 +719,10 @@ def run_codex_step(
     persistent: bool,
     fresh: bool = False,
     json_trace: bool = False,
+    prompt_override: str | None = None,
 ) -> WorkerResult:
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir)
+        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override)
     project_dir = Path(state["config"]["project_dir"])
     schema_file = schemas_root(root) / STEP_SCHEMA_FILENAMES[step]
     session_key = session_key_for(step, "codex")
@@ -672,12 +730,14 @@ def run_codex_step(
     out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)
     out_handle.close()
     output_path = Path(out_handle.name)
-    prompt = create_codex_prompt(step, state, plan_dir)
+    prompt = prompt_override if prompt_override is not None else create_codex_prompt(step, state, plan_dir)
 
     if persistent and session.get("id") and not fresh:
         # codex exec resume does not support --output-schema; we rely on
         # validate_payload() after parsing the output file instead.
         command = ["codex", "exec", "resume"]
+        if step == "execute":
+            command.append("--full-auto")
         if json_trace:
             command.append("--json")
         command.extend([
@@ -792,10 +852,20 @@ def run_step_with_worker(
     *,
     root: Path,
     resolved: tuple[str, str, bool] | None = None,
+    prompt_override: str | None = None,
 ) -> tuple[WorkerResult, str, str, bool]:
     agent, mode, refreshed = resolved or resolve_agent_mode(step, args)
     if agent == "claude":
-        worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed)
+        worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed, prompt_override=prompt_override)
     else:
-        worker = run_codex_step(step, state, plan_dir, root=root, persistent=(mode == "persistent"), fresh=refreshed, json_trace=(step == "execute"))
+        worker = run_codex_step(
+            step,
+            state,
+            plan_dir,
+            root=root,
+            persistent=(mode == "persistent"),
+            fresh=refreshed,
+            json_trace=(step == "execute"),
+            prompt_override=prompt_override,
+        )
     return worker, agent, mode, refreshed

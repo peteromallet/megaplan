@@ -50,6 +50,9 @@ _GENERIC_ACKS = {
     "verified",
     "yes",
 }
+_MIN_VERDICT_CHARS = 20
+_MIN_VERDICT_WORDS = 4
+_MIN_VERDICT_UNIQUE_WORDS = 3
 
 
 @dataclass(frozen=True)
@@ -79,9 +82,24 @@ def _parse_git_status_paths(stdout: str) -> set[str]:
     return paths
 
 
+def is_rubber_stamp(text: str, *, strict: bool = False) -> bool:
+    stripped = text.strip()
+    normalized = normalize_text(text).strip(" .!?,;:")
+    if normalized in _GENERIC_ACKS:
+        return True
+    if not strict:
+        return False
+    if len(stripped) <= _MIN_VERDICT_CHARS:
+        return True
+    words = stripped.split()
+    if len(words) < _MIN_VERDICT_WORDS:
+        return True
+    unique_words = {word.lower() for word in words}
+    return len(unique_words) < _MIN_VERDICT_UNIQUE_WORDS
+
+
 def _is_perfunctory_ack(note: str) -> bool:
-    normalized = normalize_text(note)
-    return len(note.strip()) < 10 or normalized in _GENERIC_ACKS
+    return is_rubber_stamp(note, strict=False)
 
 
 def validate_execution_evidence(finalize_data: dict[str, Any], project_dir: Path) -> dict[str, Any]:
@@ -165,6 +183,18 @@ def validate_execution_evidence(finalize_data: dict[str, Any], project_dir: Path
         if _is_perfunctory_ack(note):
             findings.append(
                 f"Sense check {sense_check_id} acknowledgment is perfunctory: {note.strip()!r}."
+            )
+
+    for task in finalize_data.get("tasks", []):
+        if task.get("status") != "done":
+            continue
+        task_id = task.get("id", "?")
+        notes = task.get("executor_notes", "")
+        if not isinstance(notes, str) or not notes.strip():
+            continue
+        if is_rubber_stamp(notes, strict=True):
+            findings.append(
+                f"Task {task_id} executor_notes are perfunctory: {notes.strip()!r}."
             )
 
     return {

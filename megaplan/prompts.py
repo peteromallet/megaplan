@@ -11,7 +11,9 @@ from megaplan.types import (
     PlanState,
 )
 from megaplan._core import (
+    batch_artifact_path,
     collect_git_diff_summary,
+    compute_task_batches,
     configured_robustness,
     current_iteration_artifact,
     intent_and_notes_block,
@@ -294,7 +296,11 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         - Focus on concrete issues that would cause real problems.
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
         - Verify that the plan remains aligned with the user's original intent.
-        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered step sections (`### Step N:` under `## Phase` headers, or flat `## Step N:`) with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`. Missing structure should be flagged as category `completeness` with severity_hint `likely-significant`.
+        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered step sections (`### Step N:` under `## Phase` headers, or flat `## Step N:`) with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`.
+        - Missing required sections or step coverage (for example: no H1, no `## Overview`, or no step sections at all) should be flagged as category `completeness` with severity_hint `likely-significant`.
+        - Structural formatting within steps (for example: prose instead of numbered substeps, or a missing file reference inside an otherwise actionable step) should usually be category `completeness` with severity_hint `likely-minor` because the executor can still follow the instructions.
+        - Ask whether the plan is the simplest approach that solves the stated problem, whether it could use fewer steps or less machinery, and whether it introduces unnecessary complexity.
+        - Over-engineering concerns should use category `maintainability`, should usually prefix the concern with "Over-engineering:", and should scale severity_hint to the practical impact.
         - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
         - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
         """
@@ -459,6 +465,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     # Codex execute often cannot write back into plan_dir during --full-auto, so
     # checkpoint instructions must stay best-effort rather than mandatory.
     finalize_path = str(plan_dir / "finalize.json")
+    checkpoint_path = str(plan_dir / "execution_checkpoint.json")
     finalize_data = read_json(plan_dir / "finalize.json")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
@@ -526,8 +533,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         Execution tracking source of truth (`finalize.json`):
         {json_dump(finalize_data).strip()}
 
-        Absolute `finalize.json` path for best-effort progress checkpoints:
-        {finalize_path}
+        Absolute checkpoint path for best-effort progress checkpoints (NOT `finalize.json`):
+        {checkpoint_path}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -548,13 +555,13 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Report deviations explicitly.
         - Output concrete files changed and commands run.
         - Use the tasks in `finalize.json` as the execution boundary.
-        - Best-effort progress checkpointing: if `{finalize_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back.
-        - Best-effort sense-check checkpointing: if `{finalize_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.
-        - Always use full read-modify-write updates for `{finalize_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
+        - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
+        - Best-effort sense-check checkpointing: if `{checkpoint_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.
+        - Always use full read-modify-write updates for `{checkpoint_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
         - Structured output remains the authoritative final summary for this step. Disk writes are progress checkpoints for timeout recovery only.
         - Return `task_updates` with one object per completed or skipped task.
         - Return `sense_check_acknowledgments` with one object per sense check.
-        - Keep `executor_notes` verification-focused: say what you verified was correct, what edge cases you considered, and what behavior you observed. The diff already shows what changed; the notes should explain why it is correct.
+        - Keep `executor_notes` verification-focused: explain why your changes are correct. The diff already shows what changed; notes should cover edge cases caught, expected behaviors confirmed, or design choices made.
         - Follow this JSON shape exactly:
         ```json
         {{
@@ -566,9 +573,23 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
             {{
               "task_id": "T6",
               "status": "done",
-              "executor_notes": "Verified that handle_execute now merges per-task evidence before blocking on missing execution proof. Tested that a done task with commands_run but no files_changed follows the FLAG-006 softening path. Edge case: empty strings in commands_run still count as missing evidence.",
+              "executor_notes": "Caught the empty-strings edge case while checking execution evidence: blank `commands_run` entries still leave the task uncovered, so the missing-evidence guard behaves correctly.",
               "files_changed": ["megaplan/handlers.py"],
               "commands_run": ["pytest tests/test_megaplan.py -k execute"]
+            }},
+            {{
+              "task_id": "T7",
+              "status": "done",
+              "executor_notes": "Confirmed the happy path still records task evidence after the prompt updates by rerunning focused tests and checking the tracked task summary stayed intact.",
+              "files_changed": ["megaplan/prompts.py"],
+              "commands_run": ["pytest tests/test_prompts.py -k review"]
+            }},
+            {{
+              "task_id": "T8",
+              "status": "done",
+              "executor_notes": "Kept the rubber-stamp thresholds centralized in evaluation so sense checks and reviewer verdicts share one policy entry point while still using different strictness levels.",
+              "files_changed": ["megaplan/evaluation.py"],
+              "commands_run": ["pytest tests/test_evaluation.py -k rubber_stamp"]
             }},
             {{
               "task_id": "T11",
@@ -592,11 +613,97 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
+def _execute_batch_prompt(
+    state: PlanState,
+    plan_dir: Path,
+    batch_task_ids: list[str],
+    completed_task_ids: set[str] | None = None,
+) -> str:
+    completed = set(completed_task_ids or set())
+    finalize_data = read_json(plan_dir / "finalize.json")
+    all_tasks = finalize_data.get("tasks", [])
+    tasks_by_id = {
+        task["id"]: task
+        for task in all_tasks
+        if isinstance(task, dict) and isinstance(task.get("id"), str)
+    }
+    batch_tasks = [tasks_by_id[task_id] for task_id in batch_task_ids if task_id in tasks_by_id]
+    completed_tasks = [
+        task
+        for task_id, task in tasks_by_id.items()
+        if task_id in completed and task_id not in set(batch_task_ids)
+    ]
+    batch_sense_checks = [
+        sense_check
+        for sense_check in finalize_data.get("sense_checks", [])
+        if sense_check.get("task_id") in set(batch_task_ids)
+    ]
+    batch_sense_check_ids = [sense_check["id"] for sense_check in batch_sense_checks if isinstance(sense_check.get("id"), str)]
+    global_batches = compute_task_batches(all_tasks)
+    batch_number = next(
+        (
+            index + 1
+            for index, batch in enumerate(global_batches)
+            if batch == batch_task_ids
+        ),
+        1,
+    )
+    batch_total = len(global_batches) or 1
+    checkpoint_path = str(batch_artifact_path(plan_dir, batch_number))
+    approval_note = (
+        "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
+        if state["config"].get("auto_approve")
+        else "Note: User explicitly approved this plan at the gate checkpoint."
+        if state["meta"].get("user_approved_gate")
+        else "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
+    )
+    return textwrap.dedent(
+        f"""
+        Execute the approved plan in the repository.
+
+        Project directory:
+        {Path(state["config"]["project_dir"])}
+
+        {intent_and_notes_block(state)}
+
+        Batch framing:
+        - Execute batch {batch_number} of {batch_total}.
+        - Actionable task IDs for this batch: {batch_task_ids}
+        - Already completed task IDs available as dependency context: {sorted(completed)}
+
+        Actionable tasks for this batch:
+        {json_dump(batch_tasks).strip()}
+
+        Completed task context (already satisfied, do not re-execute unless directly required by current edits):
+        {json_dump(completed_tasks).strip()}
+
+        Batch-scoped sense checks:
+        {json_dump(batch_sense_checks).strip()}
+
+        Full execution tracking source of truth (`finalize.json`):
+        {json_dump(finalize_data).strip()}
+
+        {approval_note}
+        Robustness level: {configured_robustness(state)}.
+
+        Requirements:
+        - Execute only the actionable tasks in this batch.
+        - Treat completed tasks as dependency context, not new work.
+        - Return structured JSON only.
+        - Only produce `task_updates` for these tasks: [{", ".join(batch_task_ids)}]
+        - Only produce `sense_check_acknowledgments` for these sense checks: [{", ".join(batch_sense_check_ids)}]
+        - Do not include updates for tasks or sense checks outside this batch.
+        - Keep `executor_notes` verification-focused.
+        - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, checkpoint task and sense-check updates there (not `finalize.json`). The harness owns `finalize.json`.
+        """
+    ).strip()
+
+
 def _settled_decisions_block(gate: dict[str, object]) -> str:
     settled_decisions = gate.get("settled_decisions", [])
     if not isinstance(settled_decisions, list) or not settled_decisions:
         return ""
-    lines = ["Settled decisions (from gate approval - do not re-litigate these):"]
+    lines = ["Settled decisions (verify the executor implemented these correctly):"]
     for item in settled_decisions:
         if not isinstance(item, dict):
             continue
@@ -615,7 +722,7 @@ def _settled_decisions_instruction(gate: dict[str, object]) -> str:
     settled_decisions = gate.get("settled_decisions", [])
     if not isinstance(settled_decisions, list) or not settled_decisions:
         return ""
-    return "- The decisions listed above were settled at the gate stage. Verify that execution honors these decisions, but do not question the decisions themselves."
+    return "- The decisions listed above were settled at the gate stage. Verify that the executor implemented each settled decision correctly. Flag deviations from these decisions, but do not question the decisions themselves."
 
 
 def _review_robustness_instruction(robustness: str) -> list[str]:

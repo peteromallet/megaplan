@@ -130,7 +130,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "verified_flag_ids": {"type": "array", "items": {"type": "string"}},
             "disputed_flag_ids": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["flags"],
+        "required": ["flags", "verified_flag_ids", "disputed_flag_ids"],
     },
     "finalize.json": {
         "type": "object",

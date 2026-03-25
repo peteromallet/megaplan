@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import megaplan.workers as worker_module
+from megaplan.prompts import _execute_batch_prompt
 from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
     ROBUSTNESS_LEVELS,
@@ -29,11 +32,15 @@ from megaplan.types import (
 from megaplan._core import (
     atomic_write_json,
     atomic_write_text,
+    batch_artifact_path,
+    compute_global_batches,
+    compute_task_batches,
     configured_robustness,
     current_iteration_raw_artifact,
     ensure_runtime_layout,
     latest_plan_meta_path,
     latest_plan_path,
+    list_batch_artifacts,
     load_flag_registry,
     load_plan,
     now_utc,
@@ -55,6 +62,8 @@ from megaplan.evaluation import (
     build_orchestrator_guidance,
     compute_plan_delta_percent,
     compute_recurring_critiques,
+    is_rubber_stamp,
+    _parse_git_status_paths,
     parse_plan_sections,
     reassemble_plan,
     renumber_steps,
@@ -377,6 +386,144 @@ def _normalize_execute_claimed_path(path: str) -> str:
     return Path(path.strip()).as_posix()
 
 
+def _repo_path_hash(project_dir: Path, relative_path: str) -> str:
+    target = project_dir / relative_path
+    if not target.exists():
+        return "<missing>"
+    if target.is_dir():
+        return "<directory>"
+    return hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def _capture_git_status_snapshot(project_dir: Path) -> tuple[dict[str, str], str | None]:
+    if not (project_dir / ".git").exists():
+        return {}, "Project directory is not a git repository."
+    try:
+        process = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(project_dir),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        return {}, "git not found on PATH."
+    except subprocess.TimeoutExpired:
+        return {}, "git status timed out."
+    if process.returncode != 0:
+        return {}, f"git status failed: {process.stderr.strip() or process.stdout.strip()}"
+    paths = _parse_git_status_paths(process.stdout)
+    return {path: _repo_path_hash(project_dir, path) for path in paths}, None
+
+
+def _observed_batch_paths(
+    *,
+    project_dir: Path,
+    before_snapshot: dict[str, str],
+    after_snapshot: dict[str, str],
+) -> set[str]:
+    observed: set[str] = set()
+    for path in set(before_snapshot) | set(after_snapshot):
+        before_hash = before_snapshot.get(path)
+        after_hash = after_snapshot.get(path)
+        if after_hash is None:
+            after_hash = _repo_path_hash(project_dir, path)
+        if before_hash is None or before_hash != after_hash:
+            observed.add(path)
+    return observed
+
+
+def _collect_execute_claimed_paths(payload: dict[str, Any]) -> set[str]:
+    claimed_paths = {
+        _normalize_execute_claimed_path(path)
+        for path in payload.get("files_changed", [])
+        if isinstance(path, str) and path.strip()
+    }
+    for task_update in payload.get("task_updates", []):
+        if not isinstance(task_update, dict):
+            continue
+        for path in task_update.get("files_changed", []):
+            if isinstance(path, str) and path.strip():
+                claimed_paths.add(_normalize_execute_claimed_path(path))
+    return claimed_paths
+
+
+def _stable_unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _build_aggregate_execution_payload(
+    batch_payloads: list[dict[str, Any]],
+    *,
+    completed_batches: int,
+    total_batches: int,
+) -> dict[str, Any]:
+    outputs = [
+        f"Batch {index + 1}: {payload.get('output', '')}".strip()
+        for index, payload in enumerate(batch_payloads)
+    ]
+    files_changed: list[str] = []
+    commands_run: list[str] = []
+    deviations: list[str] = []
+    task_updates: list[dict[str, Any]] = []
+    sense_check_acknowledgments: list[dict[str, Any]] = []
+    for payload in batch_payloads:
+        files_changed.extend([path for path in payload.get("files_changed", []) if isinstance(path, str)])
+        commands_run.extend([command for command in payload.get("commands_run", []) if isinstance(command, str)])
+        deviations.extend([issue for issue in payload.get("deviations", []) if isinstance(issue, str)])
+        task_updates.extend([item for item in payload.get("task_updates", []) if isinstance(item, dict)])
+        sense_check_acknowledgments.extend(
+            [item for item in payload.get("sense_check_acknowledgments", []) if isinstance(item, dict)]
+        )
+    output = f"Aggregated execute batches: completed {completed_batches}/{total_batches}."
+    if outputs:
+        output = output + "\n" + "\n".join(outputs)
+    return {
+        "output": output,
+        "files_changed": _stable_unique_strings(files_changed),
+        "commands_run": _stable_unique_strings(commands_run),
+        "deviations": deviations,
+        "task_updates": task_updates,
+        "sense_check_acknowledgments": sense_check_acknowledgments,
+    }
+
+
+def _active_sense_check_ids(finalize_data: dict[str, Any], active_task_ids: set[str]) -> list[str]:
+    return [
+        sense_check["id"]
+        for sense_check in finalize_data.get("sense_checks", [])
+        if isinstance(sense_check, dict)
+        and isinstance(sense_check.get("id"), str)
+        and sense_check.get("task_id") in active_task_ids
+    ]
+
+
+def _count_execute_tracking(
+    finalize_data: dict[str, Any],
+    *,
+    active_task_ids: set[str],
+    active_sense_check_ids: set[str],
+) -> tuple[int, int, int, int]:
+    tracked_tasks = sum(
+        1
+        for task in finalize_data.get("tasks", [])
+        if task.get("id") in active_task_ids and task.get("status") in {"done", "skipped"}
+    )
+    acknowledged_checks = sum(
+        1
+        for sense_check in finalize_data.get("sense_checks", [])
+        if sense_check.get("id") in active_sense_check_ids and str(sense_check.get("executor_note", "")).strip()
+    )
+    return tracked_tasks, len(active_task_ids), acknowledged_checks, len(active_sense_check_ids)
+
+
 def _reset_timeout_invalid_tasks(
     finalize_data: dict[str, Any],
     *,
@@ -430,6 +577,8 @@ def _reset_timeout_invalid_tasks(
     return sorted(reset_reasons)
 
 
+# This timeout recovery path exists for the legacy single-batch fast path.
+# Batched execution persists between batches and does not rely on this helper.
 def _recover_execute_timeout(
     *,
     plan_dir: Path,
@@ -550,20 +699,8 @@ def _build_review_blocked_message(
     )
 
 
-_MIN_VERDICT_CHARS = 20
-_MIN_VERDICT_WORDS = 4
-_MIN_VERDICT_UNIQUE_WORDS = 3
-
-
 def _is_substantive_reviewer_verdict(text: str) -> bool:
-    stripped = text.strip()
-    if len(stripped) <= _MIN_VERDICT_CHARS:
-        return False
-    words = stripped.split()
-    if len(words) < _MIN_VERDICT_WORDS:
-        return False
-    unique_words = {word.lower() for word in words}
-    return len(unique_words) >= _MIN_VERDICT_UNIQUE_WORDS
+    return not is_rubber_stamp(text, strict=True)
 
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
@@ -1579,21 +1716,17 @@ def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
     return response
 
 
-def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "execute", {STATE_FINALIZED})
-    if not args.confirm_destructive:
-        raise CliError("missing_confirmation", "Execute requires --confirm-destructive")
-    auto_approve = bool(state["config"].get("auto_approve", False))
-    if getattr(args, "user_approved", False):
-        state["meta"]["user_approved_gate"] = True
-        save_state(plan_dir, state)
-    if not auto_approve and not state["meta"].get("user_approved_gate", False):
-        raise CliError(
-            "missing_approval",
-            "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
-        )
-    agent, mode, refreshed = worker_module.resolve_agent_mode("execute", args)
+def _handle_execute_single_batch(
+    *,
+    root: Path,
+    plan_dir: Path,
+    state: PlanState,
+    args: argparse.Namespace,
+    auto_approve: bool,
+    agent: str,
+    mode: str,
+    refreshed: bool,
+) -> StepResponse:
     try:
         worker, agent, mode, refreshed = worker_module.run_step_with_worker(
             "execute",
@@ -1618,6 +1751,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
         raise
     atomic_write_json(plan_dir / "execution.json", worker.payload)
+    atomic_write_json(batch_artifact_path(plan_dir, 1), worker.payload)
     deviations = list(worker.payload.get("deviations", []))
     finalize_data = read_json(plan_dir / "finalize.json")
     project_dir = Path(state["config"]["project_dir"])
@@ -1745,6 +1879,598 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         "files_changed": worker.payload.get("files_changed", []),
         "deviations": deviations,
         "warnings": [blocked_message] if blocked else [],
+        "auto_approve": auto_approve,
+        "user_approved_gate": user_approved_gate,
+    }
+    attach_agent_fallback(response, args)
+    return response
+
+
+def _handle_execute_one_batch(
+    *,
+    root: Path,
+    plan_dir: Path,
+    state: PlanState,
+    args: argparse.Namespace,
+    batch_number: int,
+    auto_approve: bool,
+    agent: str,
+    mode: str,
+    refreshed: bool,
+) -> StepResponse:
+    """Execute a single global batch by number (--batch N mode)."""
+    finalize_data = read_json(plan_dir / "finalize.json")
+    project_dir = Path(state["config"]["project_dir"])
+    global_batches = compute_global_batches(finalize_data)
+    batches_total = len(global_batches)
+
+    if batch_number < 1 or batch_number > batches_total:
+        raise CliError(
+            "batch_out_of_range",
+            f"--batch {batch_number} is out of range. Plan has {batches_total} batch(es) (1-indexed).",
+        )
+
+    # Prerequisite check: batches 1..N-1 must be complete
+    tasks = finalize_data.get("tasks", [])
+    completed_ids = {
+        t["id"]
+        for t in tasks
+        if t.get("status") in {"done", "skipped"} and isinstance(t.get("id"), str)
+    }
+    for prior_idx in range(batch_number - 1):
+        prior_batch = global_batches[prior_idx]
+        missing = [tid for tid in prior_batch if tid not in completed_ids]
+        if missing:
+            raise CliError(
+                "batch_prerequisites",
+                f"Batch {batch_number} requires batches 1..{batch_number - 1} to be complete. "
+                f"Batch {prior_idx + 1} has incomplete tasks: {', '.join(missing)}",
+            )
+
+    batch_task_ids = global_batches[batch_number - 1]
+    batch_task_id_set = set(batch_task_ids)
+    active_task_ids = batch_task_id_set
+    active_sense_check_ids = set(_active_sense_check_ids(finalize_data, active_task_ids))
+
+    before_snapshot, before_error = _capture_git_status_snapshot(project_dir)
+    batch_prompt = _execute_batch_prompt(state, plan_dir, batch_task_ids, completed_ids)
+    try:
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker(
+            "execute",
+            state,
+            plan_dir,
+            args,
+            root=root,
+            resolved=(agent, mode, refreshed),
+            prompt_override=batch_prompt,
+        )
+    except CliError as error:
+        if error.code == "worker_timeout":
+            return _recover_execute_timeout(
+                plan_dir=plan_dir,
+                state=state,
+                error=error,
+                agent=agent,
+                mode=mode,
+                refreshed=refreshed,
+                auto_approve=auto_approve,
+                args=args,
+            )
+        record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
+        raise
+
+    apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    batch_payload = dict(worker.payload)
+    batch_deviations = list(batch_payload.get("deviations", []))
+
+    # Git observation
+    if before_error is not None:
+        batch_deviations.append(f"Advisory observation skip before batch {batch_number}/{batches_total}: {before_error}")
+    after_snapshot, after_error = _capture_git_status_snapshot(project_dir)
+    if after_error is not None:
+        batch_deviations.append(f"Advisory observation skip after batch {batch_number}/{batches_total}: {after_error}")
+    elif before_error is None:
+        observed_paths = _observed_batch_paths(project_dir=project_dir, before_snapshot=before_snapshot, after_snapshot=after_snapshot)
+        claimed_paths = _collect_execute_claimed_paths(batch_payload)
+        phantom_claims = sorted(claimed_paths - observed_paths)
+        if phantom_claims:
+            batch_deviations.append("Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: " + ", ".join(phantom_claims))
+        unclaimed_changes = sorted(observed_paths - claimed_paths)
+        if unclaimed_changes:
+            batch_deviations.append("Advisory observation mismatch: git status/content hash delta found unclaimed files: " + ", ".join(unclaimed_changes))
+
+    # Merge batch results
+    pre_merge_statuses = _snapshot_task_statuses(
+        [t for t in finalize_data.get("tasks", []) if t.get("id") in batch_task_id_set]
+    )
+    batch_tasks_by_id = {
+        t["id"]: t for t in finalize_data.get("tasks", []) if t.get("id") in batch_task_id_set
+    }
+    merged_count, total_batch_tasks = _validate_and_merge_batch(
+        batch_payload.get("task_updates"),
+        required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
+        targets_by_id=batch_tasks_by_id,
+        id_field="task_id",
+        merge_fields=("status", "executor_notes", "files_changed", "commands_run"),
+        issues=batch_deviations,
+        validation_label="task_updates",
+        merge_label="task_update",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"{total - merged_count}/{total} batch tasks have no executor update — tracking is incomplete."
+            )
+        ),
+        enum_fields={"status": {"done", "skipped"}},
+        nonempty_fields={"executor_notes"},
+        array_fields=("files_changed", "commands_run"),
+    )
+    batch_sense_checks_by_id = {
+        sc["id"]: sc
+        for sc in finalize_data.get("sense_checks", [])
+        if sc.get("task_id") in batch_task_id_set
+    }
+    acknowledged_count, total_batch_checks = _validate_and_merge_batch(
+        batch_payload.get("sense_check_acknowledgments"),
+        required_fields=("sense_check_id", "executor_note"),
+        targets_by_id=batch_sense_checks_by_id,
+        id_field="sense_check_id",
+        merge_fields=("executor_note",),
+        issues=batch_deviations,
+        validation_label="sense_check_acknowledgments",
+        merge_label="sense_check_acknowledgment",
+        incomplete_message=(
+            lambda merged_count, total: (
+                f"{total - merged_count}/{total} batch sense checks have no executor acknowledgment — tracking is incomplete."
+            )
+        ),
+        nonempty_fields={"executor_note"},
+    )
+    _append_execute_reconciliation_advisories(
+        before_statuses=pre_merge_statuses,
+        tasks_by_id=batch_tasks_by_id,
+        issues=batch_deviations,
+    )
+    batch_payload["deviations"] = batch_deviations
+
+    # Write batch artifact and finalize.json
+    atomic_write_json(batch_artifact_path(plan_dir, batch_number), batch_payload)
+    atomic_write_json(plan_dir / "finalize.json", finalize_data)
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
+
+    if worker.trace_output is not None:
+        trace_path = plan_dir / "execution_trace.jsonl"
+        existing_trace = trace_path.read_text(encoding="utf-8") if trace_path.exists() else ""
+        atomic_write_text(trace_path, existing_trace + worker.trace_output)
+
+    # Execution evidence audit
+    execution_audit = validate_execution_evidence(finalize_data, project_dir)
+    if execution_audit["skipped"]:
+        batch_deviations.append(f"Advisory audit skip: {execution_audit['reason']}")
+    for finding in execution_audit["findings"]:
+        batch_deviations.append(f"Advisory audit finding: {finding}")
+    atomic_write_json(plan_dir / "execution_audit.json", execution_audit)
+
+    # Determine if this is the final batch
+    # Re-read completed IDs after merge
+    all_tasks = finalize_data.get("tasks", [])
+    all_completed = {
+        t["id"] for t in all_tasks
+        if t.get("status") in {"done", "skipped"} and isinstance(t.get("id"), str)
+    }
+    is_final_batch = batch_number == batches_total
+    all_tracked = all(
+        t.get("status") in {"done", "skipped"}
+        for t in all_tasks
+        if isinstance(t.get("id"), str)
+    )
+
+    # On final batch with all tasks tracked, produce aggregate execution.json
+    if is_final_batch and all_tracked:
+        # Build aggregate from all batch artifact files
+        batch_artifacts = list_batch_artifacts(plan_dir)
+        batch_payloads = [read_json(p) for p in batch_artifacts]
+        aggregate_payload = _build_aggregate_execution_payload(
+            batch_payloads,
+            completed_batches=len(batch_payloads),
+            total_batches=batches_total,
+        )
+        aggregate_payload["deviations"] = list(aggregate_payload.get("deviations", []))
+        atomic_write_json(plan_dir / "execution.json", aggregate_payload)
+        state["current_state"] = STATE_EXECUTED
+
+    user_approved_gate = bool(state["meta"].get("user_approved_gate", False))
+    approval_mode = _resolve_execute_approval_mode(
+        auto_approve=auto_approve,
+        user_approved_gate=user_approved_gate,
+    )
+    finalize_hash = sha256_file(plan_dir / "finalize.json")
+    append_history(
+        state,
+        make_history_entry(
+            "execute",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success" if (is_final_batch and all_tracked) else "partial",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=f"execution_batch_{batch_number}.json",
+            artifact_hash=sha256_file(batch_artifact_path(plan_dir, batch_number)),
+            finalize_hash=finalize_hash,
+            approval_mode=approval_mode,
+        ),
+    )
+    save_state(plan_dir, state)
+
+    batches_remaining = batches_total - batch_number
+    tracking_note = _format_execute_tracking_note(
+        merged_count=merged_count,
+        total_tasks=total_batch_tasks,
+        acknowledged_count=acknowledged_count,
+        total_checks=total_batch_checks,
+    )
+    artifacts = [f"execution_batch_{batch_number}.json", "execution_audit.json", "finalize.json", "final.md"]
+    if is_final_batch and all_tracked:
+        artifacts.insert(0, "execution.json")
+
+    if is_final_batch and all_tracked:
+        summary = batch_payload.get("output", "Batch complete.") + tracking_note
+        next_step = "review"
+    else:
+        summary = (
+            f"Batch {batch_number}/{batches_total} complete.{tracking_note} "
+            f"{batches_remaining} batch(es) remaining."
+        )
+        next_step = "execute"
+
+    response: StepResponse = {
+        "success": True,
+        "step": "execute",
+        "summary": summary,
+        "artifacts": artifacts,
+        "next_step": next_step,
+        "state": STATE_EXECUTED if (is_final_batch and all_tracked) else STATE_FINALIZED,
+        "batch": batch_number,
+        "batches_total": batches_total,
+        "batches_remaining": batches_remaining,
+        "files_changed": batch_payload.get("files_changed", []),
+        "deviations": batch_deviations,
+        "auto_approve": auto_approve,
+        "user_approved_gate": user_approved_gate,
+    }
+    if next_step == "execute":
+        response["guidance"] = f"Run --batch {batch_number + 1}"
+    attach_agent_fallback(response, args)
+    return response
+
+
+def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    require_state(state, "execute", {STATE_FINALIZED})
+    if not args.confirm_destructive:
+        raise CliError("missing_confirmation", "Execute requires --confirm-destructive")
+    auto_approve = bool(state["config"].get("auto_approve", False))
+    if getattr(args, "user_approved", False):
+        state["meta"]["user_approved_gate"] = True
+        save_state(plan_dir, state)
+    if not auto_approve and not state["meta"].get("user_approved_gate", False):
+        raise CliError(
+            "missing_approval",
+            "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
+        )
+    agent, mode, refreshed = worker_module.resolve_agent_mode("execute", args)
+    if getattr(args, "batch", None) is not None:
+        return _handle_execute_one_batch(
+            root=root,
+            plan_dir=plan_dir,
+            state=state,
+            args=args,
+            batch_number=args.batch,
+            auto_approve=auto_approve,
+            agent=agent,
+            mode=mode,
+            refreshed=refreshed,
+        )
+    finalize_data = read_json(plan_dir / "finalize.json")
+    project_dir = Path(state["config"]["project_dir"])
+    tasks = finalize_data.get("tasks", [])
+    completed_task_ids = {
+        task["id"]
+        for task in tasks
+        if task.get("status") in {"done", "skipped"} and isinstance(task.get("id"), str)
+    }
+    pending_tasks = [
+        task
+        for task in tasks
+        if task.get("status") == "pending" and isinstance(task.get("id"), str)
+    ]
+    batches = compute_task_batches(pending_tasks, completed_ids=completed_task_ids)
+    if len(batches) <= 1:
+        return _handle_execute_single_batch(
+            root=root,
+            plan_dir=plan_dir,
+            state=state,
+            args=args,
+            auto_approve=auto_approve,
+            agent=agent,
+            mode=mode,
+            refreshed=refreshed,
+        )
+
+    active_task_ids = {task["id"] for task in pending_tasks}
+    active_sense_check_ids = set(_active_sense_check_ids(finalize_data, active_task_ids))
+    global_batches = compute_global_batches(finalize_data)
+    # Map each relative batch to its 1-indexed global batch number.
+    _global_batch_lookup: dict[tuple[str, ...], int] = {
+        tuple(batch): idx + 1 for idx, batch in enumerate(global_batches)
+    }
+    batch_payloads: list[dict[str, Any]] = []
+    trace_chunks: list[str] = []
+    total_duration_ms = 0
+    total_cost_usd = 0.0
+    timeout_error: CliError | None = None
+    latest_session_id: str | None = None
+    stop_after_batch = False
+
+    for batch_index, batch_task_ids in enumerate(batches, start=1):
+        before_snapshot, before_error = _capture_git_status_snapshot(project_dir)
+        batch_prompt = _execute_batch_prompt(state, plan_dir, batch_task_ids, completed_task_ids)
+        try:
+            worker, agent, mode, refreshed = worker_module.run_step_with_worker(
+                "execute",
+                state,
+                plan_dir,
+                args,
+                root=root,
+                resolved=(agent, mode, refreshed),
+                prompt_override=batch_prompt,
+            )
+        except CliError as error:
+            if error.code == "worker_timeout":
+                timeout_error = error
+                latest_session_id = error.extra.get("session_id") if isinstance(error.extra.get("session_id"), str) else latest_session_id
+                break
+            record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
+            raise
+
+        total_duration_ms += worker.duration_ms
+        total_cost_usd += worker.cost_usd
+        latest_session_id = worker.session_id
+        apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
+        batch_payload = dict(worker.payload)
+        batch_deviations = list(batch_payload.get("deviations", []))
+        if before_error is not None:
+            batch_deviations.append(
+                f"Advisory observation skip before batch {batch_index}/{len(batches)}: {before_error}"
+            )
+        after_snapshot, after_error = _capture_git_status_snapshot(project_dir)
+        if after_error is not None:
+            batch_deviations.append(
+                f"Advisory observation skip after batch {batch_index}/{len(batches)}: {after_error}"
+            )
+        elif before_error is None:
+            observed_paths = _observed_batch_paths(
+                project_dir=project_dir,
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+            )
+            claimed_paths = _collect_execute_claimed_paths(batch_payload)
+            phantom_claims = sorted(claimed_paths - observed_paths)
+            if phantom_claims:
+                batch_deviations.append(
+                    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: "
+                    + ", ".join(phantom_claims)
+                )
+            unclaimed_changes = sorted(observed_paths - claimed_paths)
+            if unclaimed_changes:
+                batch_deviations.append(
+                    "Advisory observation mismatch: git status/content hash delta found unclaimed files: "
+                    + ", ".join(unclaimed_changes)
+                )
+
+        batch_task_id_set = set(batch_task_ids)
+        pre_merge_statuses = _snapshot_task_statuses(
+            [task for task in finalize_data.get("tasks", []) if task.get("id") in batch_task_id_set]
+        )
+        batch_tasks_by_id = {
+            task["id"]: task
+            for task in finalize_data.get("tasks", [])
+            if task.get("id") in batch_task_id_set
+        }
+        merged_count, total_batch_tasks = _validate_and_merge_batch(
+            batch_payload.get("task_updates"),
+            required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
+            targets_by_id=batch_tasks_by_id,
+            id_field="task_id",
+            merge_fields=("status", "executor_notes", "files_changed", "commands_run"),
+            issues=batch_deviations,
+            validation_label="task_updates",
+            merge_label="task_update",
+            incomplete_message=(
+                lambda merged_count, total: (
+                    f"{total - merged_count}/{total} batch tasks have no executor update — tracking is incomplete."
+                )
+            ),
+            enum_fields={"status": {"done", "skipped"}},
+            nonempty_fields={"executor_notes"},
+            array_fields=("files_changed", "commands_run"),
+        )
+        batch_sense_checks_by_id = {
+            sense_check["id"]: sense_check
+            for sense_check in finalize_data.get("sense_checks", [])
+            if sense_check.get("task_id") in batch_task_id_set
+        }
+        acknowledged_count, total_batch_checks = _validate_and_merge_batch(
+            batch_payload.get("sense_check_acknowledgments"),
+            required_fields=("sense_check_id", "executor_note"),
+            targets_by_id=batch_sense_checks_by_id,
+            id_field="sense_check_id",
+            merge_fields=("executor_note",),
+            issues=batch_deviations,
+            validation_label="sense_check_acknowledgments",
+            merge_label="sense_check_acknowledgment",
+            incomplete_message=(
+                lambda merged_count, total: (
+                    f"{total - merged_count}/{total} batch sense checks have no executor acknowledgment — tracking is incomplete."
+                )
+            ),
+            nonempty_fields={"executor_note"},
+        )
+        _append_execute_reconciliation_advisories(
+            before_statuses=pre_merge_statuses,
+            tasks_by_id=batch_tasks_by_id,
+            issues=batch_deviations,
+        )
+        batch_payload["deviations"] = batch_deviations
+        batch_payloads.append(batch_payload)
+        if worker.trace_output is not None:
+            trace_chunks.append(worker.trace_output)
+
+        global_batch_number = _global_batch_lookup.get(tuple(batch_task_ids), batch_index)
+        atomic_write_json(batch_artifact_path(plan_dir, global_batch_number), batch_payload)
+        atomic_write_json(plan_dir / "finalize.json", finalize_data)
+        atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
+        save_state(plan_dir, state)
+
+        completed_task_ids.update(
+            task_id
+            for task_id in batch_task_ids
+            if batch_tasks_by_id.get(task_id, {}).get("status") in {"done", "skipped"}
+        )
+        if merged_count < total_batch_tasks or acknowledged_count < total_batch_checks:
+            stop_after_batch = True
+            break
+
+    aggregate_payload = _build_aggregate_execution_payload(
+        batch_payloads,
+        completed_batches=len(batch_payloads),
+        total_batches=len(batches),
+    )
+    if timeout_error is not None:
+        aggregate_payload["deviations"].append(
+            f"Execute timed out in batch {len(batch_payloads) + 1}/{len(batches)}: {timeout_error.message}"
+        )
+    atomic_write_json(plan_dir / "execution.json", aggregate_payload)
+    # Review consumes one aggregate execution.json artifact even when execution ran in batches.
+    if trace_chunks:
+        atomic_write_text(plan_dir / "execution_trace.jsonl", "".join(trace_chunks))
+
+    execution_audit = validate_execution_evidence(finalize_data, project_dir)
+    deviations = list(aggregate_payload.get("deviations", []))
+    if execution_audit["skipped"]:
+        deviations.append(f"Advisory audit skip: {execution_audit['reason']}")
+    for finding in execution_audit["findings"]:
+        deviations.append(f"Advisory audit finding: {finding}")
+    aggregate_payload["deviations"] = deviations
+    atomic_write_json(plan_dir / "execution.json", aggregate_payload)
+    atomic_write_json(plan_dir / "execution_audit.json", execution_audit)
+    atomic_write_json(plan_dir / "finalize.json", finalize_data)
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
+    finalize_hash = sha256_file(plan_dir / "finalize.json")
+
+    tracked_tasks, total_tasks, acknowledged_checks, total_checks = _count_execute_tracking(
+        finalize_data,
+        active_task_ids=active_task_ids,
+        active_sense_check_ids=active_sense_check_ids,
+    )
+    missing_task_evidence = _check_done_task_evidence(
+        finalize_data.get("tasks", []),
+        issues=deviations,
+        should_classify=lambda task: task.get("id") in active_task_ids,
+        has_evidence=lambda task: bool(task.get("files_changed")),
+        has_advisory_evidence=lambda task: bool(task.get("commands_run")),
+        missing_message="Done tasks missing both files_changed and commands_run: ",
+        advisory_message="Advisory: done tasks rely on commands_run without files_changed (FLAG-006 softening): ",
+    )
+
+    blocking_reasons: list[str] = []
+    if tracked_tasks < total_tasks:
+        blocking_reasons.append(f"{total_tasks - tracked_tasks}/{total_tasks} tasks have no executor update")
+    if acknowledged_checks < total_checks:
+        blocking_reasons.append(
+            f"{total_checks - acknowledged_checks}/{total_checks} sense checks have no executor acknowledgment"
+        )
+    if missing_task_evidence:
+        blocking_reasons.append(
+            "done tasks missing both files_changed and commands_run: "
+            + ", ".join(missing_task_evidence)
+        )
+    if timeout_error is not None:
+        blocking_reasons.append(f"execution timed out in batch {len(batch_payloads) + 1}/{len(batches)}")
+
+    blocked = bool(blocking_reasons)
+    if not blocked:
+        state["current_state"] = STATE_EXECUTED
+    if timeout_error is not None and latest_session_id is not None:
+        apply_session_update(state, "execute", agent, latest_session_id, mode=mode, refreshed=refreshed)
+    user_approved_gate = bool(state["meta"].get("user_approved_gate", False))
+    approval_mode = _resolve_execute_approval_mode(
+        auto_approve=auto_approve,
+        user_approved_gate=user_approved_gate,
+    )
+    raw_output_file: str | None = None
+    result = "blocked" if blocked else "success"
+    message: str | None = None
+    if timeout_error is not None:
+        result = "timeout"
+        raw_output = str(timeout_error.extra.get("raw_output") or timeout_error.message)
+        raw_output_file = store_raw_worker_output(plan_dir, "execute", state["iteration"], raw_output)
+        message = timeout_error.message
+    append_history(
+        state,
+        make_history_entry(
+            "execute",
+            duration_ms=total_duration_ms,
+            cost_usd=total_cost_usd,
+            result=result,
+            agent=agent,
+            mode=mode,
+            worker=WorkerResult(
+                payload=aggregate_payload,
+                raw_output="",
+                duration_ms=total_duration_ms,
+                cost_usd=total_cost_usd,
+                session_id=latest_session_id,
+                trace_output="".join(trace_chunks) if trace_chunks else None,
+            ),
+            output_file="execution.json",
+            artifact_hash=sha256_file(plan_dir / "execution.json"),
+            finalize_hash=finalize_hash,
+            raw_output_file=raw_output_file,
+            message=message,
+            approval_mode=approval_mode,
+        ),
+    )
+    save_state(plan_dir, state)
+
+    artifacts = ["execution.json", "execution_audit.json", "finalize.json", "final.md"]
+    if trace_chunks:
+        artifacts.append("execution_trace.jsonl")
+    tracking_note = _format_execute_tracking_note(
+        merged_count=tracked_tasks,
+        total_tasks=total_tasks,
+        acknowledged_count=acknowledged_checks,
+        total_checks=total_checks,
+    )
+    if timeout_error is not None:
+        summary = (
+            f"Execute timed out after {len(batch_payloads)}/{len(batches)} completed batches. "
+            "Prior batches were persisted; re-run execute to continue."
+        )
+    elif blocked:
+        summary = "Blocked: " + "; ".join(blocking_reasons) + ". Re-run execute to complete tracking."
+    else:
+        summary = aggregate_payload["output"] + tracking_note
+    response: StepResponse = {
+        "success": not blocked and timeout_error is None,
+        "step": "execute",
+        "summary": summary,
+        "artifacts": artifacts,
+        "next_step": "execute" if blocked or timeout_error is not None else "review",
+        "state": STATE_FINALIZED if blocked or timeout_error is not None else STATE_EXECUTED,
+        "files_changed": aggregate_payload.get("files_changed", []),
+        "deviations": deviations,
+        "warnings": [summary] if blocked or timeout_error is not None else [],
         "auto_approve": auto_approve,
         "user_approved_gate": user_approved_gate,
     }

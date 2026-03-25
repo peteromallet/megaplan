@@ -69,6 +69,60 @@ def sha256_file(path: Path) -> str:
     return sha256_text(path.read_text(encoding="utf-8"))
 
 
+def compute_task_batches(
+    tasks: list[dict[str, Any]],
+    completed_ids: set[str] | None = None,
+) -> list[list[str]]:
+    completed = set(completed_ids or set())
+    if not tasks:
+        return []
+
+    task_ids = [task["id"] for task in tasks]
+    task_id_set = set(task_ids)
+    remaining: dict[str, set[str]] = {}
+    order_index = {task_id: index for index, task_id in enumerate(task_ids)}
+
+    for task in tasks:
+        task_id = task["id"]
+        deps = task.get("depends_on", [])
+        if not isinstance(deps, list):
+            deps = []
+        normalized_deps: set[str] = set()
+        for dep in deps:
+            if dep in task_id_set:
+                normalized_deps.add(dep)
+                continue
+            if dep in completed:
+                continue
+            raise ValueError(f"Unknown dependency ID '{dep}' for task '{task_id}'")
+        remaining[task_id] = normalized_deps
+
+    batches: list[list[str]] = []
+    satisfied = set(completed)
+    unscheduled = set(task_ids)
+
+    while unscheduled:
+        ready = [
+            task_id
+            for task_id in unscheduled
+            if remaining[task_id].issubset(satisfied)
+        ]
+        ready.sort(key=order_index.__getitem__)
+        if not ready:
+            cycle_ids = sorted(unscheduled, key=order_index.__getitem__)
+            raise ValueError("Cyclic dependency graph detected among tasks: " + ", ".join(cycle_ids))
+        batches.append(ready)
+        satisfied.update(ready)
+        unscheduled.difference_update(ready)
+
+    return batches
+
+
+def compute_global_batches(finalize_data: dict[str, Any]) -> list[list[str]]:
+    tasks = finalize_data.get("tasks", [])
+    return compute_task_batches(tasks)
+
+
 # ---------------------------------------------------------------------------
 # Atomic I/O
 # ---------------------------------------------------------------------------
@@ -238,6 +292,27 @@ def schemas_root(root: Path) -> Path:
 
 def artifact_path(plan_dir: Path, filename: str) -> Path:
     return plan_dir / filename
+
+
+def batch_artifact_path(plan_dir: Path, batch_number: int) -> Path:
+    return plan_dir / f"execution_batch_{batch_number}.json"
+
+
+def list_batch_artifacts(plan_dir: Path) -> list[Path]:
+    def sort_key(path: Path) -> tuple[int, str]:
+        match = re.fullmatch(r"execution_batch_(\d+)\.json", path.name)
+        if match is None:
+            raise ValueError(f"Unexpected batch artifact filename: {path.name}")
+        return (int(match.group(1)), path.name)
+
+    return sorted(
+        (
+            path
+            for path in plan_dir.glob("execution_batch_*.json")
+            if path.is_file() and re.fullmatch(r"execution_batch_(\d+)\.json", path.name)
+        ),
+        key=sort_key,
+    )
 
 
 def current_iteration_artifact(plan_dir: Path, prefix: str, iteration: int) -> Path:

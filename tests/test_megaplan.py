@@ -40,6 +40,7 @@ def make_args_factory(project_dir: Path) -> Callable[..., Namespace]:
             "confirm_destructive": True,
             "user_approved": False,
             "confirm_self_review": False,
+            "batch": None,
             "override_action": None,
             "note": None,
             "reason": "",
@@ -995,6 +996,8 @@ def test_execute_succeeds_with_user_approval(plan_fixture: PlanFixture) -> None:
     assert response["state"] == megaplan.STATE_EXECUTED
     assert "finalize.json" in response["artifacts"]
     assert "final.md" in response["artifacts"]
+    # Single-batch path should also write execution_batch_1.json
+    assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
 
 
 def test_execute_succeeds_in_auto_approve_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2375,6 +2378,347 @@ def test_execute_softens_done_task_with_commands_only(
     assert finalize_data["tasks"][1]["commands_run"] == ["mock-verify"]
 
 
+def test_execute_multi_batch_happy_path_aggregates_results(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"] = [
+        {
+            "id": "T1",
+            "description": "First batch",
+            "depends_on": [],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+        {
+            "id": "T2",
+            "description": "Second batch",
+            "depends_on": ["T1"],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+    ]
+    finalize_data["sense_checks"] = [
+        {"id": "SC1", "task_id": "T1", "question": "Batch one?", "executor_note": "", "verdict": ""},
+        {"id": "SC2", "task_id": "T2", "question": "Batch two?", "executor_note": "", "verdict": ""},
+    ]
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    snapshots = iter([
+        ({}, None),
+        ({"batch1.py": "hash-1"}, None),
+        ({"batch1.py": "hash-1"}, None),
+        ({"batch1.py": "hash-1", "batch2.py": "hash-2"}, None),
+    ])
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+
+    def batched_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
+        assert prompt_override is not None
+        if "[T1]" in prompt_override:
+            payload = {
+                "output": "Batch one complete.",
+                "files_changed": ["batch1.py"],
+                "commands_run": ["pytest -k batch1"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Completed the first batch and verified its focused check.",
+                        "files_changed": ["batch1.py"],
+                        "commands_run": ["pytest -k batch1"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed batch one output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch1", duration_ms=2, cost_usd=0.1, session_id="batch-1", trace_output='{"batch":1}\n'), "codex", "persistent", False
+        if "[T2]" in prompt_override:
+            payload = {
+                "output": "Batch two complete.",
+                "files_changed": ["batch2.py"],
+                "commands_run": ["pytest -k batch2"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T2",
+                        "status": "done",
+                        "executor_notes": "Completed the dependent batch after T1 was persisted.",
+                        "files_changed": ["batch2.py"],
+                        "commands_run": ["pytest -k batch2"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC2", "executor_note": "Confirmed batch two output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch2", duration_ms=3, cost_usd=0.2, session_id="batch-2", trace_output='{"batch":2}\n'), "codex", "persistent", False
+        raise AssertionError(f"Unexpected batch prompt: {prompt_override}")
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", batched_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    final_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    execution = read_json(plan_fixture.plan_dir / "execution.json")
+
+    assert response["success"] is True
+    assert response["state"] == megaplan.STATE_EXECUTED
+    assert [task["status"] for task in final_data["tasks"]] == ["done", "done"]
+    assert [check["executor_note"] for check in final_data["sense_checks"]] == [
+        "Confirmed batch one output.",
+        "Confirmed batch two output.",
+    ]
+    assert execution["output"].startswith("Aggregated execute batches: completed 2/2.")
+    assert [item["task_id"] for item in execution["task_updates"]] == ["T1", "T2"]
+    assert [item["sense_check_id"] for item in execution["sense_check_acknowledgments"]] == ["SC1", "SC2"]
+    assert execution["files_changed"] == ["batch1.py", "batch2.py"]
+    assert execution["commands_run"] == ["pytest -k batch1", "pytest -k batch2"]
+    assert (plan_fixture.plan_dir / "execution_trace.jsonl").read_text(encoding="utf-8") == '{"batch":1}\n{"batch":2}\n'
+    # T4: Per-batch artifact files should be written with correct per-batch task_updates
+    batch_1 = read_json(plan_fixture.plan_dir / "execution_batch_1.json")
+    batch_2 = read_json(plan_fixture.plan_dir / "execution_batch_2.json")
+    assert [item["task_id"] for item in batch_1["task_updates"]] == ["T1"]
+    assert [item["task_id"] for item in batch_2["task_updates"]] == ["T2"]
+
+
+def test_execute_multi_batch_timeout_preserves_prior_batches(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][1]["depends_on"] = ["T1"]
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    snapshots = iter([
+        ({}, None),
+        ({"batch1.py": "hash-1"}, None),
+        ({"batch1.py": "hash-1"}, None),
+    ])
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+
+    def timed_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
+        assert prompt_override is not None
+        if "[T1]" in prompt_override:
+            payload = {
+                "output": "Batch one complete.",
+                "files_changed": ["batch1.py"],
+                "commands_run": ["pytest -k batch1"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Completed the first batch and verified its focused check.",
+                        "files_changed": ["batch1.py"],
+                        "commands_run": ["pytest -k batch1"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed batch one output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch1", duration_ms=2, cost_usd=0.1, session_id="batch-1"), "codex", "persistent", False
+        raise megaplan.CliError("worker_timeout", "execute timed out", extra={"session_id": "batch-2", "raw_output": "partial"})
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", timed_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    final_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    execution = read_json(plan_fixture.plan_dir / "execution.json")
+    state = load_state(plan_fixture.plan_dir)
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert final_data["tasks"][0]["status"] == "done"
+    assert final_data["tasks"][1]["status"] == "pending"
+    assert final_data["sense_checks"][0]["executor_note"] == "Confirmed batch one output."
+    assert final_data["sense_checks"][1]["executor_note"] == ""
+    assert [item["task_id"] for item in execution["task_updates"]] == ["T1"]
+    assert state["history"][-1]["result"] == "timeout"
+
+
+def test_execute_rerun_with_completed_dependency_uses_single_batch_fast_path(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][0]["status"] = "done"
+    finalize_data["tasks"][0]["executor_notes"] = "Already completed."
+    finalize_data["tasks"][0]["files_changed"] = ["batch1.py"]
+    finalize_data["tasks"][0]["commands_run"] = ["pytest -k batch1"]
+    finalize_data["tasks"][1]["depends_on"] = ["T1"]
+    finalize_data["sense_checks"][0]["executor_note"] = "Already acknowledged."
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    prompt_overrides: list[str | None] = []
+
+    def rerun_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
+        prompt_overrides.append(prompt_override)
+        payload = {
+            "output": "Rerun complete.",
+            "files_changed": ["batch1.py", "batch2.py"],
+            "commands_run": ["pytest -k rerun"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Kept the already-completed task intact during rerun.",
+                    "files_changed": ["batch1.py"],
+                    "commands_run": ["pytest -k batch1"],
+                },
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Completed the remaining dependent task.",
+                    "files_changed": ["batch2.py"],
+                    "commands_run": ["pytest -k rerun"],
+                },
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Already acknowledged."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed rerun output."},
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="rerun", duration_ms=1, cost_usd=0.0, session_id="rerun"), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", rerun_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    assert response["success"] is True
+    assert prompt_overrides == [None]
+
+
+def test_execute_multi_batch_observation_allows_cross_batch_reedit_and_flags_phantoms(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][1]["depends_on"] = ["T1"]
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    snapshots = iter([
+        ({}, None),
+        ({"megaplan/handlers.py": "hash-1"}, None),
+        ({"megaplan/handlers.py": "hash-1"}, None),
+        ({"megaplan/handlers.py": "hash-2"}, None),
+    ])
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+
+    def observation_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
+        assert prompt_override is not None
+        if "[T1]" in prompt_override:
+            payload = {
+                "output": "Batch one complete.",
+                "files_changed": ["megaplan/handlers.py"],
+                "commands_run": ["pytest -k batch1"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Edited handlers.py in batch one.",
+                        "files_changed": ["megaplan/handlers.py"],
+                        "commands_run": ["pytest -k batch1"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed batch one output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch1", duration_ms=1, cost_usd=0.0, session_id="batch-1"), "codex", "persistent", False
+        payload = {
+            "output": "Batch two complete.",
+            "files_changed": ["megaplan/handlers.py", "ghost.py"],
+            "commands_run": ["pytest -k batch2"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Re-edited handlers.py in batch two.",
+                    "files_changed": ["megaplan/handlers.py", "ghost.py"],
+                    "commands_run": ["pytest -k batch2"],
+                }
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC2", "executor_note": "Confirmed batch two output."}
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="batch2", duration_ms=1, cost_usd=0.0, session_id="batch-2"), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", observation_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    assert response["success"] is True
+    assert any("ghost.py" in deviation for deviation in response["deviations"])
+    assert not any(
+        "executor claimed files not observed" in deviation and "megaplan/handlers.py" in deviation
+        for deviation in response["deviations"]
+    )
+
+
 def test_review_blocks_empty_evidence_files_without_substantive_verdict(
     plan_fixture: PlanFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -2554,3 +2898,340 @@ def test_load_plan_migrates_legacy_evaluated_state(tmp_path: Path) -> None:
     assert state["current_state"] == megaplan.STATE_CRITIQUED
     assert state["last_gate"] == {}
     assert "last_evaluation" not in persisted
+
+
+# ---------------------------------------------------------------------------
+# Progress command tests (T7)
+# ---------------------------------------------------------------------------
+
+
+def _drive_to_finalized(plan_fixture: PlanFixture) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+
+def test_progress_all_pending(plan_fixture: PlanFixture) -> None:
+    _drive_to_finalized(plan_fixture)
+    response = megaplan.handle_progress(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name),
+    )
+    assert response["success"] is True
+    assert response["tasks_pending"] == response["tasks_total"]
+    assert response["tasks_done"] == 0
+    assert response["batches_completed"] == 0
+    assert response["batches_total"] >= 1
+
+
+def test_progress_after_partial_execution(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _drive_to_finalized(plan_fixture)
+    # Set up 2-batch plan: T1 (no deps), T2 (depends on T1)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"] = [
+        {
+            "id": "T1",
+            "description": "First",
+            "depends_on": [],
+            "status": "done",
+            "executor_notes": "Done.",
+            "files_changed": ["a.py"],
+            "commands_run": ["pytest"],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+        {
+            "id": "T2",
+            "description": "Second",
+            "depends_on": ["T1"],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+    ]
+    (plan_fixture.plan_dir / "finalize.json").write_text(
+        json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
+    )
+    response = megaplan.handle_progress(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name),
+    )
+    assert response["batches_completed"] == 1
+    assert response["batches_total"] == 2
+    assert response["tasks_done"] == 1
+    assert response["tasks_pending"] == 1
+
+
+def test_progress_after_full_execution(plan_fixture: PlanFixture) -> None:
+    _drive_to_finalized(plan_fixture)
+    megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    response = megaplan.handle_progress(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name),
+    )
+    assert response["tasks_done"] + response["tasks_skipped"] == response["tasks_total"]
+    assert response["batches_completed"] == response["batches_total"]
+    assert response["tasks_pending"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-batch execute mode tests (T10)
+# ---------------------------------------------------------------------------
+
+
+def _setup_two_batch_plan(plan_fixture: PlanFixture) -> None:
+    """Drive plan to finalized and set up 2-batch task structure."""
+    _drive_to_finalized(plan_fixture)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"] = [
+        {
+            "id": "T1",
+            "description": "First batch",
+            "depends_on": [],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+        {
+            "id": "T2",
+            "description": "Second batch",
+            "depends_on": ["T1"],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        },
+    ]
+    finalize_data["sense_checks"] = [
+        {"id": "SC1", "task_id": "T1", "question": "Batch one?", "executor_note": "", "verdict": ""},
+        {"id": "SC2", "task_id": "T2", "question": "Batch two?", "executor_note": "", "verdict": ""},
+    ]
+    (plan_fixture.plan_dir / "finalize.json").write_text(
+        json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+    """Mock worker that returns batch-specific results based on prompt content."""
+    assert prompt_override is not None
+    if "[T1]" in prompt_override:
+        payload = {
+            "output": "Batch one complete.",
+            "files_changed": ["batch1.py"],
+            "commands_run": ["pytest -k batch1"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Completed the first batch.",
+                    "files_changed": ["batch1.py"],
+                    "commands_run": ["pytest -k batch1"],
+                }
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed batch one."}
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="batch1", duration_ms=2, cost_usd=0.1, session_id="batch-1"), "codex", "persistent", False
+    if "[T2]" in prompt_override:
+        payload = {
+            "output": "Batch two complete.",
+            "files_changed": ["batch2.py"],
+            "commands_run": ["pytest -k batch2"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Completed the second batch.",
+                    "files_changed": ["batch2.py"],
+                    "commands_run": ["pytest -k batch2"],
+                }
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC2", "executor_note": "Confirmed batch two."}
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="batch2", duration_ms=3, cost_usd=0.2, session_id="batch-2"), "codex", "persistent", False
+    raise AssertionError(f"Unexpected batch prompt: {prompt_override}")
+
+
+def test_batch_1_on_two_batch_plan_stays_finalized(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _batch_worker)
+
+    make_args = plan_fixture.make_args
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    state = read_json(plan_fixture.plan_dir / "state.json")
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert response["batch"] == 1
+    assert response["batches_total"] == 2
+    assert response["batches_remaining"] == 1
+    assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
+    assert not (plan_fixture.plan_dir / "execution.json").exists()
+    assert finalize_data["tasks"][0]["status"] == "done"
+    assert finalize_data["tasks"][1]["status"] == "pending"
+
+
+def test_batch_2_after_batch_1_transitions_to_executed(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _batch_worker)
+
+    make_args = plan_fixture.make_args
+    # Execute batch 1
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    # Execute batch 2
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=2),
+    )
+    state = read_json(plan_fixture.plan_dir / "state.json")
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["state"] == megaplan.STATE_EXECUTED
+    assert response["next_step"] == "review"
+    assert response["batch"] == 2
+    assert response["batches_remaining"] == 0
+    assert (plan_fixture.plan_dir / "execution.json").exists()
+    execution = read_json(plan_fixture.plan_dir / "execution.json")
+    assert [item["task_id"] for item in execution["task_updates"]] == ["T1", "T2"]
+    assert all(t["status"] == "done" for t in finalize_data["tasks"])
+
+
+def test_batch_out_of_range_raises(
+    plan_fixture: PlanFixture,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    make_args = plan_fixture.make_args
+    with pytest.raises(megaplan.CliError, match="out of range"):
+        megaplan.handle_execute(
+            plan_fixture.root,
+            make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=3),
+        )
+
+
+def test_batch_2_without_batch_1_raises_prerequisites(
+    plan_fixture: PlanFixture,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    make_args = plan_fixture.make_args
+    with pytest.raises(megaplan.CliError, match="requires batches") as exc_info:
+        megaplan.handle_execute(
+            plan_fixture.root,
+            make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=2),
+        )
+    assert exc_info.value.code == "batch_prerequisites"
+
+
+def test_batch_1_on_single_batch_plan_transitions_to_executed(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    # Make T2 independent of T1 so both are in batch 1
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][1]["depends_on"] = []
+    (plan_fixture.plan_dir / "finalize.json").write_text(
+        json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+
+    def single_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        payload = {
+            "output": "All tasks complete.",
+            "files_changed": ["batch1.py", "batch2.py"],
+            "commands_run": ["pytest"],
+            "deviations": [],
+            "task_updates": [
+                {"task_id": "T1", "status": "done", "executor_notes": "Done T1.", "files_changed": ["batch1.py"], "commands_run": ["pytest"]},
+                {"task_id": "T2", "status": "done", "executor_notes": "Done T2.", "files_changed": ["batch2.py"], "commands_run": ["pytest"]},
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed."},
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="all", duration_ms=1, cost_usd=0.1, session_id="single"), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", single_batch_worker)
+
+    make_args = plan_fixture.make_args
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+
+    assert response["state"] == megaplan.STATE_EXECUTED
+    assert response["next_step"] == "review"
+    assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
+    assert (plan_fixture.plan_dir / "execution.json").exists()
+
+
+def test_review_works_after_batch_by_batch_execution(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+
+    original_run_step = megaplan.workers.run_step_with_worker
+
+    def _worker_dispatch(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        if step == "execute":
+            return _batch_worker(step, state, plan_dir, args, root=root, resolved=resolved, prompt_override=prompt_override)
+        return original_run_step(step, state, plan_dir, args, root=root, resolved=resolved, prompt_override=prompt_override)
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _worker_dispatch)
+
+    make_args = plan_fixture.make_args
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=2),
+    )
+    # Review should work - execution.json and finalize.json are in correct shape
+    review = megaplan.handle_review(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name),
+    )
+    assert review["state"] == megaplan.STATE_DONE
