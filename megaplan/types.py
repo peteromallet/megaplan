@@ -89,6 +89,7 @@ class LastGateRecord(TypedDict, total=False):
     rationale: str
     signals_assessment: str
     warnings: list[str]
+    settled_decisions: list["SettledDecision"]
     passed: bool
     preflight_results: dict[str, bool]
     orchestrator_guidance: str
@@ -137,11 +138,18 @@ class GateCheckResult(TypedDict):
     unresolved_flags: list[FlagRecord]
 
 
+class SettledDecision(TypedDict, total=False):
+    id: str
+    decision: str
+    rationale: str
+
+
 class GatePayload(TypedDict):
     recommendation: str
     rationale: str
     signals_assessment: str
     warnings: list[str]
+    settled_decisions: list[SettledDecision]
 
 
 class GateArtifact(TypedDict, total=False):
@@ -153,6 +161,7 @@ class GateArtifact(TypedDict, total=False):
     rationale: str
     signals_assessment: str
     warnings: list[str]
+    settled_decisions: list[SettledDecision]
     override_forced: bool
     orchestrator_guidance: str
     robustness: str

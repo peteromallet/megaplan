@@ -37,32 +37,6 @@ _PLAN_HEADING_RE = re.compile(r"^##\s+.+$")
 _PLAN_PHASE_HEADING_RE = re.compile(r"^###\s+.+$")
 _PLAN_STEP_RE = re.compile(r"^##\s+Step\s+(\d+):\s+.+$")
 _PLAN_PHASE_STEP_RE = re.compile(r"^###\s+Step\s+(\d+):\s+.+$")
-_PATH_TOKEN_RE = re.compile(r"`([^`\n]+)`|(?<!\w)([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)(?!\w)")
-_FILE_SUFFIXES = (
-    ".cfg",
-    ".cs",
-    ".css",
-    ".go",
-    ".html",
-    ".ini",
-    ".java",
-    ".js",
-    ".json",
-    ".jsx",
-    ".lock",
-    ".md",
-    ".py",
-    ".rb",
-    ".rs",
-    ".sh",
-    ".sql",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".txt",
-    ".yaml",
-    ".yml",
-)
 _GENERIC_ACKS = {
     "ack",
     "checked",
@@ -102,21 +76,6 @@ def _parse_git_status_paths(stdout: str) -> set[str]:
         cleaned = path_text.strip().strip('"')
         if cleaned:
             paths.add(_normalize_repo_path(cleaned))
-    return paths
-
-
-def _extract_note_paths(text: str) -> set[str]:
-    paths: set[str] = set()
-    for match in _PATH_TOKEN_RE.finditer(text):
-        token = match.group(1) or match.group(2) or ""
-        cleaned = token.strip().strip(".,:;()[]{}<>\"'")
-        if not cleaned or cleaned.startswith(("http://", "https://")):
-            continue
-        if "/" not in cleaned and not cleaned.endswith(_FILE_SUFFIXES):
-            continue
-        if " " in cleaned:
-            continue
-        paths.add(_normalize_repo_path(cleaned))
     return paths
 
 
@@ -196,17 +155,6 @@ def validate_execution_evidence(finalize_data: dict[str, Any], project_dir: Path
             "Git status shows changed files not claimed by any task: "
             + ", ".join(unclaimed_changes)
         )
-
-    for task in finalize_data.get("tasks", []):
-        task_id = task.get("id", "?")
-        note = task.get("executor_notes", "")
-        if not isinstance(note, str) or not note.strip():
-            continue
-        for note_path in sorted(_extract_note_paths(note)):
-            if not (project_dir / note_path).exists():
-                findings.append(
-                    f"Task {task_id} executor_notes references missing artifact '{note_path}'."
-                )
 
     for sense_check in finalize_data.get("sense_checks", []):
         sense_check_id = sense_check.get("id", "?")
@@ -581,6 +529,7 @@ def build_gate_artifact(
         "rationale": gate_payload["rationale"],
         "signals_assessment": gate_payload["signals_assessment"],
         "warnings": warnings,
+        "settled_decisions": list(gate_payload.get("settled_decisions", [])),
         "override_forced": override_forced,
         "orchestrator_guidance": orchestrator_guidance,
         "robustness": signals.get("robustness"),

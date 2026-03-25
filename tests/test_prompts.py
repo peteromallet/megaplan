@@ -9,6 +9,7 @@ import pytest
 from megaplan.types import PlanState
 from megaplan._core import atomic_write_json, atomic_write_text, save_flag_registry
 from megaplan.prompts import create_claude_prompt, create_codex_prompt
+from megaplan.workers import _build_mock_payload
 
 
 def _state(project_dir: Path, *, iteration: int = 1) -> PlanState:
@@ -107,6 +108,14 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     atomic_write_json(
         plan_dir / "gate.json",
         {
+            **_build_mock_payload(
+                "gate",
+                state,
+                plan_dir,
+                recommendation="ITERATE",
+                rationale="revise it",
+                signals_assessment="not ready",
+            ),
             "passed": False,
             "criteria_check": {"count": 1, "items": ["criterion"]},
             "preflight_results": {
@@ -117,10 +126,6 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
                 "codex_available": True,
             },
             "unresolved_flags": [],
-            "recommendation": "ITERATE",
-            "rationale": "revise it",
-            "signals_assessment": "not ready",
-            "warnings": [],
             "override_forced": False,
             "robustness": "thorough",
             "signals": {"loop_summary": "Iteration summary"},
@@ -128,43 +133,49 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     )
     atomic_write_json(
         plan_dir / "execution.json",
-        {
-            "output": "done",
-            "files_changed": [],
-            "commands_run": [],
-            "deviations": [],
-            "task_updates": [
+        _build_mock_payload(
+            "execute",
+            state,
+            plan_dir,
+            output="done",
+            files_changed=[],
+            commands_run=[],
+            deviations=[],
+            task_updates=[
                 {
                     "task_id": "T1",
                     "status": "done",
-                    "executor_notes": "Implemented.",
+                    "executor_notes": "Verified the prompt changes and matched them against focused prompt tests.",
                     "files_changed": ["megaplan/prompts.py"],
                     "commands_run": ["pytest tests/test_prompts.py"],
                 }
             ],
-            "sense_check_acknowledgments": [
+            sense_check_acknowledgments=[
                 {"sense_check_id": "SC1", "executor_note": "Confirmed prompt coverage."}
             ],
-        },
+        ),
     )
     atomic_write_json(
         plan_dir / "finalize.json",
-        {
-            "tasks": [
+        _build_mock_payload(
+            "finalize",
+            state,
+            plan_dir,
+            tasks=[
                 {
                     "id": "T1",
                     "description": "Do the thing",
                     "depends_on": [],
                     "status": "done",
-                    "executor_notes": "Implemented.",
+                    "executor_notes": "Verified the prompt changes and matched them against focused prompt tests.",
                     "files_changed": ["megaplan/prompts.py"],
                     "commands_run": ["pytest tests/test_prompts.py"],
                     "evidence_files": [],
                     "reviewer_verdict": "",
                 }
             ],
-            "watch_items": ["Check assumptions."],
-            "sense_checks": [
+            watch_items=["Check assumptions."],
+            sense_checks=[
                 {
                     "id": "SC1",
                     "task_id": "T1",
@@ -173,8 +184,8 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
                     "verdict": "",
                 }
             ],
-            "meta_commentary": "Stay focused.",
-        },
+            meta_commentary="Stay focused.",
+        ),
     )
     save_flag_registry(
         plan_dir,
@@ -203,6 +214,17 @@ def test_plan_prompt_absorbs_clarification_when_missing(tmp_path: Path) -> None:
     assert "Identify ambiguities" in prompt
     assert "questions" in prompt
     assert state["idea"] in prompt
+
+
+def test_light_plan_prompt_requests_combined_gate_fields(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["config"]["robustness"] = "light"
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert "self_flags" in prompt
+    assert "gate_recommendation" in prompt
+    assert "gate_rationale" in prompt
+    assert "settled_decisions" in prompt
+    assert "PROCEED, ITERATE, ESCALATE" in prompt
 
 
 def test_plan_prompt_uses_existing_clarification_context(tmp_path: Path) -> None:
@@ -235,6 +257,7 @@ def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
     assert "Gate summary" in prompt
     assert "Execution summary" in prompt
     assert "Execution tracking state (`finalize.json`)" in prompt
+    assert "line by line" in prompt.lower()
 
 
 def test_plan_prompt_is_nonempty(tmp_path: Path) -> None:
@@ -307,7 +330,7 @@ def test_review_prompts_differ_between_agents(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     claude_prompt = create_claude_prompt("review", state, plan_dir)
     codex_prompt = create_codex_prompt("review", state, plan_dir)
-    # Review prompts should be different (claude has Gate summary, codex doesn't)
+    # Review prompts should be different across agents even though both include gate context.
     assert claude_prompt != codex_prompt
 
 
@@ -319,6 +342,7 @@ def test_execute_prompt_auto_approve_note(tmp_path: Path) -> None:
     assert "task_updates" in prompt
     assert "sense_check_acknowledgments" in prompt
     assert '"files_changed": ["megaplan/handlers.py"' in prompt
+    assert "verification-focused" in prompt
 
 
 def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
@@ -336,6 +360,16 @@ def test_execute_prompt_surfaces_sense_checks_and_watch_items(tmp_path: Path) ->
     assert "SC1 (T1): Did it work?" in prompt
     assert "Watch items to keep visible during execution:" in prompt
     assert "Check assumptions." in prompt
+
+
+def test_execute_prompt_includes_finalize_path_and_checkpoint_instructions(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("execute", state, plan_dir)
+    assert str(plan_dir / "finalize.json") in prompt
+    assert "Best-effort progress checkpointing" in prompt
+    assert "full read-modify-write" in prompt
+    assert "Structured output remains the authoritative final summary" in prompt
+    assert "Do not create or rewrite tracking artifacts directly." not in prompt
 
 
 def test_finalize_prompt_requests_structured_tracking_fields(tmp_path: Path) -> None:
@@ -399,6 +433,53 @@ def test_review_prompt_gracefully_handles_missing_audit(tmp_path: Path) -> None:
     prompt = create_claude_prompt("review", state, plan_dir)
     assert "not present" in prompt
     assert "Skip that artifact gracefully" in prompt
+
+
+def test_review_prompt_includes_settled_decisions_when_present(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "gate.json",
+        {
+            **_build_mock_payload(
+                "gate",
+                state,
+                plan_dir,
+                recommendation="PROCEED",
+                rationale="ready",
+                signals_assessment="stable",
+                settled_decisions=[
+                    {
+                        "id": "DECISION-001",
+                        "decision": "Treat FLAG-006 softening as settled.",
+                        "rationale": "The gate already approved the tradeoff.",
+                    }
+                ],
+            ),
+            "passed": True,
+            "criteria_check": {"count": 1, "items": ["criterion"]},
+            "preflight_results": {
+                "project_dir_exists": True,
+                "project_dir_writable": True,
+                "success_criteria_present": True,
+                "claude_available": True,
+                "codex_available": True,
+            },
+            "unresolved_flags": [],
+            "override_forced": False,
+            "robustness": "thorough",
+            "signals": {"loop_summary": "Iteration summary"},
+        },
+    )
+    prompt = create_claude_prompt("review", state, plan_dir)
+    assert "do not re-litigate" in prompt
+    assert "DECISION-001" in prompt
+    assert "Treat FLAG-006 softening as settled." in prompt
+
+
+def test_review_prompt_omits_settled_decisions_when_empty(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_codex_prompt("review", state, plan_dir)
+    assert "Settled decisions (from gate approval" not in prompt
 
 
 def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:

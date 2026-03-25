@@ -181,8 +181,25 @@ def test_gate_schema_is_strict_and_requires_all_fields() -> None:
         "rationale",
         "signals_assessment",
         "warnings",
+        "settled_decisions",
     ]
     assert schema["properties"]["recommendation"]["enum"] == ["PROCEED", "ITERATE", "ESCALATE"]
+
+
+def test_plan_schema_keeps_light_mode_gate_fields_optional() -> None:
+    schema = strict_schema(SCHEMAS["plan.json"])
+    assert set(schema["required"]) == {"plan", "questions", "success_criteria", "assumptions"}
+    assert "self_flags" in schema["properties"]
+    assert "gate_recommendation" in schema["properties"]
+    assert "gate_rationale" in schema["properties"]
+    assert "settled_decisions" in schema["properties"]
+
+
+def test_gate_schema_includes_settled_decisions_structure() -> None:
+    schema = strict_schema(SCHEMAS["gate.json"])
+    item_schema = schema["properties"]["settled_decisions"]["items"]
+    assert set(item_schema["required"]) == {"id", "decision"}
+    assert "rationale" in item_schema["properties"]
 
 
 def test_strict_schema_new_tracking_objects_are_strict() -> None:

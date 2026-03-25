@@ -22,8 +22,10 @@ Run the loop in this order:
 6. `execute`
 7. `review`
 Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
+At `--robustness light`, `plan` can collapse plan + critique + gate into one call. When that happens it writes the critique and gate artifacts itself and may route directly to `finalize`, back to `revise`, or to an override path without separate `critique` / `gate` worker calls.
 ## Step Rules
 - `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`.
+- `plan` at light robustness: also produce `self_flags`, `gate_recommendation`, `gate_rationale`, and `settled_decisions` so the handler can fast-forward the loop.
 - `critique`: surface concrete flags with concern, evidence, category, and severity; reuse open flag IDs; call out scope creep.
 - `gate`: read the response, warnings, and `orchestrator_guidance`.
 - `revise`: show the delta, flags addressed, and flags remaining; then loop back through `critique` and `gate`.

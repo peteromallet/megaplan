@@ -36,7 +36,7 @@ from megaplan._core import (
 from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
-WORKER_TIMEOUT_SECONDS = 3600
+WORKER_TIMEOUT_SECONDS = 7200
 
 # Shared mapping from step name to schema filename, used by both
 # run_claude_step and run_codex_step.
@@ -196,8 +196,19 @@ def _mock_result(
     )
 
 
-def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
-    payload = {
+def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(base_value, value)
+            continue
+        merged[key] = value
+    return merged
+
+
+def _default_mock_plan_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "plan": textwrap.dedent(
             f"""
             # Implementation Plan: Mock Planning Pass
@@ -237,13 +248,30 @@ def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
         ],
         "assumptions": ["The project directory is writable."],
     }
-    return _mock_result(payload)
+    if state["config"].get("robustness") == "light":
+        payload.update(
+            {
+                "self_flags": [
+                    {
+                        "id": "FLAG-101",
+                        "concern": "The mock plan assumes the existing repo structure stays stable while wiring the light-path checks.",
+                        "category": "maintainability",
+                        "severity_hint": "likely-minor",
+                        "evidence": "The plan intentionally stays narrow and leans on current handler boundaries.",
+                    }
+                ],
+                "gate_recommendation": "PROCEED",
+                "gate_rationale": "The combined plan is concrete enough to execute and the remaining self-flag is minor.",
+                "settled_decisions": [],
+            }
+        )
+    return payload
 
 
-def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     iteration = state["iteration"] or 1
     if iteration == 1:
-        payload = {
+        return {
             "flags": [
                 {
                     "id": "FLAG-001",
@@ -263,13 +291,11 @@ def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
             "verified_flag_ids": [],
             "disputed_flag_ids": [],
         }
-    else:
-        payload = {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
-    return _mock_result(payload)
+    return {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
 
 
-def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
-    payload = {
+def _default_mock_revise_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+    return {
         "plan": textwrap.dedent(
             f"""
             # Implementation Plan: Mock Revision Pass
@@ -311,12 +337,11 @@ def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
         ],
         "questions": [],
     }
-    return _mock_result(payload)
 
 
-def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _default_mock_gate_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     recommendation = "ITERATE" if state["iteration"] == 1 else "PROCEED"
-    payload = {
+    return {
         "recommendation": recommendation,
         "rationale": (
             "First critique cycle still needs another pass."
@@ -329,12 +354,12 @@ def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
             else "Weighted score and loop trajectory support proceeding."
         ),
         "warnings": [],
+        "settled_decisions": [],
     }
-    return _mock_result(payload)
 
 
-def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
-    payload = {
+def _default_mock_finalize_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+    return {
         "tasks": [
             {
                 "id": "T1",
@@ -378,15 +403,14 @@ def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
         ],
         "meta_commentary": "This is a mock finalize output.",
     }
-    return _mock_result(payload)
 
 
-def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _default_mock_execute_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
-    target.write_text("mock execution completed\n", encoding="utf-8")
-    payload = {
+    relative_target = str(target.relative_to(Path(state["config"]["project_dir"])))
+    return {
         "output": "Mock execution completed successfully.",
-        "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
+        "files_changed": [relative_target],
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
         "deviations": [],
         "task_updates": [
@@ -394,7 +418,7 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
                 "task_id": "T1",
                 "status": "done",
                 "executor_notes": "Implemented via mock worker output and wrote IMPLEMENTED_BY_MEGAPLAN.txt.",
-                "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
+                "files_changed": [relative_target],
                 "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
             },
             {
@@ -416,16 +440,15 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
             },
         ],
     }
-    return _mock_result(payload, trace_output='{"event":"mock-execute"}\n')
 
 
-def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
+def _default_mock_review_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     meta = read_json(latest_plan_meta_path(plan_dir, state))
     criteria = [
         {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
         for criterion in meta.get("success_criteria", [])
     ]
-    payload = {
+    return {
         "review_verdict": "approved",
         "criteria": criteria,
         "issues": [],
@@ -447,7 +470,56 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
             {"sense_check_id": "SC2", "verdict": "Confirmed."},
         ],
     }
-    return _mock_result(payload)
+
+
+_MockPayloadBuilder = Callable[[PlanState, Path], dict[str, Any]]
+
+_MOCK_DEFAULTS: dict[str, _MockPayloadBuilder] = {
+    "plan": _default_mock_plan_payload,
+    "critique": _default_mock_critique_payload,
+    "revise": _default_mock_revise_payload,
+    "gate": _default_mock_gate_payload,
+    "finalize": _default_mock_finalize_payload,
+    "execute": _default_mock_execute_payload,
+    "review": _default_mock_review_payload,
+}
+
+
+def _build_mock_payload(step: str, state: PlanState, plan_dir: Path, **overrides: Any) -> dict[str, Any]:
+    builder = _MOCK_DEFAULTS.get(step)
+    if builder is None:
+        raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
+    return _deep_merge(builder(state, plan_dir), overrides)
+
+
+def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("plan", state, plan_dir))
+
+
+def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("critique", state, plan_dir))
+
+
+def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("revise", state, plan_dir))
+
+
+def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("gate", state, plan_dir))
+
+
+def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("finalize", state, plan_dir))
+
+
+def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
+    target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
+    target.write_text("mock execution completed\n", encoding="utf-8")
+    return _mock_result(_build_mock_payload("execute", state, plan_dir), trace_output='{"event":"mock-execute"}\n')
+
+
+def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("review", state, plan_dir))
 
 
 _MockHandler = Callable[[PlanState, Path], WorkerResult]
@@ -523,7 +595,12 @@ def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, 
         session_id = str(uuid.uuid4())
         command.extend(["--session-id", session_id])
     prompt = create_claude_prompt(step, state, plan_dir)
-    result = run_command(command, cwd=project_dir, stdin_text=prompt)
+    try:
+        result = run_command(command, cwd=project_dir, stdin_text=prompt)
+    except CliError as error:
+        if error.code == "worker_timeout":
+            error.extra["session_id"] = session_id
+        raise
     raw = result.stdout or result.stderr
     envelope, payload = parse_claude_envelope(raw)
     try:
@@ -581,7 +658,16 @@ def run_codex_step(
             command.append("--json")
         command.extend(["--output-schema", str(schema_file), "-"])
 
-    result = run_command(command, cwd=Path.cwd(), stdin_text=prompt)
+    try:
+        result = run_command(command, cwd=Path.cwd(), stdin_text=prompt)
+    except CliError as error:
+        if error.code == "worker_timeout":
+            timeout_session_id = session.get("id") if persistent else None
+            if timeout_session_id is None:
+                timeout_session_id = extract_session_id(error.extra.get("raw_output", ""))
+            if timeout_session_id is not None:
+                error.extra["session_id"] = timeout_session_id
+        raise
     raw = result.stdout + result.stderr
     if result.returncode != 0 and (not output_path.exists() or not output_path.read_text(encoding="utf-8").strip()):
         raise CliError("worker_error", f"Codex step failed with exit code {result.returncode}", extra={"raw_output": raw})
@@ -660,8 +746,16 @@ def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None
     return agent, "persistent", refreshed
 
 
-def run_step_with_worker(step: str, state: PlanState, plan_dir: Path, args: argparse.Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
-    agent, mode, refreshed = resolve_agent_mode(step, args)
+def run_step_with_worker(
+    step: str,
+    state: PlanState,
+    plan_dir: Path,
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    resolved: tuple[str, str, bool] | None = None,
+) -> tuple[WorkerResult, str, str, bool]:
+    agent, mode, refreshed = resolved or resolve_agent_mode(step, args)
     if agent == "claude":
         worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed)
     else:

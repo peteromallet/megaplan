@@ -12,6 +12,7 @@ import pytest
 from megaplan.evaluation import validate_plan_structure
 from megaplan.types import CliError
 from megaplan.workers import (
+    _build_mock_payload,
     extract_session_id,
     parse_claude_envelope,
     parse_json_file,
@@ -51,7 +52,16 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
     [
         ("plan", {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}),
         ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
-        ("gate", {"recommendation": "PROCEED", "rationale": "ok", "signals_assessment": "ok", "warnings": []}),
+        (
+            "gate",
+            {
+                "recommendation": "PROCEED",
+                "rationale": "ok",
+                "signals_assessment": "ok",
+                "warnings": [],
+                "settled_decisions": [],
+            },
+        ),
         (
             "finalize",
             {
@@ -229,36 +239,34 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
     )
     (plan_dir / "faults.json").write_text(json.dumps({"flags": []}), encoding="utf-8")
     (plan_dir / "gate.json").write_text(
-        json.dumps({"passed": True, "recommendation": "PROCEED", "rationale": "ok", "signals_assessment": "ok", "warnings": [], "criteria_check": {}, "preflight_results": {}, "unresolved_flags": [], "override_forced": False}),
-        encoding="utf-8",
-    )
-    (plan_dir / "execution.json").write_text(
         json.dumps(
             {
-                "output": "done",
-                "files_changed": [],
-                "commands_run": [],
-                "deviations": [],
-                "task_updates": [
-                    {
-                        "task_id": "T1",
-                        "status": "done",
-                        "executor_notes": "Implemented.",
-                        "files_changed": ["megaplan/workers.py"],
-                        "commands_run": ["pytest tests/test_workers.py"],
-                    }
-                ],
-                "sense_check_acknowledgments": [
-                    {"sense_check_id": "SC1", "executor_note": "Confirmed."}
-                ],
+                "passed": True,
+                "recommendation": "PROCEED",
+                "rationale": "ok",
+                "signals_assessment": "ok",
+                "warnings": [],
+                "settled_decisions": [],
+                "criteria_check": {},
+                "preflight_results": {},
+                "unresolved_flags": [],
+                "override_forced": False,
             }
         ),
         encoding="utf-8",
     )
+    (plan_dir / "execution.json").write_text(
+        json.dumps(_build_mock_payload("execute", state, plan_dir, output="done")),
+        encoding="utf-8",
+    )
     (plan_dir / "finalize.json").write_text(
         json.dumps(
-            {
-                "tasks": [
+            _build_mock_payload(
+                "finalize",
+                state,
+                plan_dir,
+                watch_items=["Watch repository assumptions."],
+                tasks=[
                     {
                         "id": "T1",
                         "description": "Do work",
@@ -282,13 +290,12 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
                         "reviewer_verdict": "",
                     },
                 ],
-                "watch_items": ["Watch repository assumptions."],
-                "sense_checks": [
+                sense_checks=[
                     {"id": "SC1", "task_id": "T1", "question": "Did it work?", "executor_note": "", "verdict": ""},
                     {"id": "SC2", "task_id": "T2", "question": "Was it verified?", "executor_note": "", "verdict": ""},
                 ],
-                "meta_commentary": "Mock finalize output.",
-            }
+                meta_commentary="Mock finalize output.",
+            )
         ),
         encoding="utf-8",
     )
@@ -304,6 +311,29 @@ def test_mock_plan_returns_valid_payload(tmp_path: Path) -> None:
     assert "success_criteria" in result.payload
     assert "assumptions" in result.payload
     assert validate_plan_structure(result.payload["plan"]) == []
+
+
+def test_build_mock_payload_execute_returns_complete_payload(tmp_path: Path) -> None:
+    plan_dir, state = _mock_state(tmp_path)
+    payload = _build_mock_payload(
+        "execute",
+        state,
+        plan_dir,
+        task_updates=[
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Verified the targeted execute payload override keeps the schema intact.",
+                "files_changed": ["megaplan/workers.py"],
+                "commands_run": ["pytest tests/test_workers.py -k build_mock_payload"],
+            }
+        ],
+    )
+
+    assert payload["output"] == "Mock execution completed successfully."
+    assert payload["task_updates"][0]["task_id"] == "T1"
+    assert len(payload["task_updates"]) == 1
+    assert payload["sense_check_acknowledgments"]
 
 
 def test_mock_critique_returns_valid_payload(tmp_path: Path) -> None:
@@ -333,6 +363,7 @@ def test_mock_gate_returns_valid_payload(tmp_path: Path) -> None:
     assert "rationale" in result.payload
     assert "signals_assessment" in result.payload
     assert "warnings" in result.payload
+    assert "settled_decisions" in result.payload
 
 
 def test_mock_finalize_returns_valid_payload(tmp_path: Path) -> None:
@@ -572,6 +603,28 @@ def test_run_claude_step_raises_on_invalid_payload(tmp_path: Path) -> None:
             run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=True)
 
 
+def test_run_claude_step_attaches_session_id_on_timeout(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import run_claude_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    state["sessions"][session_key_for("plan", "claude")] = {
+        "id": "claude-session",
+        "mode": "persistent",
+        "created_at": "2026-03-20T00:00:00Z",
+        "last_used_at": "2026-03-20T00:00:00Z",
+        "refreshed": False,
+    }
+
+    timeout_error = CliError("worker_timeout", "Claude timed out", extra={"raw_output": "partial"})
+    with patch("megaplan.workers.run_command", side_effect=timeout_error):
+        with pytest.raises(CliError) as exc_info:
+            run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=False)
+
+    assert exc_info.value.extra["session_id"] == "claude-session"
+
+
 def test_run_codex_step_parses_output_file(tmp_path: Path) -> None:
     from megaplan._core import ensure_runtime_layout
     from megaplan.workers import CommandResult, run_codex_step
@@ -630,3 +683,22 @@ def test_run_codex_step_raises_on_nonzero_exit(tmp_path: Path) -> None:
             run_codex_step(
                 "plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True,
             )
+
+
+def test_run_codex_step_extracts_session_id_from_timeout_output(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    timeout_error = CliError(
+        "worker_timeout",
+        "Codex timed out",
+        extra={"raw_output": '{"type":"thread.started","thread_id":"codex-timeout-session"}\n'},
+    )
+
+    with patch("megaplan.workers.run_command", side_effect=timeout_error):
+        with pytest.raises(CliError) as exc_info:
+            run_codex_step("execute", state, plan_dir, root=tmp_path, persistent=True, fresh=True, json_trace=True)
+
+    assert exc_info.value.extra["session_id"] == "codex-timeout-session"

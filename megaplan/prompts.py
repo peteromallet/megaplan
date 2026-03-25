@@ -129,6 +129,75 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
+def _plan_light_prompt(state: PlanState, plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    clarification = state.get("clarification", {})
+    if clarification:
+        clarification_block = textwrap.dedent(
+            f"""
+            Existing clarification context:
+            {json_dump(clarification).strip()}
+            """
+        ).strip()
+    else:
+        clarification_block = "No prior clarification artifact exists. Identify ambiguities, ask clarifying questions, and state your assumptions inside the plan output."
+    return textwrap.dedent(
+        f"""
+        You are creating a light-robustness implementation plan for the following idea.
+
+        {intent_and_notes_block(state)}
+
+        Project directory:
+        {project_dir}
+
+        {clarification_block}
+
+        Requirements:
+        - Inspect the actual repository before planning.
+        - Produce structured JSON only.
+        - `plan` must be concrete markdown using the plan template below.
+        - `questions`, `success_criteria`, and `assumptions` follow the normal planning rules.
+        - Add `self_flags`: concrete concerns you can already see in your own plan. Use the same shape as critique flags (`id`, `concern`, `category`, `severity_hint`, `evidence`).
+        - Add `gate_recommendation`: exactly one of PROCEED, ITERATE, ESCALATE.
+        - Add `gate_rationale`: a compact explanation of that recommendation.
+        - Add `settled_decisions`: design choices that are now settled and should carry into review without being re-litigated. Return `[]` when none.
+        - Preserve quality while staying pragmatic: combine planning, self-critique, and the gate recommendation in one pass.
+        - Prefer cheap validation steps early.
+        - If user notes answer earlier questions, incorporate them into the draft plan instead of re-asking them.
+
+        Example output shape:
+        ```json
+        {{
+          "plan": "# Implementation Plan: ...",
+          "questions": [],
+          "success_criteria": ["..."],
+          "assumptions": ["..."],
+          "self_flags": [
+            {{
+              "id": "FLAG-001",
+              "concern": "The plan still relies on an implied helper that does not exist yet.",
+              "category": "correctness",
+              "severity_hint": "likely-significant",
+              "evidence": "No existing helper in the referenced module handles this workflow."
+            }}
+          ],
+          "gate_recommendation": "PROCEED",
+          "gate_rationale": "The plan is specific enough to execute and any remaining concerns are minor.",
+          "settled_decisions": [
+            {{
+              "id": "DECISION-001",
+              "decision": "Keep light robustness to a single plan call that also produces self-critique and gate guidance.",
+              "rationale": "The user explicitly wants to collapse the plan, critique, and gate loop into one call."
+            }}
+          ]
+        }}
+        ```
+
+        {PLAN_TEMPLATE}
+        """
+    ).strip()
+
+
 def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
@@ -283,6 +352,23 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
         - ESCALATE when the loop is stuck, churn is recurring, or user intervention is needed.
         - `signals_assessment` should summarize the score trajectory, plan delta, recurring critiques, unresolved flag weight, and preflight posture in one compact paragraph.
         - Put any cautionary notes in `warnings`.
+        - Populate `settled_decisions` with design choices that are now settled and should carry into review without being re-litigated. Return `[]` when there are no such decisions.
+        - Example output shape:
+        ```json
+        {{
+          "recommendation": "PROCEED",
+          "rationale": "The remaining issues are executor-level details rather than planning blockers.",
+          "signals_assessment": "Weighted score is falling, plan delta is stabilizing, and preflight remains clean.",
+          "warnings": ["Double-check FLAG-005 while executing."],
+          "settled_decisions": [
+            {{
+              "id": "DECISION-001",
+              "decision": "Treat FLAG-006 softening as approved gate guidance during review.",
+              "rationale": "The gate already accepted this tradeoff and review should verify compliance, not reopen it."
+            }}
+          ]
+        }}
+        ```
         """
     ).strip()
 
@@ -370,6 +456,9 @@ def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
 
 def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    # Codex execute often cannot write back into plan_dir during --full-auto, so
+    # checkpoint instructions must stay best-effort rather than mandatory.
+    finalize_path = str(plan_dir / "finalize.json")
     finalize_data = read_json(plan_dir / "finalize.json")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
@@ -437,6 +526,9 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         Execution tracking source of truth (`finalize.json`):
         {json_dump(finalize_data).strip()}
 
+        Absolute `finalize.json` path for best-effort progress checkpoints:
+        {finalize_path}
+
         Plan metadata:
         {json_dump(latest_meta).strip()}
 
@@ -455,10 +547,14 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
         - Output concrete files changed and commands run.
-        - Use the tasks in `finalize.json` as the execution boundary. Do not create or rewrite tracking artifacts directly.
+        - Use the tasks in `finalize.json` as the execution boundary.
+        - Best-effort progress checkpointing: if `{finalize_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back.
+        - Best-effort sense-check checkpointing: if `{finalize_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.
+        - Always use full read-modify-write updates for `{finalize_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
+        - Structured output remains the authoritative final summary for this step. Disk writes are progress checkpoints for timeout recovery only.
         - Return `task_updates` with one object per completed or skipped task.
         - Return `sense_check_acknowledgments` with one object per sense check.
-        - Keep `executor_notes` specific enough that a reviewer can map each update to the actual code and commands you ran.
+        - Keep `executor_notes` verification-focused: say what you verified was correct, what edge cases you considered, and what behavior you observed. The diff already shows what changed; the notes should explain why it is correct.
         - Follow this JSON shape exactly:
         ```json
         {{
@@ -470,7 +566,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
             {{
               "task_id": "T6",
               "status": "done",
-              "executor_notes": "Updated handle_execute to merge per-task evidence, merge sense-check acknowledgments, and enforce the FLAG-006 softening path.",
+              "executor_notes": "Verified that handle_execute now merges per-task evidence before blocking on missing execution proof. Tested that a done task with commands_run but no files_changed follows the FLAG-006 softening path. Edge case: empty strings in commands_run still count as missing evidence.",
               "files_changed": ["megaplan/handlers.py"],
               "commands_run": ["pytest tests/test_megaplan.py -k execute"]
             }},
@@ -496,6 +592,48 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
+def _settled_decisions_block(gate: dict[str, object]) -> str:
+    settled_decisions = gate.get("settled_decisions", [])
+    if not isinstance(settled_decisions, list) or not settled_decisions:
+        return ""
+    lines = ["Settled decisions (from gate approval - do not re-litigate these):"]
+    for item in settled_decisions:
+        if not isinstance(item, dict):
+            continue
+        decision_id = item.get("id", "DECISION")
+        decision = item.get("decision", "")
+        rationale = item.get("rationale", "")
+        line = f"- {decision_id}: {decision}"
+        if rationale:
+            line += f" ({rationale})"
+        lines.append(line)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _settled_decisions_instruction(gate: dict[str, object]) -> str:
+    settled_decisions = gate.get("settled_decisions", [])
+    if not isinstance(settled_decisions, list) or not settled_decisions:
+        return ""
+    return "- The decisions listed above were settled at the gate stage. Verify that execution honors these decisions, but do not question the decisions themselves."
+
+
+def _review_robustness_instruction(robustness: str) -> list[str]:
+    if robustness == "light":
+        return [
+            "Light robustness: trust executor evidence by default, focus on success criteria pass/fail, and do not require deep cross-referencing unless the diff or audit contradicts the claim.",
+        ]
+    if robustness == "thorough":
+        return [
+            "Thorough robustness: cross-reference every claimed file against the diff line by line before accepting the claim.",
+            "Thorough robustness: verify each sense-check acknowledgment against actual code behavior, not just the prose.",
+            "Thorough robustness: flag any executor note that merely describes the edit instead of explaining verification evidence.",
+        ]
+    return [
+        "Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.",
+    ]
+
+
 def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
@@ -503,6 +641,10 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     execution = read_json(plan_dir / "execution.json")
     gate = read_json(plan_dir / "gate.json")
     finalize_data = read_json(plan_dir / "finalize.json")
+    robustness = configured_robustness(state)
+    settled_decisions_block = _settled_decisions_block(gate)
+    settled_decisions_instruction = _settled_decisions_instruction(gate)
+    robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
     if audit_path.exists():
@@ -535,6 +677,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         Gate summary:
         {json_dump(gate).strip()}
 
+        {settled_decisions_block}
+
         Execution summary:
         {json_dump(execution).strip()}
 
@@ -546,7 +690,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         Requirements:
         - Judge against the success criteria, not plan elegance.
         - Be critical and call out real misses.
-        - Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.
+        {robustness_lines}
+        {settled_decisions_instruction}
         - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself is acceptable.
         - Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.
         - Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.
@@ -588,7 +733,12 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     execution = read_json(plan_dir / "execution.json")
+    gate = read_json(plan_dir / "gate.json")
     finalize_data = read_json(plan_dir / "finalize.json")
+    robustness = configured_robustness(state)
+    settled_decisions_block = _settled_decisions_block(gate)
+    settled_decisions_instruction = _settled_decisions_instruction(gate)
+    robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
     if audit_path.exists():
@@ -618,6 +768,11 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         Plan metadata:
         {json_dump(latest_meta).strip()}
 
+        Gate summary:
+        {json_dump(gate).strip()}
+
+        {settled_decisions_block}
+
         Execution summary:
         {json_dump(execution).strip()}
 
@@ -629,7 +784,8 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         Requirements:
         - Be critical.
         - Verify each success criterion explicitly.
-        - Trust executor evidence by default. Only re-verify from scratch where the diff, the audit, or the notes leave a real ambiguity.
+        {robustness_lines}
+        {settled_decisions_instruction}
         - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself checks out.
         - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
         - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
@@ -690,6 +846,8 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 
 
 def create_claude_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
+    if step == "plan" and configured_robustness(state) == "light":
+        return _plan_light_prompt(state, plan_dir)
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
@@ -697,6 +855,8 @@ def create_claude_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
 
 
 def create_codex_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
+    if step == "plan" and configured_robustness(state) == "light":
+        return _plan_light_prompt(state, plan_dir)
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")

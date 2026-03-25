@@ -350,6 +350,185 @@ def _format_execute_tracking_note(
     return f" ({', '.join(tracking_bits)})" if tracking_bits else ""
 
 
+def _snapshot_task_statuses(tasks: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        task["id"]: str(task.get("status", ""))
+        for task in tasks
+        if isinstance(task, dict) and isinstance(task.get("id"), str)
+    }
+
+
+def _append_execute_reconciliation_advisories(
+    *,
+    before_statuses: dict[str, str],
+    tasks_by_id: dict[str, dict[str, Any]],
+    issues: list[str],
+) -> None:
+    for task_id, before_status in before_statuses.items():
+        after_status = str(tasks_by_id.get(task_id, {}).get("status", ""))
+        if before_status not in {"done", "skipped"} or after_status == before_status:
+            continue
+        issues.append(
+            f"Advisory: task {task_id} was {before_status!r} on disk before merge but structured output set it to {after_status!r}. Structured output remains authoritative."
+        )
+
+
+def _normalize_execute_claimed_path(path: str) -> str:
+    return Path(path.strip()).as_posix()
+
+
+def _reset_timeout_invalid_tasks(
+    finalize_data: dict[str, Any],
+    *,
+    execution_audit: dict[str, Any],
+    issues: list[str],
+) -> list[str]:
+    reset_reasons: dict[str, list[str]] = {}
+    missing_task_ids = _check_done_task_evidence(
+        finalize_data.get("tasks", []),
+        issues=issues,
+        should_classify=lambda task: True,
+        has_evidence=lambda task: bool(task.get("files_changed")),
+        has_advisory_evidence=lambda task: bool(task.get("commands_run")),
+        missing_message="Done tasks missing both files_changed and commands_run during timeout recovery: ",
+        advisory_message="Advisory: done tasks rely on commands_run without files_changed during timeout recovery: ",
+    )
+    for task_id in missing_task_ids:
+        reset_reasons.setdefault(task_id, []).append("missing both files_changed and commands_run")
+
+    if not execution_audit.get("skipped"):
+        files_in_diff = {
+            _normalize_execute_claimed_path(path)
+            for path in execution_audit.get("files_in_diff", [])
+            if isinstance(path, str) and path.strip()
+        }
+        for task in finalize_data.get("tasks", []):
+            if task.get("status") != "done":
+                continue
+            claimed_paths = [
+                _normalize_execute_claimed_path(path)
+                for path in task.get("files_changed", [])
+                if isinstance(path, str) and path.strip()
+            ]
+            if claimed_paths and any(path not in files_in_diff for path in claimed_paths):
+                reset_reasons.setdefault(task["id"], []).append("claimed files not present in git status")
+
+    for task in finalize_data.get("tasks", []):
+        reasons = reset_reasons.get(task.get("id"))
+        if not reasons:
+            continue
+        note_prefix = str(task.get("executor_notes", "")).strip()
+        reset_note = "Timeout recovery reset this task to pending because " + " and ".join(reasons) + "."
+        task["status"] = "pending"
+        task["executor_notes"] = f"{note_prefix} {reset_note}".strip()
+
+    if reset_reasons:
+        issues.append(
+            "Reset timed-out done tasks to pending after evidence validation: "
+            + ", ".join(sorted(reset_reasons))
+        )
+    return sorted(reset_reasons)
+
+
+def _recover_execute_timeout(
+    *,
+    plan_dir: Path,
+    state: PlanState,
+    error: CliError,
+    agent: str,
+    mode: str,
+    refreshed: bool,
+    auto_approve: bool,
+    args: argparse.Namespace,
+) -> StepResponse:
+    deviations = [f"Execute timed out: {error.message}"]
+    finalize_data = read_json(plan_dir / "finalize.json")
+    project_dir = Path(state["config"]["project_dir"])
+    initial_audit = validate_execution_evidence(finalize_data, project_dir)
+    if initial_audit["skipped"]:
+        deviations.append(f"Advisory audit skip during timeout recovery: {initial_audit['reason']}")
+    for finding in initial_audit["findings"]:
+        deviations.append(f"Advisory audit finding during timeout recovery: {finding}")
+
+    _reset_timeout_invalid_tasks(
+        finalize_data,
+        execution_audit=initial_audit,
+        issues=deviations,
+    )
+    execution_audit = validate_execution_evidence(finalize_data, project_dir)
+    atomic_write_json(plan_dir / "execution_audit.json", execution_audit)
+    atomic_write_json(plan_dir / "finalize.json", finalize_data)
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
+
+    finalize_hash = sha256_file(plan_dir / "finalize.json")
+    raw_output = str(error.extra.get("raw_output") or error.message)
+    raw_name = store_raw_worker_output(plan_dir, "execute", state["iteration"], raw_output)
+    session_id = error.extra.get("session_id")
+    timeout_worker = WorkerResult(
+        payload={},
+        raw_output=raw_output,
+        duration_ms=0,
+        cost_usd=0.0,
+        session_id=session_id if isinstance(session_id, str) else None,
+    )
+    apply_session_update(state, "execute", agent, timeout_worker.session_id, mode=mode, refreshed=refreshed)
+    user_approved_gate = bool(state["meta"].get("user_approved_gate", False))
+    approval_mode = _resolve_execute_approval_mode(
+        auto_approve=auto_approve,
+        user_approved_gate=user_approved_gate,
+    )
+    append_history(
+        state,
+        make_history_entry(
+            "execute",
+            duration_ms=0,
+            cost_usd=0.0,
+            result="timeout",
+            worker=timeout_worker,
+            agent=agent,
+            mode=mode,
+            output_file="finalize.json",
+            artifact_hash=finalize_hash,
+            finalize_hash=finalize_hash,
+            raw_output_file=raw_name,
+            message=error.message,
+            approval_mode=approval_mode,
+        ),
+    )
+    save_state(plan_dir, state)
+
+    tasks = finalize_data.get("tasks", [])
+    completed_tasks = [task for task in tasks if task.get("status") in {"done", "skipped"}]
+    files_changed = sorted(
+        {
+            path
+            for task in completed_tasks
+            for path in task.get("files_changed", [])
+            if isinstance(path, str) and path.strip()
+        }
+    )
+    summary = (
+        "Execute timed out after partial progress. "
+        f"{len(completed_tasks)}/{len(tasks)} tasks remain marked done or skipped on disk. "
+        "Re-run execute to finish and re-emit structured output."
+    )
+    response: StepResponse = {
+        "success": False,
+        "step": "execute",
+        "summary": summary,
+        "artifacts": ["execution_audit.json", "finalize.json", "final.md"],
+        "next_step": "execute",
+        "state": STATE_FINALIZED,
+        "files_changed": files_changed,
+        "deviations": deviations,
+        "warnings": [summary],
+        "auto_approve": auto_approve,
+        "user_approved_gate": user_approved_gate,
+    }
+    attach_agent_fallback(response, args)
+    return response
+
+
 def _build_review_blocked_message(
     *,
     verdict_count: int,
@@ -743,6 +922,198 @@ def _validate_generated_plan_or_raise(
     return structure_warnings
 
 
+def _store_last_gate(state: PlanState, gate_summary: dict[str, Any]) -> None:
+    state["last_gate"] = {
+        "recommendation": gate_summary["recommendation"],
+        "rationale": gate_summary["rationale"],
+        "signals_assessment": gate_summary["signals_assessment"],
+        "warnings": gate_summary["warnings"],
+        "settled_decisions": gate_summary.get("settled_decisions", []),
+        "passed": gate_summary["passed"],
+        "preflight_results": gate_summary["preflight_results"],
+        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
+    }
+
+
+def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robustness: str) -> tuple[str, str, str]:
+    result = "success"
+    summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
+    if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
+        state["current_state"] = STATE_GATED
+        state["meta"].pop("user_approved_gate", None)
+        return result, "finalize", summary
+    state["current_state"] = STATE_CRITIQUED
+    if gate_summary["recommendation"] == "PROCEED":
+        result = "blocked"
+        summary = "Gate recommended PROCEED, but preflight checks are still blocking execution."
+        return result, "revise", summary
+    if gate_summary["recommendation"] == "ITERATE":
+        return result, "revise", summary
+    if gate_summary["recommendation"] == "ESCALATE":
+        if robustness == "light" and gate_summary["signals"]["weighted_score"] <= 4.0:
+            return result, "override force-proceed", summary
+        return result, "override add-note", summary
+    result = "unknown_recommendation"
+    summary = f"Gate returned unknown recommendation '{gate_summary['recommendation']}'; treating as escalation."
+    return result, "override add-note", summary
+
+
+def _synthetic_signals_assessment(signals_artifact: dict[str, Any]) -> str:
+    signals = signals_artifact["signals"]
+    parts = [f"Iteration {signals.get('iteration', '?')} weighted score {signals.get('weighted_score', 0.0)}."]
+    weighted_history = list(signals.get("weighted_history", []))
+    if weighted_history:
+        parts.append(f"Previous weighted score {weighted_history[-1]}.")
+    delta = signals.get("plan_delta_from_previous")
+    if delta is not None:
+        parts.append(f"Plan delta from previous iteration is {delta}%.")
+    recurring = list(signals.get("recurring_critiques", []))
+    if recurring:
+        parts.append(f"Recurring critiques: {', '.join(recurring)}.")
+    unresolved = list(signals_artifact.get("unresolved_flags", []))
+    parts.append(f"{len(unresolved)} unresolved significant flag(s) remain.")
+    if all(signals_artifact["preflight_results"].values()):
+        parts.append("Preflight is clean.")
+    else:
+        blocked = ", ".join(
+            name for name, passed in signals_artifact["preflight_results"].items() if not passed
+        )
+        parts.append(f"Preflight is blocked by: {blocked}.")
+    return " ".join(parts)
+
+
+def _maybe_fast_forward_light_plan(
+    *,
+    plan_dir: Path,
+    state: PlanState,
+    payload: dict[str, Any],
+    version: int,
+    plan_filename: str,
+    meta_filename: str,
+) -> StepResponse | None:
+    if configured_robustness(state) != "light":
+        return None
+    if not isinstance(payload.get("self_flags"), list):
+        return None
+    recommendation = payload.get("gate_recommendation")
+    if recommendation not in {"PROCEED", "ITERATE", "ESCALATE"}:
+        return None
+
+    critique_payload = {
+        "flags": payload.get("self_flags", []),
+        "verified_flag_ids": [],
+        "disputed_flag_ids": [],
+    }
+    critique_filename = f"critique_v{version}.json"
+    atomic_write_json(plan_dir / critique_filename, critique_payload)
+    registry = update_flags_after_critique(plan_dir, critique_payload, iteration=version)
+    significant = len(
+        [
+            flag
+            for flag in registry["flags"]
+            if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES
+        ]
+    )
+    _append_to_meta(state, "significant_counts", significant)
+    recurring = compute_recurring_critiques(plan_dir, version)
+    _append_to_meta(state, "recurring_critiques", recurring)
+    state["current_state"] = STATE_CRITIQUED
+    append_history(
+        state,
+        make_history_entry(
+            "critique",
+            duration_ms=0,
+            cost_usd=0.0,
+            result="success",
+            output_file=critique_filename,
+            artifact_hash=sha256_file(plan_dir / critique_filename),
+            flags_count=len(critique_payload["flags"]),
+            message="Synthetic light-mode critique generated from the combined plan output.",
+        ),
+    )
+
+    gate_signals = build_gate_signals(plan_dir, state)
+    gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
+    signals_artifact = {
+        "robustness": gate_signals["robustness"],
+        "signals": gate_signals["signals"],
+        "warnings": gate_signals.get("warnings", []),
+        "criteria_check": gate_checks["criteria_check"],
+        "preflight_results": gate_checks["preflight_results"],
+        "unresolved_flags": gate_checks["unresolved_flags"],
+    }
+    signals_filename = f"gate_signals_v{version}.json"
+    atomic_write_json(plan_dir / signals_filename, signals_artifact)
+    gate_payload = {
+        "recommendation": recommendation,
+        "rationale": payload.get("gate_rationale", ""),
+        "signals_assessment": _synthetic_signals_assessment(signals_artifact),
+        "warnings": [],
+        "settled_decisions": payload.get("settled_decisions", []),
+    }
+    guidance = build_orchestrator_guidance(
+        gate_payload=gate_payload,
+        signals=signals_artifact["signals"],
+        preflight_passed=all(signals_artifact["preflight_results"].values()),
+        preflight_results=signals_artifact["preflight_results"],
+        robustness=signals_artifact.get("robustness", "standard"),
+        plan_name=state["name"],
+    )
+    gate_summary = build_gate_artifact(
+        signals_artifact,
+        gate_payload,
+        override_forced=False,
+        orchestrator_guidance=guidance,
+    )
+    atomic_write_json(plan_dir / "gate.json", gate_summary)
+    _store_last_gate(state, gate_summary)
+    if len(state["meta"].get("weighted_scores", [])) < version:
+        _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
+    result, next_step, gate_summary_text = _apply_gate_outcome(
+        state,
+        gate_summary,
+        robustness=gate_signals["robustness"],
+    )
+    append_history(
+        state,
+        make_history_entry(
+            "gate",
+            duration_ms=0,
+            cost_usd=0.0,
+            result=result,
+            output_file="gate.json",
+            artifact_hash=sha256_file(plan_dir / "gate.json"),
+            recommendation=gate_summary["recommendation"],
+            message="Synthetic light-mode gate generated from the combined plan output.",
+        ),
+    )
+    return {
+        "success": gate_summary["recommendation"] != "PROCEED" or gate_summary["passed"],
+        "step": "plan",
+        "iteration": version,
+        "summary": (
+            f"Generated light robustness plan v{version} with {len(payload['questions'])} questions and "
+            f"{len(payload['success_criteria'])} success criteria. {gate_summary_text}"
+        ),
+        "artifacts": [plan_filename, meta_filename, critique_filename, "faults.json", signals_filename, "gate.json"],
+        "next_step": next_step,
+        "state": state["current_state"],
+        "questions": payload["questions"],
+        "assumptions": payload["assumptions"],
+        "success_criteria": payload["success_criteria"],
+        "recommendation": gate_summary["recommendation"],
+        "rationale": gate_summary["rationale"],
+        "signals_assessment": gate_summary["signals_assessment"],
+        "warnings": gate_summary["warnings"],
+        "passed": gate_summary["passed"],
+        "criteria_check": gate_summary["criteria_check"],
+        "preflight_results": gate_summary["preflight_results"],
+        "unresolved_flags": gate_summary["unresolved_flags"],
+        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
+        "signals": gate_summary["signals"],
+    }
+
+
 def handle_step(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "step", _STEP_EDIT_ALLOWED_STATES)
@@ -877,22 +1248,31 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
             artifact_hash=meta["hash"],
         ),
     )
+    response = _maybe_fast_forward_light_plan(
+        plan_dir=plan_dir,
+        state=state,
+        payload=payload,
+        version=version,
+        plan_filename=plan_filename,
+        meta_filename=meta_filename,
+    )
+    if response is None:
+        response = {
+            "success": True,
+            "step": "plan",
+            "iteration": version,
+            "summary": (
+                f"{'Refined' if rerun else 'Generated'} plan v{version} with "
+                f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
+            ),
+            "artifacts": [plan_filename, meta_filename],
+            "next_step": "critique",
+            "state": STATE_PLANNED,
+            "questions": payload["questions"],
+            "assumptions": payload["assumptions"],
+            "success_criteria": payload["success_criteria"],
+        }
     save_state(plan_dir, state)
-    response: StepResponse = {
-        "success": True,
-        "step": "plan",
-        "iteration": version,
-        "summary": (
-            f"{'Refined' if rerun else 'Generated'} plan v{version} with "
-            f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
-        ),
-        "artifacts": [plan_filename, meta_filename],
-        "next_step": "critique",
-        "state": STATE_PLANNED,
-        "questions": payload["questions"],
-        "assumptions": payload["assumptions"],
-        "success_criteria": payload["success_criteria"],
-    }
     attach_agent_fallback(response, args)
     return response
 
@@ -1107,40 +1487,16 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         orchestrator_guidance=guidance,
     )
     atomic_write_json(plan_dir / "gate.json", gate_summary)
-    state["last_gate"] = {
-        "recommendation": gate_summary["recommendation"],
-        "rationale": gate_summary["rationale"],
-        "signals_assessment": gate_summary["signals_assessment"],
-        "warnings": gate_summary["warnings"],
-        "passed": gate_summary["passed"],
-        "preflight_results": gate_summary["preflight_results"],
-        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
-    }
+    _store_last_gate(state, gate_summary)
     if len(state["meta"].get("weighted_scores", [])) < iteration:
         _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
 
-    result = "success"
     artifacts = [signals_filename, "gate.json"]
-    summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
-    if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
-        state["current_state"] = STATE_GATED
-        state["meta"].pop("user_approved_gate", None)
-        next_step = "finalize"
-    elif gate_summary["recommendation"] == "PROCEED":
-        result = "blocked"
-        next_step = "revise"
-        summary = "Gate recommended PROCEED, but preflight checks are still blocking execution."
-    elif gate_summary["recommendation"] == "ITERATE":
-        next_step = "revise"
-    elif gate_summary["recommendation"] == "ESCALATE":
-        if gate_signals["robustness"] == "light" and gate_signals["signals"]["weighted_score"] <= 4.0:
-            next_step = "override force-proceed"
-        else:
-            next_step = "override add-note"
-    else:
-        next_step = "override add-note"
-        result = "unknown_recommendation"
-        summary = f"Gate returned unknown recommendation '{gate_summary['recommendation']}'; treating as escalation."
+    result, next_step, summary = _apply_gate_outcome(
+        state,
+        gate_summary,
+        robustness=gate_signals["robustness"],
+    )
 
     apply_session_update(state, "gate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
@@ -1237,15 +1593,35 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             "missing_approval",
             "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
         )
+    agent, mode, refreshed = worker_module.resolve_agent_mode("execute", args)
     try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("execute", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker(
+            "execute",
+            state,
+            plan_dir,
+            args,
+            root=root,
+            resolved=(agent, mode, refreshed),
+        )
     except CliError as error:
+        if error.code == "worker_timeout":
+            return _recover_execute_timeout(
+                plan_dir=plan_dir,
+                state=state,
+                error=error,
+                agent=agent,
+                mode=mode,
+                refreshed=refreshed,
+                auto_approve=auto_approve,
+                args=args,
+            )
         record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
         raise
     atomic_write_json(plan_dir / "execution.json", worker.payload)
     deviations = list(worker.payload.get("deviations", []))
     finalize_data = read_json(plan_dir / "finalize.json")
     project_dir = Path(state["config"]["project_dir"])
+    pre_merge_statuses = _snapshot_task_statuses(finalize_data.get("tasks", []))
     tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
     merged_count, total_tasks = _validate_and_merge_batch(
         worker.payload.get("task_updates"),
@@ -1285,6 +1661,11 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             )
         ),
         nonempty_fields={"executor_note"},
+    )
+    _append_execute_reconciliation_advisories(
+        before_statuses=pre_merge_statuses,
+        tasks_by_id=tasks_by_id,
+        issues=deviations,
     )
     unacked_checks = total_checks - acknowledged_count
     missing_task_evidence = _check_done_task_evidence(

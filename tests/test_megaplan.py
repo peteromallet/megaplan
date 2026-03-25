@@ -16,7 +16,8 @@ import megaplan._core
 import megaplan.workers
 from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
 from megaplan._core import ensure_runtime_layout, load_plan
-from megaplan.workers import WorkerResult
+from megaplan.prompts import create_claude_prompt
+from megaplan.workers import WorkerResult, _build_mock_payload
 
 
 def read_json(path: Path) -> dict:
@@ -58,8 +59,12 @@ class PlanFixture:
     make_args: Callable[..., Namespace]
 
 
-@pytest.fixture
-def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture:
+def _make_plan_fixture_with_robustness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    robustness: str,
+) -> PlanFixture:
     root = tmp_path / "root"
     project_dir = tmp_path / "project"
     root.mkdir()
@@ -74,7 +79,7 @@ def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture
     )
 
     make_args = make_args_factory(project_dir)
-    response = megaplan.handle_init(root, make_args())
+    response = megaplan.handle_init(root, make_args(robustness=robustness))
     plan_name = response["plan"]
     return PlanFixture(
         root=root,
@@ -83,6 +88,11 @@ def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture
         plan_dir=megaplan.plans_root(root) / plan_name,
         make_args=make_args,
     )
+
+
+@pytest.fixture
+def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture:
+    return _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="standard")
 
 
 def load_state(plan_dir: Path) -> dict:
@@ -216,6 +226,133 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert execute_entry["finalize_hash"].startswith("sha256:")
     assert review_entry["finalize_hash"].startswith("sha256:")
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
+
+
+def test_workflow_light_robustness_collapses_to_one_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
+    make_args = plan_fixture.make_args
+    recorded_steps: list[str] = []
+    original_run_step = megaplan.workers.run_step_with_worker
+
+    def _record(step: str, *args: object, **kwargs: object) -> tuple[WorkerResult, str, str, bool]:
+        recorded_steps.append(step)
+        return original_run_step(step, *args, **kwargs)
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _record)
+
+    plan = megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    faults = read_json(plan_fixture.plan_dir / "faults.json")
+    gate = read_json(plan_fixture.plan_dir / "gate.json")
+    finalize = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    execute = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    review = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+
+    assert plan["state"] == megaplan.STATE_GATED
+    assert plan["next_step"] == "finalize"
+    assert (plan_fixture.plan_dir / "critique_v1.json").exists()
+    assert (plan_fixture.plan_dir / "gate_signals_v1.json").exists()
+    assert faults["flags"][0]["id"] == "FLAG-101"
+    assert gate["recommendation"] == "PROCEED"
+    assert finalize["state"] == megaplan.STATE_FINALIZED
+    assert execute["state"] == megaplan.STATE_EXECUTED
+    assert review["state"] == megaplan.STATE_DONE
+    assert recorded_steps == ["plan", "finalize", "execute", "review"]
+    assert [entry["step"] for entry in state["history"]] == [
+        "init",
+        "plan",
+        "critique",
+        "gate",
+        "finalize",
+        "execute",
+        "review",
+    ]
+
+
+def test_handle_plan_light_iterate_routes_to_revise_via_critiqued_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
+
+    def _light_iterate(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
+        if step == "plan":
+            payload = _build_mock_payload(
+                "plan",
+                state,
+                plan_dir,
+                gate_recommendation="ITERATE",
+                gate_rationale="The combined pass found a real planning gap.",
+            )
+            return WorkerResult(payload=payload, raw_output="{}", duration_ms=1, cost_usd=0.0, session_id="light-plan"), "claude", "persistent", False
+        return megaplan.workers.mock_worker_output(step, state, plan_dir), "claude", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _light_iterate)
+
+    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+
+    assert response["next_step"] == "revise"
+    assert response["state"] == megaplan.STATE_CRITIQUED
+    assert state["last_gate"]["recommendation"] == "ITERATE"
+
+
+def test_handle_plan_light_escalate_routes_to_override_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
+
+    def _light_escalate(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
+        if step == "plan":
+            payload = _build_mock_payload(
+                "plan",
+                state,
+                plan_dir,
+                gate_recommendation="ESCALATE",
+                gate_rationale="The combined pass wants a user judgment call.",
+            )
+            return WorkerResult(payload=payload, raw_output="{}", duration_ms=1, cost_usd=0.0, session_id="light-plan"), "claude", "persistent", False
+        return megaplan.workers.mock_worker_output(step, state, plan_dir), "claude", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _light_escalate)
+
+    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+
+    assert response["next_step"] == "override force-proceed"
+    assert response["state"] == megaplan.STATE_CRITIQUED
+    assert state["last_gate"]["recommendation"] == "ESCALATE"
+
+
+def test_workflow_thorough_robustness_review_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="thorough")
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    _, state = load_plan(plan_fixture.root, plan_fixture.plan_name)
+    prompt = create_claude_prompt("review", state, plan_fixture.plan_dir)
+
+    assert "line by line" in prompt.lower()
+    assert "sense-check acknowledgment" in prompt.lower()
 
 
 def test_handle_plan_stores_nonblocking_structure_warnings(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1715,6 +1852,154 @@ def test_execute_happy_path_tracks_all_tasks(plan_fixture: PlanFixture) -> None:
     assert response["warnings"] == []
     assert "2/2 tasks tracked" in response["summary"]
     assert "2/2 sense checks acknowledged" in response["summary"]
+
+
+def test_execute_timeout_recovers_partial_progress_from_finalize_json(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][0]["status"] = "done"
+    finalize_data["tasks"][0]["executor_notes"] = "Verified the implementation artifact before timeout recovery."
+    finalize_data["tasks"][0]["files_changed"] = ["IMPLEMENTED_BY_MEGAPLAN.txt"]
+    finalize_data["tasks"][0]["commands_run"] = ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"]
+    finalize_data["sense_checks"][0]["executor_note"] = "Confirmed the implementation artifact exists."
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    def timing_out_worker(*args, **kwargs):
+        raise megaplan.CliError("worker_timeout", "execute timed out", extra={"session_id": "test-session", "raw_output": ""})
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", timing_out_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    state = load_state(plan_fixture.plan_dir)
+    recovered = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is False
+    assert response["next_step"] == "execute"
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert recovered["tasks"][0]["status"] == "done"
+    assert state["history"][-1]["result"] == "timeout"
+    assert state["sessions"][megaplan.workers.session_key_for("execute", "codex")]["id"] == "test-session"
+
+
+def test_execute_timeout_resets_done_tasks_without_any_evidence(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][0]["status"] = "done"
+    finalize_data["tasks"][0]["executor_notes"] = "Claimed completion without evidence."
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    def timing_out_worker(*args, **kwargs):
+        raise megaplan.CliError("worker_timeout", "execute timed out", extra={"session_id": "test-session", "raw_output": ""})
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", timing_out_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    recovered = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is False
+    assert recovered["tasks"][0]["status"] == "pending"
+    assert "Timeout recovery reset this task to pending" in recovered["tasks"][0]["executor_notes"]
+    assert any("Reset timed-out done tasks to pending" in deviation for deviation in response["deviations"])
+
+
+def test_execute_reports_advisory_when_structured_output_disagrees_with_disk_checkpoint(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][0]["status"] = "done"
+    finalize_data["tasks"][0]["executor_notes"] = "Checkpointed as done on disk before final structured output."
+    finalize_data["tasks"][0]["files_changed"] = ["IMPLEMENTED_BY_MEGAPLAN.txt"]
+    finalize_data["tasks"][0]["commands_run"] = ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"]
+    (plan_fixture.plan_dir / "finalize.json").write_text(json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8")
+
+    worker = WorkerResult(
+        payload={
+            "output": "Execution completed with structured output.",
+            "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+            "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "skipped",
+                    "executor_notes": "Verified the disk checkpoint should be downgraded because no additional work was required.",
+                    "files_changed": [],
+                    "commands_run": [],
+                },
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Verified the remaining task completed successfully.",
+                    "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                    "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed the checkpoint mismatch was intentional."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed the remaining task completed successfully."},
+            ],
+        },
+        raw_output="execute with mismatch",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="execute-mismatch",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    merged_finalize = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is True
+    assert merged_finalize["tasks"][0]["status"] == "skipped"
+    assert any(
+        "task T1 was 'done' on disk before merge but structured output set it to 'skipped'" in deviation
+        for deviation in response["deviations"]
+    )
 
 
 def test_review_flags_incomplete_verdicts(plan_fixture: PlanFixture) -> None:

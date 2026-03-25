@@ -13,6 +13,50 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "questions": {"type": "array", "items": {"type": "string"}},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "assumptions": {"type": "array", "items": {"type": "string"}},
+            "self_flags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "concern": {"type": "string"},
+                        "category": {
+                            "type": "string",
+                            "enum": [
+                                "correctness",
+                                "security",
+                                "completeness",
+                                "performance",
+                                "maintainability",
+                                "other",
+                            ],
+                        },
+                        "severity_hint": {
+                            "type": "string",
+                            "enum": ["likely-significant", "likely-minor", "uncertain"],
+                        },
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["id", "concern", "category", "severity_hint", "evidence"],
+                },
+            },
+            "gate_recommendation": {
+                "type": "string",
+                "enum": ["PROCEED", "ITERATE", "ESCALATE"],
+            },
+            "gate_rationale": {"type": "string"},
+            "settled_decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "decision": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["id", "decision"],
+                },
+            },
         },
         "required": ["plan", "questions", "success_criteria", "assumptions"],
     },
@@ -38,8 +82,20 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "rationale": {"type": "string"},
             "signals_assessment": {"type": "string"},
             "warnings": {"type": "array", "items": {"type": "string"}},
+            "settled_decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "decision": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["id", "decision"],
+                },
+            },
         },
-        "required": ["recommendation", "rationale", "signals_assessment", "warnings"],
+        "required": ["recommendation", "rationale", "signals_assessment", "warnings", "settled_decisions"],
     },
     "critique.json": {
         "type": "object",
@@ -213,7 +269,7 @@ def strict_schema(schema: Any) -> Any:
         updated = {key: strict_schema(value) for key, value in schema.items()}
         if updated.get("type") == "object":
             updated.setdefault("additionalProperties", False)
-            if "properties" in updated:
+            if "properties" in updated and "required" not in updated:
                 updated["required"] = list(updated["properties"].keys())
         return updated
     if isinstance(schema, list):

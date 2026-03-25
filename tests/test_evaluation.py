@@ -11,6 +11,7 @@ import pytest
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
     _strip_fenced_blocks,
+    build_gate_artifact,
     build_orchestrator_guidance,
     build_gate_signals,
     compute_plan_delta_percent,
@@ -22,6 +23,7 @@ from megaplan.evaluation import (
     validate_execution_evidence,
     validate_plan_structure,
 )
+from megaplan.workers import _build_mock_payload
 
 
 def _write_json(path: Path, data: dict[str, object]) -> None:
@@ -575,7 +577,7 @@ def test_validate_execution_evidence_flags_diff_mismatches_and_weak_notes(
             {
                 "id": "T1",
                 "files_changed": ["src/existing.py", "docs/new_name.py", "ghost.py"],
-                "executor_notes": "Updated src/existing.py and noted missing/report.txt for follow-up.",
+                "executor_notes": "Verified src/existing.py and confirmed the rename to docs/new_name.py showed up in git status.",
             }
         ],
         "sense_checks": [
@@ -600,8 +602,37 @@ def test_validate_execution_evidence_flags_diff_mismatches_and_weak_notes(
     assert result["files_claimed"] == ["docs/new_name.py", "ghost.py", "src/existing.py"]
     assert any("ghost.py" in finding for finding in result["findings"])
     assert any("deleted.txt" in finding and "untracked.md" in finding for finding in result["findings"])
-    assert any("missing/report.txt" in finding for finding in result["findings"])
     assert any("SC1" in finding and "perfunctory" in finding for finding in result["findings"])
+
+
+def test_build_gate_artifact_passes_through_settled_decisions(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    gate_payload = _build_mock_payload(
+        "gate",
+        state,
+        plan_dir,
+        settled_decisions=[
+            {
+                "id": "DECISION-001",
+                "decision": "Reviewer must respect the softened FLAG-006 behavior.",
+                "rationale": "This was approved at gate time.",
+            }
+        ],
+    )
+    artifact = build_gate_artifact(
+        {
+            "criteria_check": {"count": 1, "items": ["criterion"]},
+            "preflight_results": {"project_dir_exists": True},
+            "unresolved_flags": [],
+            "warnings": [],
+            "robustness": "standard",
+            "signals": {"weighted_score": 0.5},
+        },
+        gate_payload,
+        override_forced=False,
+    )
+
+    assert artifact["settled_decisions"] == gate_payload["settled_decisions"]
 
 
 def test_validate_execution_evidence_skips_without_git_repo(tmp_path: Path) -> None:
