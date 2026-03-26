@@ -60,7 +60,6 @@ from megaplan._core import (
     slugify,
     unresolved_significant_flags,
     workflow_includes_step,
-    workflow_primary_next,
     workflow_transition,
     workflow_next,
 )
@@ -939,7 +938,9 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
-    next_step = workflow_primary_next(state)
+    next_steps = workflow_next(state)
+    # Skip self-loop (plan→planned) to find the forward step
+    next_step = next((s for s in next_steps if s != "plan" and s != "step"), next_steps[0] if next_steps else None)
     updated_registry = load_flag_registry(plan_dir)
     remaining = [
         {

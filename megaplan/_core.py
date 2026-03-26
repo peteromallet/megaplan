@@ -685,7 +685,7 @@ WORKFLOW: dict[str, list[Transition]] = {
         Transition("override abort", STATE_ABORTED, "gate_escalate"),
         Transition("revise", STATE_PLANNED, "gate_proceed_blocked"),
         Transition("override force-proceed", STATE_GATED, "gate_proceed_blocked"),
-        Transition("gate", STATE_GATED, "gate_fallback"),
+        Transition("gate", STATE_GATED, "gate_proceed"),
     ],
     STATE_GATED: [
         Transition("finalize", STATE_FINALIZED),
@@ -753,10 +753,8 @@ def _transition_matches(state: PlanState, condition: str) -> bool:
         return recommendation == "ESCALATE"
     if condition == "gate_proceed_blocked":
         return recommendation == "PROCEED" and not gate.get("passed", False)
-    if condition == "gate_fallback":
-        return bool(recommendation) and recommendation != "ITERATE" and recommendation != "ESCALATE" and not (
-            recommendation == "PROCEED" and not gate.get("passed", False)
-        )
+    if condition == "gate_proceed":
+        return recommendation == "PROCEED" and gate.get("passed", False)
     return False
 
 
@@ -780,21 +778,6 @@ def workflow_transition(state: PlanState, step: str) -> Transition | None:
         if transition.next_step == step and _transition_matches(state, transition.condition):
             return transition
     return None
-
-
-def workflow_primary_next(state: PlanState) -> str | None:
-    current = state.get("current_state")
-    if not isinstance(current, str):
-        return None
-    workflow = _workflow_for_robustness(_workflow_robustness_from_state(state))
-    for transition in workflow.get(current, []):
-        if not _transition_matches(state, transition.condition):
-            continue
-        if transition.next_state == current:
-            continue
-        return transition.next_step
-    next_steps = workflow_next(state)
-    return next_steps[0] if next_steps else None
 
 
 def workflow_next(state: PlanState) -> list[str]:

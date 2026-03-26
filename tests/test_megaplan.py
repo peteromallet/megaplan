@@ -228,6 +228,65 @@ def test_workflow_definition_is_complete_for_standard_flow() -> None:
         assert set(overrides).issubset(WORKFLOW)
 
 
+def test_workflow_walk_matches_documented_standard_flow() -> None:
+    walk = [
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, "plan"),
+        ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, "critique"),
+        ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, "gate"),
+        (
+            {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}},
+            "revise",
+        ),
+        ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, "critique"),
+        (
+            {
+                "current_state": megaplan.STATE_CRITIQUED,
+                "last_gate": {"recommendation": "PROCEED", "passed": True},
+            },
+            "gate",
+        ),
+        ({"current_state": megaplan.STATE_GATED, "last_gate": {}}, "finalize"),
+        ({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}}, "execute"),
+        ({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}}, "review"),
+    ]
+
+    actual_steps: list[str] = []
+    for state, expected_step in walk:
+        assert expected_step in workflow_next(state)
+        actual_steps.append(expected_step)
+
+    assert actual_steps == [
+        "plan",
+        "critique",
+        "gate",
+        "revise",
+        "critique",
+        "gate",
+        "finalize",
+        "execute",
+        "review",
+    ]
+
+
+def test_workflow_walk_matches_documented_light_flow() -> None:
+    light_config = {"config": {"robustness": "light"}}
+    walk = [
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **light_config}, "plan"),
+        ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}, **light_config}, "critique"),
+        ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, **light_config}, "revise"),
+        ({"current_state": megaplan.STATE_GATED, "last_gate": {}, **light_config}, "finalize"),
+        ({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}, **light_config}, "execute"),
+    ]
+
+    actual_steps: list[str] = []
+    for state, expected_step in walk:
+        assert expected_step in workflow_next(state)
+        actual_steps.append(expected_step)
+
+    assert workflow_next({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, **light_config}) == []
+    assert actual_steps == ["plan", "critique", "revise", "finalize", "execute"]
+
+
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     megaplan.handle_override(
