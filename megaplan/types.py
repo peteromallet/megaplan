@@ -257,10 +257,16 @@ DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "execute": "codex",
     "review": "codex",
 }
-KNOWN_AGENTS = ["claude", "codex"]
-ROBUSTNESS_LEVELS = ("light", "standard", "thorough")
-ROBUSTNESS_SKIP_THRESHOLDS = {"light": 4.0, "standard": 2.0, "thorough": 1.0}
-ROBUSTNESS_STAGNATION_FACTORS = {"light": 0.8, "standard": 0.9, "thorough": 0.95}
+KNOWN_AGENTS = ["claude", "codex", "hermes"]
+ROBUSTNESS_LEVELS = ("light", "standard")
+def parse_agent_spec(spec: str) -> tuple[str, str | None]:
+    """Parse 'hermes:model/name' → ('hermes', 'model/name') or 'claude' → ('claude', None)."""
+    if ":" in spec:
+        agent, model = spec.split(":", 1)
+        return agent, model
+    return spec, None
+
+
 SCOPE_CREEP_TERMS = (
     "scope creep",
     "out of scope",

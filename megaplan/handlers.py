@@ -59,6 +59,10 @@ from megaplan._core import (
     sha256_text,
     slugify,
     unresolved_significant_flags,
+    workflow_includes_step,
+    workflow_primary_next,
+    workflow_transition,
+    workflow_next,
 )
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
@@ -603,169 +607,10 @@ def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robus
     if gate_summary["recommendation"] == "ITERATE":
         return result, "revise", summary
     if gate_summary["recommendation"] == "ESCALATE":
-        if robustness == "light" and gate_summary["signals"]["weighted_score"] <= 4.0:
-            return result, "override force-proceed", summary
         return result, "override add-note", summary
     result = "unknown_recommendation"
     summary = f"Gate returned unknown recommendation '{gate_summary['recommendation']}'; treating as escalation."
     return result, "override add-note", summary
-
-
-def _synthetic_signals_assessment(signals_artifact: dict[str, Any]) -> str:
-    signals = signals_artifact["signals"]
-    parts = [f"Iteration {signals.get('iteration', '?')} weighted score {signals.get('weighted_score', 0.0)}."]
-    weighted_history = list(signals.get("weighted_history", []))
-    if weighted_history:
-        parts.append(f"Previous weighted score {weighted_history[-1]}.")
-    delta = signals.get("plan_delta_from_previous")
-    if delta is not None:
-        parts.append(f"Plan delta from previous iteration is {delta}%.")
-    recurring = list(signals.get("recurring_critiques", []))
-    if recurring:
-        parts.append(f"Recurring critiques: {', '.join(recurring)}.")
-    unresolved = list(signals_artifact.get("unresolved_flags", []))
-    parts.append(f"{len(unresolved)} unresolved significant flag(s) remain.")
-    if all(signals_artifact["preflight_results"].values()):
-        parts.append("Preflight is clean.")
-    else:
-        blocked = ", ".join(
-            name for name, passed in signals_artifact["preflight_results"].items() if not passed
-        )
-        parts.append(f"Preflight is blocked by: {blocked}.")
-    return " ".join(parts)
-
-
-def _maybe_fast_forward_light_plan(
-    *,
-    root: Path,
-    plan_dir: Path,
-    state: PlanState,
-    payload: dict[str, Any],
-    version: int,
-    plan_filename: str,
-    meta_filename: str,
-) -> StepResponse | None:
-    if configured_robustness(state) != "light":
-        return None
-    if not isinstance(payload.get("self_flags"), list):
-        return None
-    recommendation = payload.get("gate_recommendation")
-    if recommendation not in {"PROCEED", "ITERATE", "ESCALATE"}:
-        return None
-
-    critique_payload = {
-        "flags": payload.get("self_flags", []),
-        "verified_flag_ids": [],
-        "disputed_flag_ids": [],
-    }
-    critique_filename = f"critique_v{version}.json"
-    atomic_write_json(plan_dir / critique_filename, critique_payload)
-    registry = update_flags_after_critique(plan_dir, critique_payload, iteration=version)
-    significant = len(
-        [
-            flag
-            for flag in registry["flags"]
-            if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES
-        ]
-    )
-    _append_to_meta(state, "significant_counts", significant)
-    recurring = compute_recurring_critiques(plan_dir, version)
-    _append_to_meta(state, "recurring_critiques", recurring)
-    state["current_state"] = STATE_CRITIQUED
-    append_history(
-        state,
-        make_history_entry(
-            "critique",
-            duration_ms=0,
-            cost_usd=0.0,
-            result="success",
-            output_file=critique_filename,
-            artifact_hash=sha256_file(plan_dir / critique_filename),
-            flags_count=len(critique_payload["flags"]),
-            message="Synthetic light-mode critique generated from the combined plan output.",
-        ),
-    )
-
-    gate_signals = build_gate_signals(plan_dir, state, root=root)
-    gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
-    signals_artifact = {
-        "robustness": gate_signals["robustness"],
-        "signals": gate_signals["signals"],
-        "warnings": gate_signals.get("warnings", []),
-        "criteria_check": gate_checks["criteria_check"],
-        "preflight_results": gate_checks["preflight_results"],
-        "unresolved_flags": gate_checks["unresolved_flags"],
-    }
-    signals_filename = f"gate_signals_v{version}.json"
-    atomic_write_json(plan_dir / signals_filename, signals_artifact)
-    gate_payload = {
-        "recommendation": recommendation,
-        "rationale": payload.get("gate_rationale", ""),
-        "signals_assessment": _synthetic_signals_assessment(signals_artifact),
-        "warnings": [],
-        "settled_decisions": payload.get("settled_decisions", []),
-    }
-    guidance = build_orchestrator_guidance(
-        gate_payload=gate_payload,
-        signals=signals_artifact["signals"],
-        preflight_passed=all(signals_artifact["preflight_results"].values()),
-        preflight_results=signals_artifact["preflight_results"],
-        robustness=signals_artifact.get("robustness", "standard"),
-        plan_name=state["name"],
-    )
-    gate_summary = build_gate_artifact(
-        signals_artifact,
-        gate_payload,
-        override_forced=False,
-        orchestrator_guidance=guidance,
-    )
-    atomic_write_json(plan_dir / "gate.json", gate_summary)
-    _store_last_gate(state, gate_summary)
-    if len(state["meta"].get("weighted_scores", [])) < version:
-        _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
-    result, next_step, gate_summary_text = _apply_gate_outcome(
-        state,
-        gate_summary,
-        robustness=gate_signals["robustness"],
-    )
-    append_history(
-        state,
-        make_history_entry(
-            "gate",
-            duration_ms=0,
-            cost_usd=0.0,
-            result=result,
-            output_file="gate.json",
-            artifact_hash=sha256_file(plan_dir / "gate.json"),
-            recommendation=gate_summary["recommendation"],
-            message="Synthetic light-mode gate generated from the combined plan output.",
-        ),
-    )
-    return {
-        "success": gate_summary["recommendation"] != "PROCEED" or gate_summary["passed"],
-        "step": "plan",
-        "iteration": version,
-        "summary": (
-            f"Generated light robustness plan v{version} with {len(payload['questions'])} questions and "
-            f"{len(payload['success_criteria'])} success criteria. {gate_summary_text}"
-        ),
-        "artifacts": [plan_filename, meta_filename, critique_filename, "faults.json", signals_filename, "gate.json"],
-        "next_step": next_step,
-        "state": state["current_state"],
-        "questions": payload["questions"],
-        "assumptions": payload["assumptions"],
-        "success_criteria": payload["success_criteria"],
-        "recommendation": gate_summary["recommendation"],
-        "rationale": gate_summary["rationale"],
-        "signals_assessment": gate_summary["signals_assessment"],
-        "warnings": gate_summary["warnings"],
-        "passed": gate_summary["passed"],
-        "criteria_check": gate_summary["criteria_check"],
-        "preflight_results": gate_summary["preflight_results"],
-        "unresolved_flags": gate_summary["unresolved_flags"],
-        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
-        "signals": gate_summary["signals"],
-    }
 
 
 def handle_step(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -902,31 +747,21 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
             artifact_hash=meta["hash"],
         ),
     )
-    response = _maybe_fast_forward_light_plan(
-        root=root,
-        plan_dir=plan_dir,
-        state=state,
-        payload=payload,
-        version=version,
-        plan_filename=plan_filename,
-        meta_filename=meta_filename,
-    )
-    if response is None:
-        response = {
-            "success": True,
-            "step": "plan",
-            "iteration": version,
-            "summary": (
-                f"{'Refined' if rerun else 'Generated'} plan v{version} with "
-                f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
-            ),
-            "artifacts": [plan_filename, meta_filename],
-            "next_step": "critique",
-            "state": STATE_PLANNED,
-            "questions": payload["questions"],
-            "assumptions": payload["assumptions"],
-            "success_criteria": payload["success_criteria"],
-        }
+    response: StepResponse = {
+        "success": True,
+        "step": "plan",
+        "iteration": version,
+        "summary": (
+            f"{'Refined' if rerun else 'Generated'} plan v{version} with "
+            f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
+        ),
+        "artifacts": [plan_filename, meta_filename],
+        "next_step": "critique",
+        "state": STATE_PLANNED,
+        "questions": payload["questions"],
+        "assumptions": payload["assumptions"],
+        "success_criteria": payload["success_criteria"],
+    }
     save_state(plan_dir, state)
     attach_agent_fallback(response, args)
     return response
@@ -972,7 +807,22 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
             flags_count=len(worker.payload.get("flags", [])),
         ),
     )
+    robustness = configured_robustness(state)
+    skip_gate = not workflow_includes_step(robustness, "gate")
+    if skip_gate:
+        # Light robustness: skip gate, go straight to revise.
+        # Write a minimal gate.json so the revise prompt can reference it.
+        minimal_gate: dict[str, Any] = {
+            "recommendation": "ITERATE",
+            "rationale": "Light robustness: single revision pass to incorporate critique feedback.",
+            "signals_assessment": "",
+            "warnings": [],
+            "settled_decisions": [],
+        }
+        atomic_write_json(plan_dir / "gate.json", minimal_gate)
+        state["last_gate"] = {"recommendation": "ITERATE"}
     save_state(plan_dir, state)
+    next_steps = workflow_next(state)
     scope_flags_list = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
     open_flags_detail = [
         {
@@ -990,7 +840,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         "iteration": iteration,
         "summary": f"Recorded {len(worker.payload.get('flags', []))} critique flags.",
         "artifacts": [critique_filename, "faults.json"],
-        "next_step": "gate",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
         "open_flags": open_flags_detail,
@@ -1007,10 +857,19 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
 def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "revise", {STATE_CRITIQUED})
-    if state["last_gate"].get("recommendation") != "ITERATE":
+    robustness = configured_robustness(state)
+    has_gate = workflow_includes_step(robustness, "gate")
+    if has_gate and state["last_gate"].get("recommendation") != "ITERATE":
         raise CliError(
             "invalid_transition",
             "Revise requires a gate recommendation of ITERATE",
+            valid_next=infer_next_steps(state),
+        )
+    revise_transition = workflow_transition(state, "revise")
+    if revise_transition is None:
+        raise CliError(
+            "invalid_transition",
+            "Revise is not available from the current workflow state",
             valid_next=infer_next_steps(state),
         )
     previous_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
@@ -1049,9 +908,10 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     }
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
-    state["current_state"] = STATE_PLANNED
+    state["current_state"] = revise_transition.next_state
     state["meta"].pop("user_approved_gate", None)
-    state["last_gate"] = {}
+    if has_gate:
+        state["last_gate"] = {}
     state["plan_versions"].append(
         {"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
     )
@@ -1079,6 +939,7 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
+    next_step = workflow_primary_next(state)
     updated_registry = load_flag_registry(plan_dir)
     remaining = [
         {
@@ -1095,8 +956,8 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
         "iteration": version,
         "summary": f"Updated plan to v{version}; addressed {len(payload['flags_addressed'])} flags.",
         "artifacts": [plan_filename, meta_filename, "faults.json"],
-        "next_step": "critique",
-        "state": STATE_PLANNED,
+        "next_step": next_step,
+        "state": state["current_state"],
         "changes_summary": payload["changes_summary"],
         "flags_addressed": payload["flags_addressed"],
         "flags_remaining": remaining,
@@ -1304,12 +1165,12 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             "missing_approval",
             "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
         )
-    agent, mode, refreshed = worker_module.resolve_agent_mode("execute", args)
+    agent, mode, refreshed, model = worker_module.resolve_agent_mode("execute", args)
     # Force fresh session after review kickback to avoid prior-context bias
     if not refreshed and _is_rework_reexecution(state):
         refreshed = True
     if getattr(args, "batch", None) is not None:
-        return dispatch_execute_one_batch(
+        response = dispatch_execute_one_batch(
             root=root,
             plan_dir=plan_dir,
             state=state,
@@ -1319,6 +1180,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             agent=agent,
             mode=mode,
             refreshed=refreshed,
+            model=model,
             apply_session_update_fn=apply_session_update,
             append_history_fn=append_history,
             make_history_entry_fn=make_history_entry,
@@ -1328,24 +1190,32 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             record_step_failure_fn=record_step_failure,
             capture_git_status_snapshot_fn=_capture_git_status_snapshot,
         )
-    return dispatch_execute_auto_loop(
-        root=root,
-        plan_dir=plan_dir,
-        state=state,
-        args=args,
-        auto_approve=auto_approve,
-        agent=agent,
-        mode=mode,
-        refreshed=refreshed,
-        apply_session_update_fn=apply_session_update,
-        append_history_fn=append_history,
-        make_history_entry_fn=make_history_entry,
-        save_state_fn=save_state,
-        attach_agent_fallback_fn=attach_agent_fallback,
-        store_raw_worker_output_fn=store_raw_worker_output,
-        record_step_failure_fn=record_step_failure,
-        capture_git_status_snapshot_fn=_capture_git_status_snapshot,
-    )
+    else:
+        response = dispatch_execute_auto_loop(
+            root=root,
+            plan_dir=plan_dir,
+            state=state,
+            args=args,
+            auto_approve=auto_approve,
+            agent=agent,
+            mode=mode,
+            refreshed=refreshed,
+            model=model,
+            apply_session_update_fn=apply_session_update,
+            append_history_fn=append_history,
+            make_history_entry_fn=make_history_entry,
+            save_state_fn=save_state,
+            attach_agent_fallback_fn=attach_agent_fallback,
+            store_raw_worker_output_fn=store_raw_worker_output,
+            record_step_failure_fn=record_step_failure,
+            capture_git_status_snapshot_fn=_capture_git_status_snapshot,
+        )
+    if not workflow_includes_step(configured_robustness(state), "review") and response.get("state") == STATE_EXECUTED:
+        state["current_state"] = STATE_DONE
+        save_state(plan_dir, state)
+        response["state"] = STATE_DONE
+        response["next_step"] = None
+    return response
 
 
 def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:

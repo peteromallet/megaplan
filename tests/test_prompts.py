@@ -29,7 +29,7 @@ def _state(project_dir: Path, *, iteration: int = 1) -> PlanState:
         "config": {
             "project_dir": str(project_dir),
             "auto_approve": False,
-            "robustness": "thorough",
+            "robustness": "standard",
         },
         "sessions": {},
         "plan_versions": [
@@ -81,7 +81,7 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     atomic_write_json(
         plan_dir / f"gate_signals_v{iteration}.json",
         {
-            "robustness": "thorough",
+            "robustness": "standard",
             "signals": {
                 "iteration": iteration,
                 "weighted_score": 2.0,
@@ -134,7 +134,7 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
             },
             "unresolved_flags": [],
             "override_forced": False,
-            "robustness": "thorough",
+            "robustness": "standard",
             "signals": {"loop_summary": "Iteration summary"},
         },
     )
@@ -252,15 +252,14 @@ def test_plan_prompt_absorbs_clarification_when_missing(tmp_path: Path) -> None:
     assert state["idea"] in prompt
 
 
-def test_light_plan_prompt_requests_combined_gate_fields(tmp_path: Path) -> None:
+def test_light_plan_prompt_uses_normal_plan_prompt(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     state["config"]["robustness"] = "light"
     prompt = create_claude_prompt("plan", state, plan_dir)
-    assert "self_flags" in prompt
-    assert "gate_recommendation" in prompt
-    assert "gate_rationale" in prompt
-    assert "settled_decisions" in prompt
-    assert "PROCEED, ITERATE, ESCALATE" in prompt
+    # Light now uses the standard plan prompt, no self_flags or gate fields
+    assert "self_flags" not in prompt
+    assert "gate_recommendation" not in prompt
+    assert "plan" in prompt.lower()
 
 
 def test_plan_prompt_uses_existing_clarification_context(tmp_path: Path) -> None:
@@ -313,7 +312,6 @@ def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
     assert "Gate summary" in prompt
     assert "Execution summary" in prompt
     assert "Execution tracking state (`finalize.json`)" in prompt
-    assert "line by line" in prompt.lower()
 
 
 def test_plan_prompt_is_nonempty(tmp_path: Path) -> None:
@@ -337,7 +335,7 @@ def test_critique_prompt_contains_intent_and_robustness(tmp_path: Path) -> None:
     prompt = create_claude_prompt("critique", state, plan_dir)
     assert state["idea"] in prompt
     assert "Robustness level" in prompt
-    assert "thorough" in prompt
+    assert "standard" in prompt
     assert "simplest approach" in prompt
     assert "Over-engineering:" in prompt
     assert "maintainability" in prompt
@@ -678,7 +676,7 @@ def test_review_prompt_includes_settled_decisions_when_present(tmp_path: Path) -
             },
             "unresolved_flags": [],
             "override_forced": False,
-            "robustness": "thorough",
+            "robustness": "standard",
             "signals": {"loop_summary": "Iteration summary"},
         },
     )

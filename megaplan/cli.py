@@ -419,6 +419,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--name")
     init_parser.add_argument("--auto-approve", action="store_true")
     init_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default="standard")
+    init_parser.add_argument("--hermes", nargs="?", const="", default=None,
+                             help="Use Hermes agent for all phases. Optional: specify default model")
+    init_parser.add_argument("--phase-model", action="append", default=[],
+                             help="Per-phase model override: --phase-model critique=hermes:openai/gpt-5")
     init_parser.add_argument("idea")
 
     subparsers.add_parser("list")
@@ -430,7 +434,11 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ["plan", "critique", "revise", "gate", "finalize", "execute", "review"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
-        step_parser.add_argument("--agent", choices=["claude", "codex"])
+        step_parser.add_argument("--agent", choices=["claude", "codex", "hermes"])
+        step_parser.add_argument("--hermes", nargs="?", const="", default=None,
+                                 help="Use Hermes agent for all phases. Optional: specify default model (e.g. --hermes anthropic/claude-sonnet-4.6)")
+        step_parser.add_argument("--phase-model", action="append", default=[],
+                                 help="Per-phase model override: --phase-model critique=hermes:openai/gpt-5")
         step_parser.add_argument("--fresh", action="store_true")
         step_parser.add_argument("--persist", action="store_true")
         step_parser.add_argument("--ephemeral", action="store_true")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from megaplan.types import (
     MOCK_ENV_VAR,
     PlanState,
     SessionInfo,
+    parse_agent_spec,
 )
 from megaplan._core import (
     detect_available_agents,
@@ -285,23 +287,6 @@ def _default_mock_plan_payload(state: PlanState, plan_dir: Path) -> dict[str, An
         ],
         "assumptions": ["The project directory is writable."],
     }
-    if state["config"].get("robustness") == "light":
-        payload.update(
-            {
-                "self_flags": [
-                    {
-                        "id": "FLAG-101",
-                        "concern": "The mock plan assumes the existing repo structure stays stable while wiring the light-path checks.",
-                        "category": "maintainability",
-                        "severity_hint": "likely-minor",
-                        "evidence": "The plan intentionally stays narrow and leans on current handler boundaries.",
-                    }
-                ],
-                "gate_recommendation": "PROCEED",
-                "gate_rationale": "The combined plan is concrete enough to execute and the remaining self-flag is minor.",
-                "settled_decisions": [],
-            }
-        )
     return payload
 
 
@@ -626,23 +611,27 @@ def mock_worker_output(
     return handler(state, plan_dir)
 
 
-def session_key_for(step: str, agent: str) -> str:
+def session_key_for(step: str, agent: str, model: str | None = None) -> str:
     if step in {"plan", "revise"}:
-        return f"{agent}_planner"
-    if step == "critique":
-        return f"{agent}_critic"
-    if step == "gate":
-        return f"{agent}_gatekeeper"
-    if step == "finalize":
-        return f"{agent}_finalizer"
-    if step == "execute":
-        return f"{agent}_executor"
-    if step == "review":
-        return f"{agent}_reviewer"
-    return f"{agent}_{step}"
+        key = f"{agent}_planner"
+    elif step == "critique":
+        key = f"{agent}_critic"
+    elif step == "gate":
+        key = f"{agent}_gatekeeper"
+    elif step == "finalize":
+        key = f"{agent}_finalizer"
+    elif step == "execute":
+        key = f"{agent}_executor"
+    elif step == "review":
+        key = f"{agent}_reviewer"
+    else:
+        key = f"{agent}_{step}"
+    if model:
+        key += f"_{hashlib.sha256(model.encode()).hexdigest()[:8]}"
+    return key
 
 
-def update_session_state(step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool, existing_sessions: dict[str, Any] | None = None) -> tuple[str, SessionInfo] | None:
+def update_session_state(step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool, model: str | None = None, existing_sessions: dict[str, Any] | None = None) -> tuple[str, SessionInfo] | None:
     """Build a session entry for the given step.
 
     Returns ``(key, entry)`` so the caller can store it on the state dict,
@@ -650,7 +639,7 @@ def update_session_state(step: str, agent: str, session_id: str | None, *, mode:
     """
     if not session_id:
         return None
-    key = session_key_for(step, agent)
+    key = session_key_for(step, agent, model=model)
     if existing_sessions is None:
         existing_sessions = {}
     entry = {
@@ -797,35 +786,87 @@ def run_codex_step(
     )
 
 
-def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None = None) -> tuple[str, str, bool]:
-    """Returns (agent, mode, refreshed).
+def _is_agent_available(agent: str) -> bool:
+    """Check if an agent is available (CLI binary or importable for hermes)."""
+    if agent == "hermes":
+        try:
+            import run_agent  # noqa: F401
+            return True
+        except ImportError:
+            return False
+    return bool(shutil.which(agent))
+
+
+def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None = None) -> tuple[str, str, bool, str | None]:
+    """Returns (agent, mode, refreshed, model).
 
     Both agents default to persistent sessions.  Use --fresh to start a new
     persistent session (break continuity) or --ephemeral for a truly one-off
     call with no session saved.
+
+    The model is extracted from compound agent specs (e.g. 'hermes:openai/gpt-5')
+    or from --phase-model / --hermes CLI flags. None means use agent default.
     """
-    explicit = args.agent
-    if explicit:
-        if not shutil.which(explicit):
-            raise CliError("agent_not_found", f"Agent '{explicit}' not found on PATH")
-        agent = explicit
+    model = None
+
+    # Check --phase-model overrides first (highest priority)
+    phase_models = getattr(args, "phase_model", None) or []
+    for pm in phase_models:
+        if "=" in pm:
+            pm_step, pm_spec = pm.split("=", 1)
+            if pm_step == step:
+                agent, model = parse_agent_spec(pm_spec)
+                break
     else:
-        config = load_config(home)
-        agent = config.get("agents", {}).get(step) or DEFAULT_AGENT_ROUTING[step]
-        if not shutil.which(agent):
-            available = detect_available_agents()
-            if not available:
-                raise CliError(
-                    "agent_not_found",
-                    "No supported agents found on PATH. Install claude or codex.",
-                )
-            fallback = available[0]
-            args._agent_fallback = {
-                "requested": agent,
-                "resolved": fallback,
-                "reason": f"{agent} not found on PATH",
-            }
-            agent = fallback
+        # Check --hermes flag
+        hermes_flag = getattr(args, "hermes", None)
+        if hermes_flag is not None:
+            agent = "hermes"
+            if isinstance(hermes_flag, str) and hermes_flag:
+                model = hermes_flag
+        else:
+            # Check explicit --agent flag
+            explicit = args.agent
+            if explicit:
+                agent, model = parse_agent_spec(explicit)
+            else:
+                # Fall back to config / defaults
+                config = load_config(home)
+                spec = config.get("agents", {}).get(step) or DEFAULT_AGENT_ROUTING[step]
+                agent, model = parse_agent_spec(spec)
+
+    # Validate agent availability
+    explicit_agent = args.agent  # was an explicit --agent flag used?
+    if not _is_agent_available(agent):
+        # If explicitly requested (via --agent), fail immediately
+        if explicit_agent and not any(pm.startswith(f"{step}=") for pm in (getattr(args, "phase_model", None) or [])):
+            if agent == "hermes":
+                from megaplan.hermes_worker import check_hermes_available
+                ok, msg = check_hermes_available()
+                raise CliError("agent_not_found", msg if not ok else f"Agent '{agent}' not found")
+            raise CliError("agent_not_found", f"Agent '{agent}' not found on PATH")
+        # For hermes via --hermes flag, give a specific error
+        if getattr(args, "hermes", None) is not None or agent == "hermes":
+            from megaplan.hermes_worker import check_hermes_available
+            ok, msg = check_hermes_available()
+            if not ok:
+                raise CliError("agent_not_found", msg)
+        # Try fallback
+        available = detect_available_agents()
+        if not available:
+            raise CliError(
+                "agent_not_found",
+                "No supported agents found. Install claude, codex, or hermes-agent.",
+            )
+        fallback = available[0]
+        args._agent_fallback = {
+            "requested": agent,
+            "resolved": fallback,
+            "reason": f"{agent} not available",
+        }
+        agent = fallback
+        model = None  # Reset model when falling back
+
     ephemeral = getattr(args, "ephemeral", False)
     fresh = getattr(args, "fresh", False)
     persist = getattr(args, "persist", False)
@@ -833,7 +874,7 @@ def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None
     if conflicting > 1:
         raise CliError("invalid_args", "Cannot combine --fresh, --persist, and --ephemeral")
     if ephemeral:
-        return agent, "ephemeral", True
+        return agent, "ephemeral", True, model
     refreshed = fresh
     # Review with Claude: default to fresh to avoid self-bias (principle #5)
     if step == "review" and agent == "claude":
@@ -841,7 +882,7 @@ def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None
             raise CliError("invalid_args", "Claude review requires --confirm-self-review when using --persist")
         if not persist:
             refreshed = True
-    return agent, "persistent", refreshed
+    return agent, "persistent", refreshed, model
 
 
 def run_step_with_worker(
@@ -851,11 +892,23 @@ def run_step_with_worker(
     args: argparse.Namespace,
     *,
     root: Path,
-    resolved: tuple[str, str, bool] | None = None,
+    resolved: tuple[str, str, bool, str | None] | None = None,
     prompt_override: str | None = None,
 ) -> tuple[WorkerResult, str, str, bool]:
-    agent, mode, refreshed = resolved or resolve_agent_mode(step, args)
-    if agent == "claude":
+    agent, mode, refreshed, model = resolved or resolve_agent_mode(step, args)
+    if agent == "hermes":
+        # Deferred import to avoid circular import (hermes_worker imports from workers)
+        from megaplan.hermes_worker import run_hermes_step
+        worker = run_hermes_step(
+            step,
+            state,
+            plan_dir,
+            root=root,
+            fresh=refreshed,
+            model=model,
+            prompt_override=prompt_override,
+        )
+    elif agent == "claude":
         worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed, prompt_override=prompt_override)
     else:
         worker = run_codex_step(

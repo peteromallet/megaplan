@@ -30,6 +30,8 @@ def _make_args(**overrides: object) -> Namespace:
         "fresh": False,
         "persist": False,
         "confirm_self_review": False,
+        "hermes": None,
+        "phase_model": [],
     }
     data.update(overrides)
     return Namespace(**data)
@@ -179,7 +181,7 @@ def test_resolve_agent_mode_uses_configured_fallback() -> None:
         with patch("megaplan.workers.detect_available_agents", return_value=["codex"]):
             with patch("megaplan.workers.load_config", return_value={"agents": {"plan": "claude"}}):
                 args = _make_args()
-                agent, mode, refreshed = resolve_agent_mode("plan", args)
+                agent, mode, refreshed, model = resolve_agent_mode("plan", args)
     assert agent == "codex"
     assert mode == "persistent"
     assert refreshed is False
@@ -188,7 +190,7 @@ def test_resolve_agent_mode_uses_configured_fallback() -> None:
 
 def test_resolve_agent_mode_for_review_claude_defaults_to_fresh() -> None:
     with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
-        agent, mode, refreshed = resolve_agent_mode("review", _make_args(agent="claude"))
+        agent, mode, refreshed, model = resolve_agent_mode("review", _make_args(agent="claude"))
     assert agent == "claude"
     assert mode == "persistent"
     assert refreshed is True
@@ -474,14 +476,14 @@ def test_step_schema_filenames_reference_existing_schemas() -> None:
 
 def test_resolve_agent_mode_cli_flag_override() -> None:
     with patch("megaplan.workers.shutil.which", return_value="/usr/bin/codex"):
-        agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="codex"))
+        agent, mode, refreshed, model = resolve_agent_mode("plan", _make_args(agent="codex"))
     assert agent == "codex"
 
 
 def test_resolve_agent_mode_config_override() -> None:
     with patch("megaplan.workers.shutil.which", return_value="/usr/bin/codex"):
         with patch("megaplan.workers.load_config", return_value={"agents": {"plan": "codex"}}):
-            agent, mode, refreshed = resolve_agent_mode("plan", _make_args())
+            agent, mode, refreshed, model = resolve_agent_mode("plan", _make_args())
     assert agent == "codex"
 
 
@@ -507,7 +509,7 @@ def test_resolve_agent_mode_conflicting_flags_raises() -> None:
 
 def test_resolve_agent_mode_ephemeral_mode() -> None:
     with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
-        agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="claude", ephemeral=True))
+        agent, mode, refreshed, model = resolve_agent_mode("plan", _make_args(agent="claude", ephemeral=True))
     assert mode == "ephemeral"
     assert refreshed is True
 
@@ -717,7 +719,7 @@ def test_run_step_with_worker_passes_prompt_override(tmp_path: Path) -> None:
             plan_dir,
             _make_args(agent="codex"),
             root=tmp_path,
-            resolved=("codex", "persistent", False),
+            resolved=("codex", "persistent", False, None),
             prompt_override="custom execute prompt",
         )
     assert run_codex.call_args.kwargs["prompt_override"] == "custom execute prompt"

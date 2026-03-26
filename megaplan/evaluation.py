@@ -643,11 +643,6 @@ def build_orchestrator_guidance(
             name for name, passed in preflight_results.items() if not passed
         )
         guidance = f"Gate says PROCEED but preflight blocked. Fix: {failing_checks}."
-    elif recommendation == "ESCALATE" and robustness == "light" and weighted_score <= 4.0:
-        guidance = (
-            "Auto-force-proceed eligible. Run: "
-            f'`megaplan override force-proceed --plan {plan_name} --reason "light robustness, score {weighted_score}"`'
-        )
     elif recommendation == "ESCALATE":
         guidance = "Gate escalated. Ask the user: force-proceed, add-note, or abort."
     elif recommendation == "ITERATE" and plateaued and recurring_critiques:

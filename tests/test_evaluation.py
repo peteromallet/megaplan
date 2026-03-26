@@ -879,20 +879,6 @@ def test_build_orchestrator_guidance_proceed_with_preflight_failure_lists_checks
     assert "Gate says PROCEED but preflight blocked. Fix: project_dir_writable, success_criteria_present." in guidance
 
 
-def test_build_orchestrator_guidance_escalate_auto_force_uses_plan_name_and_score() -> None:
-    guidance = build_orchestrator_guidance(
-        gate_payload={"recommendation": "ESCALATE"},
-        signals=_signals(weighted_score=4.0, weighted_history=[5.0]),
-        preflight_passed=True,
-        preflight_results={"project_dir_exists": True},
-        robustness="light",
-        plan_name="demo-plan",
-    )
-    assert "Auto-force-proceed eligible." in guidance
-    assert "megaplan override force-proceed --plan demo-plan" in guidance
-    assert 'light robustness, score 4.0' in guidance
-
-
 def test_build_orchestrator_guidance_escalate_requires_user_decision_when_not_auto_force() -> None:
     guidance = build_orchestrator_guidance(
         gate_payload={"recommendation": "ESCALATE"},
@@ -1019,7 +1005,7 @@ def test_build_gate_signals_emits_scope_creep_and_high_iteration_warnings(tmp_pa
         }
     ]
     plan_dir, state = _scaffold(tmp_path, iteration=12, flags=flags)
-    state["config"]["robustness"] = "thorough"
+    state["config"]["robustness"] = "standard"
     result = build_gate_signals(plan_dir, state)
     assert any("Scope creep detected" in warning for warning in result["warnings"])
     assert any("hard iteration limit reached" in warning for warning in result["warnings"])

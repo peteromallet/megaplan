@@ -13,50 +13,6 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "questions": {"type": "array", "items": {"type": "string"}},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
             "assumptions": {"type": "array", "items": {"type": "string"}},
-            "self_flags": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "concern": {"type": "string"},
-                        "category": {
-                            "type": "string",
-                            "enum": [
-                                "correctness",
-                                "security",
-                                "completeness",
-                                "performance",
-                                "maintainability",
-                                "other",
-                            ],
-                        },
-                        "severity_hint": {
-                            "type": "string",
-                            "enum": ["likely-significant", "likely-minor", "uncertain"],
-                        },
-                        "evidence": {"type": "string"},
-                    },
-                    "required": ["id", "concern", "category", "severity_hint", "evidence"],
-                },
-            },
-            "gate_recommendation": {
-                "type": "string",
-                "enum": ["PROCEED", "ITERATE", "ESCALATE"],
-            },
-            "gate_rationale": {"type": "string"},
-            "settled_decisions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "decision": {"type": "string"},
-                        "rationale": {"type": "string"},
-                    },
-                    "required": ["id", "decision"],
-                },
-            },
         },
         "required": ["plan", "questions", "success_criteria", "assumptions"],
     },

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,9 @@ from megaplan.types import (
     PlanVersionRecord,
     ROBUSTNESS_LEVELS,
     SCOPE_CREEP_TERMS,
+    STATE_ABORTED,
     STATE_CRITIQUED,
+    STATE_DONE,
     STATE_EXECUTED,
     STATE_FINALIZED,
     STATE_GATED,
@@ -265,7 +268,14 @@ def save_config(config: dict[str, Any], home: Path | None = None) -> Path:
 
 
 def detect_available_agents() -> list[str]:
-    return [a for a in KNOWN_AGENTS if shutil.which(a)]
+    available = [a for a in KNOWN_AGENTS if a != "hermes" and shutil.which(a)]
+    # Hermes is a Python library, not a CLI binary
+    try:
+        import run_agent  # noqa: F401
+        available.append("hermes")
+    except ImportError:
+        pass
+    return available
 
 
 # ---------------------------------------------------------------------------
@@ -602,8 +612,6 @@ def configured_robustness(state: PlanState) -> str:
 def robustness_critique_instruction(robustness: str) -> str:
     if robustness == "light":
         return "Be pragmatic. Only flag issues that would cause real failures. Ignore style, minor edge cases, and issues the executor will naturally resolve."
-    if robustness == "thorough":
-        return "Be exhaustive. Flag edge cases, missing error handling, performance concerns, and anything that could cause problems in production even if unlikely."
     return "Use balanced judgment. Flag significant risks, but do not spend flags on minor polish or executor-obvious boilerplate."
 
 
@@ -654,31 +662,157 @@ def collect_git_diff_summary(project_dir: Path) -> str:
 # State machine
 # ---------------------------------------------------------------------------
 
-def infer_next_steps(state: PlanState) -> list[str]:
-    current = state["current_state"]
-    if current == STATE_INITIALIZED:
-        return ["plan"]
-    if current == STATE_PLANNED:
-        return ["plan", "critique", "step"]
-    if current == STATE_CRITIQUED:
-        gate = state.get("last_gate", {})
-        recommendation = gate.get("recommendation")
-        if not recommendation:
-            return ["gate", "step"]
-        if recommendation == "ITERATE":
-            return ["revise", "step"]
-        if recommendation == "ESCALATE":
-            return ["override add-note", "override force-proceed", "override abort", "step"]
-        if recommendation == "PROCEED" and not gate.get("passed", False):
-            return ["revise", "override force-proceed", "step"]
-        return ["gate", "step"]
-    if current == STATE_GATED:
-        return ["finalize", "override replan", "step"]
-    if current == STATE_FINALIZED:
-        return ["execute", "override replan", "step"]
-    if current == STATE_EXECUTED:
-        return ["review"]
-    return []
+@dataclass(frozen=True)
+class Transition:
+    next_step: str
+    next_state: str
+    condition: str = "always"
+
+
+WORKFLOW: dict[str, list[Transition]] = {
+    STATE_INITIALIZED: [
+        Transition("plan", STATE_PLANNED),
+    ],
+    STATE_PLANNED: [
+        Transition("plan", STATE_PLANNED),
+        Transition("critique", STATE_CRITIQUED),
+    ],
+    STATE_CRITIQUED: [
+        Transition("gate", STATE_GATED, "gate_unset"),
+        Transition("revise", STATE_PLANNED, "gate_iterate"),
+        Transition("override add-note", STATE_CRITIQUED, "gate_escalate"),
+        Transition("override force-proceed", STATE_GATED, "gate_escalate"),
+        Transition("override abort", STATE_ABORTED, "gate_escalate"),
+        Transition("revise", STATE_PLANNED, "gate_proceed_blocked"),
+        Transition("override force-proceed", STATE_GATED, "gate_proceed_blocked"),
+        Transition("gate", STATE_GATED, "gate_fallback"),
+    ],
+    STATE_GATED: [
+        Transition("finalize", STATE_FINALIZED),
+        Transition("override replan", STATE_PLANNED),
+    ],
+    STATE_FINALIZED: [
+        Transition("execute", STATE_EXECUTED),
+        Transition("override replan", STATE_PLANNED),
+    ],
+    STATE_EXECUTED: [
+        Transition("review", STATE_DONE),
+    ],
+}
+
+WORKFLOW_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
+    "light": {
+        STATE_CRITIQUED: [
+            Transition("revise", STATE_GATED),
+        ],
+        STATE_EXECUTED: [],
+    },
+}
+
+_STEP_CONTEXT_STATES = {
+    STATE_PLANNED,
+    STATE_CRITIQUED,
+    STATE_GATED,
+    STATE_FINALIZED,
+}
+
+
+def _normalize_workflow_robustness(robustness: Any) -> str:
+    if robustness in ROBUSTNESS_LEVELS:
+        return str(robustness)
+    return "standard"
+
+
+def _workflow_robustness_from_state(state: PlanState) -> str:
+    config = state.get("config", {})
+    if not isinstance(config, dict):
+        return "standard"
+    return _normalize_workflow_robustness(config.get("robustness", "standard"))
+
+
+def _workflow_for_robustness(robustness: str) -> dict[str, list[Transition]]:
+    normalized = _normalize_workflow_robustness(robustness)
+    return {
+        **WORKFLOW,
+        **WORKFLOW_OVERRIDES.get(normalized, {}),
+    }
+
+
+def _transition_matches(state: PlanState, condition: str) -> bool:
+    if condition == "always":
+        return True
+    gate = state.get("last_gate", {})
+    if not isinstance(gate, dict):
+        gate = {}
+    recommendation = gate.get("recommendation")
+    if condition == "gate_unset":
+        return not recommendation
+    if condition == "gate_iterate":
+        return recommendation == "ITERATE"
+    if condition == "gate_escalate":
+        return recommendation == "ESCALATE"
+    if condition == "gate_proceed_blocked":
+        return recommendation == "PROCEED" and not gate.get("passed", False)
+    if condition == "gate_fallback":
+        return bool(recommendation) and recommendation != "ITERATE" and recommendation != "ESCALATE" and not (
+            recommendation == "PROCEED" and not gate.get("passed", False)
+        )
+    return False
+
+
+def workflow_includes_step(robustness: str, step: str) -> bool:
+    if step == "step":
+        return True
+    workflow = _workflow_for_robustness(robustness)
+    return any(
+        transition.next_step == step
+        for transitions in workflow.values()
+        for transition in transitions
+    )
+
+
+def workflow_transition(state: PlanState, step: str) -> Transition | None:
+    current = state.get("current_state")
+    if not isinstance(current, str):
+        return None
+    workflow = _workflow_for_robustness(_workflow_robustness_from_state(state))
+    for transition in workflow.get(current, []):
+        if transition.next_step == step and _transition_matches(state, transition.condition):
+            return transition
+    return None
+
+
+def workflow_primary_next(state: PlanState) -> str | None:
+    current = state.get("current_state")
+    if not isinstance(current, str):
+        return None
+    workflow = _workflow_for_robustness(_workflow_robustness_from_state(state))
+    for transition in workflow.get(current, []):
+        if not _transition_matches(state, transition.condition):
+            continue
+        if transition.next_state == current:
+            continue
+        return transition.next_step
+    next_steps = workflow_next(state)
+    return next_steps[0] if next_steps else None
+
+
+def workflow_next(state: PlanState) -> list[str]:
+    current = state.get("current_state")
+    if not isinstance(current, str):
+        return []
+    workflow = _workflow_for_robustness(_workflow_robustness_from_state(state))
+    next_steps = [
+        transition.next_step
+        for transition in workflow.get(current, [])
+        if _transition_matches(state, transition.condition)
+    ]
+    if current in _STEP_CONTEXT_STATES:
+        next_steps.append("step")
+    return next_steps
+
+
+infer_next_steps = workflow_next
 
 
 def require_state(state: PlanState, step: str, allowed: set[str]) -> None:

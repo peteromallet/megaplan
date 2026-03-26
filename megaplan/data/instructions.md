@@ -1,15 +1,16 @@
 # Megaplan
 Route every step through the `megaplan` CLI. Never call agents directly.
 ## Triage
-- Simple tasks: skip megaplan and do the work.
-- Complex, risky, or ambiguous tasks: use megaplan.
-- Unsure: ask whether the user wants direct execution or the planning loop.
+Pick the right level based on the task:
+- **Skip megaplan**: single-file fixes, bug fixes with clear cause, simple refactors, config changes, adding tests for existing code. Just do it.
+- **Light** (default for megaplan): multi-file changes with clear scope, well-understood features, straightforward additions. One critique pass, no iteration loop.
+- **Standard**: cross-cutting changes touching many subsystems, unfamiliar codebase areas, ambiguous requirements, changes with high breakage risk, or anything where the plan itself needs debate.
+
+Default to light unless the task clearly needs standard. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
 ## Start
-Ask two questions before `init`:
-1. Execution mode: auto-approve or review.
-2. Robustness: light, standard, or thorough.
+Ask execution mode (auto-approve or review) before `init`. Pick robustness yourself per the triage guidance above.
 ```bash
-megaplan init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|standard|thorough] "$IDEA"
+megaplan init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|standard] "$IDEA"
 ```
 Report the plan name, execution mode, robustness, current state, and next step.
 ## Workflow
@@ -22,13 +23,12 @@ Run the loop in this order:
 6. `execute`
 7. `review`
 Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
-At `--robustness light`, `plan` can collapse plan + critique + gate into one call. When that happens it writes the critique and gate artifacts itself and may route directly to `finalize`, back to `revise`, or to an override path without separate `critique` / `gate` worker calls.
+At `--robustness light`, the loop is: `plan` → `critique` → `revise` → `finalize` → `execute`. No gate, no iteration, no review. One pass of external critique, one revision to incorporate it, then execute and done.
 ## Step Rules
 - `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`.
-- `plan` at light robustness: also produce `self_flags`, `gate_recommendation`, `gate_rationale`, and `settled_decisions` so the handler can fast-forward the loop.
 - `critique`: surface concrete flags with concern, evidence, category, and severity; reuse open flag IDs; call out scope creep.
-- `gate`: read the response, warnings, and `orchestrator_guidance`.
-- `revise`: show the delta, flags addressed, and flags remaining; then loop back through `critique` and `gate`.
+- `gate`: read the response, warnings, and `orchestrator_guidance`. (Skipped at light robustness.)
+- `revise`: show the delta, flags addressed, and flags remaining. At light robustness, routes to `finalize`; otherwise loops back through `critique` and `gate`.
 - `review`: judge success against the success criteria and the user's intent, not plan elegance.
 ## Gate Principle
 The gate response tells the orchestrator what to do next. Follow `orchestrator_guidance` unless you have a concrete reason to disagree after investigating the repository or plan artifacts yourself.

@@ -17,7 +17,7 @@ import megaplan.cli
 import megaplan._core
 import megaplan.workers
 from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
-from megaplan._core import ensure_runtime_layout, load_plan
+from megaplan._core import WORKFLOW, WORKFLOW_OVERRIDES, ensure_runtime_layout, load_plan, workflow_next
 from megaplan.prompts import create_claude_prompt
 from megaplan.workers import WorkerResult, _build_mock_payload
 
@@ -157,30 +157,75 @@ def test_init_response_points_to_plan(tmp_path: Path, monkeypatch: pytest.Monkey
     assert response["next_step"] == "plan"
 
 
+_LEGACY_STATE_MACHINE_CASES = [
+    ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, ["plan"]),
+    ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, ["plan", "critique", "step"]),
+    ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, ["gate", "step"]),
+    ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}, ["revise", "step"]),
+    (
+        {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ESCALATE"}},
+        ["override add-note", "override force-proceed", "override abort", "step"],
+    ),
+    (
+        {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "PROCEED", "passed": False}},
+        ["revise", "override force-proceed", "step"],
+    ),
+    ({"current_state": megaplan.STATE_GATED, "last_gate": {}}, ["finalize", "override replan", "step"]),
+    ({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}}, ["execute", "override replan", "step"]),
+]
+
+
 def test_infer_next_steps_matches_new_state_machine() -> None:
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}) == ["plan"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}) == ["plan", "critique", "step"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}) == ["gate", "step"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}) == ["revise", "step"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ESCALATE"}}) == [
-        "override add-note",
-        "override force-proceed",
-        "override abort",
-        "step",
-    ]
-    assert megaplan.infer_next_steps(
-        {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "PROCEED", "passed": False}}
-    ) == ["revise", "override force-proceed", "step"]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_GATED, "last_gate": {}}) == [
-        "finalize",
-        "override replan",
-        "step",
-    ]
-    assert megaplan.infer_next_steps({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}}) == [
-        "execute",
-        "override replan",
-        "step",
-    ]
+    for state, expected in _LEGACY_STATE_MACHINE_CASES:
+        assert megaplan.infer_next_steps(state) == expected
+
+
+def test_workflow_next_matches_legacy_partial_state_cases() -> None:
+    for state, expected in _LEGACY_STATE_MACHINE_CASES:
+        assert workflow_next(state) == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, "config": {"robustness": "light"}},
+            ["revise", "step"],
+        ),
+        (
+            {
+                "current_state": megaplan.STATE_CRITIQUED,
+                "last_gate": {"recommendation": "ESCALATE"},
+                "config": {"robustness": "light"},
+            },
+            ["revise", "step"],
+        ),
+        (
+            {"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, "config": {"robustness": "light"}},
+            [],
+        ),
+    ],
+)
+def test_workflow_next_light_robustness_overrides(state: dict[str, object], expected: list[str]) -> None:
+    assert workflow_next(state) == expected
+
+
+def test_workflow_definition_is_complete_for_standard_flow() -> None:
+    expected_states = {
+        megaplan.STATE_INITIALIZED,
+        megaplan.STATE_PLANNED,
+        megaplan.STATE_CRITIQUED,
+        megaplan.STATE_GATED,
+        megaplan.STATE_FINALIZED,
+        megaplan.STATE_EXECUTED,
+    }
+
+    assert expected_states.issubset(WORKFLOW)
+    for state_name, transitions in WORKFLOW.items():
+        assert transitions or state_name in megaplan.TERMINAL_STATES
+    for robustness, overrides in WORKFLOW_OVERRIDES.items():
+        assert robustness in megaplan._core.ROBUSTNESS_LEVELS
+        assert set(overrides).issubset(WORKFLOW)
 
 
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
@@ -261,7 +306,7 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
 
 
-def test_workflow_light_robustness_collapses_to_one_call(
+def test_workflow_light_robustness_single_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,115 +322,81 @@ def test_workflow_light_robustness_collapses_to_one_call(
     monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _record)
 
     plan = megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    faults = read_json(plan_fixture.plan_dir / "faults.json")
-    gate = read_json(plan_fixture.plan_dir / "gate.json")
+    assert plan["next_step"] == "critique"
+
+    critique = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    assert critique["next_step"] == "revise"
+
+    revise = megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    assert revise["next_step"] == "finalize"
+    assert revise["state"] == megaplan.STATE_GATED
+
     finalize = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     execute = megaplan.handle_execute(
         plan_fixture.root,
         make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
     )
-    review = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     state = load_state(plan_fixture.plan_dir)
 
-    assert plan["state"] == megaplan.STATE_GATED
-    assert plan["next_step"] == "finalize"
-    assert (plan_fixture.plan_dir / "critique_v1.json").exists()
-    assert (plan_fixture.plan_dir / "gate_signals_v1.json").exists()
-    assert faults["flags"][0]["id"] == "FLAG-101"
-    assert gate["recommendation"] == "PROCEED"
     assert finalize["state"] == megaplan.STATE_FINALIZED
-    assert execute["state"] == megaplan.STATE_EXECUTED
-    assert review["state"] == megaplan.STATE_DONE
-    assert recorded_steps == ["plan", "finalize", "execute", "review"]
+    assert execute["state"] == megaplan.STATE_DONE
+    assert execute["next_step"] is None
+    assert recorded_steps == ["plan", "critique", "revise", "finalize", "execute"]
     assert [entry["step"] for entry in state["history"]] == [
         "init",
         "plan",
         "critique",
-        "gate",
+        "revise",
         "finalize",
         "execute",
-        "review",
     ]
 
 
-def test_handle_plan_light_iterate_routes_to_revise_via_critiqued_state(
+def test_light_critique_routes_to_revise(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
+    make_args = plan_fixture.make_args
 
-    def _light_iterate(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
-        if step == "plan":
-            payload = _build_mock_payload(
-                "plan",
-                state,
-                plan_dir,
-                gate_recommendation="ITERATE",
-                gate_rationale="The combined pass found a real planning gap.",
-            )
-            return WorkerResult(payload=payload, raw_output="{}", duration_ms=1, cost_usd=0.0, session_id="light-plan"), "claude", "persistent", False
-        return megaplan.workers.mock_worker_output(step, state, plan_dir), "claude", "persistent", False
-
-    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _light_iterate)
-
-    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    response = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     state = load_state(plan_fixture.plan_dir)
 
     assert response["next_step"] == "revise"
-    assert response["state"] == megaplan.STATE_CRITIQUED
     assert state["last_gate"]["recommendation"] == "ITERATE"
 
 
-def test_handle_plan_light_escalate_routes_to_override_path(
+def test_light_revise_routes_to_finalize(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
-
-    def _light_escalate(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
-        if step == "plan":
-            payload = _build_mock_payload(
-                "plan",
-                state,
-                plan_dir,
-                gate_recommendation="ESCALATE",
-                gate_rationale="The combined pass wants a user judgment call.",
-            )
-            return WorkerResult(payload=payload, raw_output="{}", duration_ms=1, cost_usd=0.0, session_id="light-plan"), "claude", "persistent", False
-        return megaplan.workers.mock_worker_output(step, state, plan_dir), "claude", "persistent", False
-
-    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _light_escalate)
-
-    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    state = load_state(plan_fixture.plan_dir)
-
-    assert response["next_step"] == "override force-proceed"
-    assert response["state"] == megaplan.STATE_CRITIQUED
-    assert state["last_gate"]["recommendation"] == "ESCALATE"
-
-
-def test_workflow_thorough_robustness_review_prompt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="thorough")
     make_args = plan_fixture.make_args
+
     megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
-    megaplan.handle_execute(
-        plan_fixture.root,
-        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
-    )
-    _, state = load_plan(plan_fixture.root, plan_fixture.plan_name)
-    prompt = create_claude_prompt("review", state, plan_fixture.plan_dir)
+    response = megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
 
-    assert "line by line" in prompt.lower()
-    assert "sense-check acknowledgment" in prompt.lower()
+    assert response["next_step"] == "finalize"
+    assert state["current_state"] == megaplan.STATE_GATED
+
+
+def test_standard_revise_routes_to_critique_and_clears_last_gate(plan_fixture: PlanFixture) -> None:
+    make_args = plan_fixture.make_args
+
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    gate = megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    response = megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+
+    assert gate["recommendation"] == "ITERATE"
+    assert response["state"] == megaplan.STATE_PLANNED
+    assert response["next_step"] == "critique"
+    assert state["current_state"] == megaplan.STATE_PLANNED
+    assert state["last_gate"] == {}
 
 
 def test_handle_plan_stores_nonblocking_structure_warnings(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3789,6 +3800,51 @@ def test_batch_1_on_single_batch_plan_transitions_to_executed(
 
     assert response["state"] == megaplan.STATE_EXECUTED
     assert response["next_step"] == "review"
+    assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
+    assert (plan_fixture.plan_dir / "execution.json").exists()
+
+
+def test_light_batch_1_on_single_batch_plan_transitions_to_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="light")
+    _setup_two_batch_plan(plan_fixture)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"][1]["depends_on"] = []
+    (plan_fixture.plan_dir / "finalize.json").write_text(
+        json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+
+    def single_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        payload = {
+            "output": "All tasks complete.",
+            "files_changed": ["batch1.py", "batch2.py"],
+            "commands_run": ["pytest"],
+            "deviations": [],
+            "task_updates": [
+                {"task_id": "T1", "status": "done", "executor_notes": "Done T1.", "files_changed": ["batch1.py"], "commands_run": ["pytest"]},
+                {"task_id": "T2", "status": "done", "executor_notes": "Done T2.", "files_changed": ["batch2.py"], "commands_run": ["pytest"]},
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed."},
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="all", duration_ms=1, cost_usd=0.1, session_id="single"), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", single_batch_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    state = load_state(plan_fixture.plan_dir)
+
+    assert response["state"] == megaplan.STATE_DONE
+    assert response["next_step"] is None
+    assert state["current_state"] == megaplan.STATE_DONE
     assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
     assert (plan_fixture.plan_dir / "execution.json").exists()
 
