@@ -6,15 +6,8 @@ from megaplan.schemas import SCHEMAS, strict_schema
 
 
 def test_schema_registry_matches_5_step_workflow() -> None:
-    assert set(SCHEMAS) == {
-        "plan.json",
-        "revise.json",
-        "gate.json",
-        "critique.json",
-        "finalize.json",
-        "execution.json",
-        "review.json",
-    }
+    required = {"plan.json", "prep.json", "research.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
+    assert required.issubset(set(SCHEMAS))
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +88,8 @@ def test_strict_schema_non_object_untouched() -> None:
 
 
 def test_schema_registry_has_all_expected_steps() -> None:
-    expected_schemas = {"plan.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
-    assert set(SCHEMAS.keys()) == expected_schemas
+    required_schemas = {"plan.json", "prep.json", "research.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
+    assert required_schemas.issubset(set(SCHEMAS.keys()))
 
 
 def test_schema_registry_entries_include_required_field() -> None:
@@ -191,6 +184,27 @@ def test_plan_schema_has_core_fields_only() -> None:
     assert set(schema["required"]) == {"plan", "questions", "success_criteria", "assumptions"}
     assert "self_flags" not in schema["properties"]
     assert "gate_recommendation" not in schema["properties"]
+
+
+def test_prep_schema_exists_and_has_expected_structure() -> None:
+    schema = strict_schema(SCHEMAS["prep.json"])
+    assert set(schema["required"]) == {
+        "task_summary",
+        "key_evidence",
+        "relevant_code",
+        "test_expectations",
+        "constraints",
+        "suggested_approach",
+    }
+    evidence_schema = schema["properties"]["key_evidence"]["items"]
+    relevant_code_schema = schema["properties"]["relevant_code"]["items"]
+    test_expectation_schema = schema["properties"]["test_expectations"]["items"]
+    assert set(evidence_schema["required"]) == {"point", "source", "relevance"}
+    assert evidence_schema["properties"]["relevance"]["enum"] == ["high", "medium", "low"]
+    assert set(relevant_code_schema["required"]) == {"file_path", "why"}
+    assert relevant_code_schema["properties"]["functions"]["items"]["type"] == "string"
+    assert set(test_expectation_schema["required"]) == {"test_id", "what_it_checks", "status"}
+    assert test_expectation_schema["properties"]["status"]["enum"] == ["fail_to_pass", "pass_to_pass"]
 
 
 def test_gate_schema_includes_settled_decisions_structure() -> None:

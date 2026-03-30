@@ -15,7 +15,13 @@ from megaplan._core import (
     save_debt_registry,
     save_flag_registry,
 )
-from megaplan.prompts import _execute_batch_prompt, create_claude_prompt, create_codex_prompt
+from megaplan.prompts import (
+    _execute_batch_prompt,
+    _prep_prompt,
+    _render_prep_block,
+    create_claude_prompt,
+    create_codex_prompt,
+)
 from megaplan.workers import _build_mock_payload
 
 
@@ -252,6 +258,59 @@ def test_plan_prompt_absorbs_clarification_when_missing(tmp_path: Path) -> None:
     assert state["idea"] in prompt
 
 
+def test_prep_prompt_contains_idea_and_root_path(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = _prep_prompt(state, plan_dir, root=tmp_path)
+    assert state["idea"] in prompt
+    assert str(tmp_path) in prompt
+    assert "prep.json" in prompt
+
+
+def test_render_prep_block_returns_empty_strings_when_missing(tmp_path: Path) -> None:
+    plan_dir, _ = _scaffold(tmp_path)
+    assert _render_prep_block(plan_dir) == ("", "")
+
+
+def test_render_prep_block_formats_existing_brief(tmp_path: Path) -> None:
+    plan_dir, _ = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "prep.json",
+        {
+            "task_summary": "Add the prep phase before planning.",
+            "key_evidence": [
+                {"point": "Task requires a prep phase", "source": "idea", "relevance": "high"},
+            ],
+            "relevant_code": [
+                {
+                    "file_path": "megaplan/prompts.py",
+                    "why": "Prompt injection happens here.",
+                    "functions": ["_plan_prompt", "_render_prep_block"],
+                }
+            ],
+            "test_expectations": [
+                {
+                    "test_id": "FAIL_TO_PASS::prep-phase",
+                    "what_it_checks": "Prep artifacts are rendered before planning.",
+                    "status": "fail_to_pass",
+                }
+            ],
+            "constraints": ["Do not break standard robustness routing."],
+            "suggested_approach": "Render the brief before the raw task context in downstream prompts.",
+        },
+    )
+
+    block, instruction = _render_prep_block(plan_dir)
+
+    assert "### Task Summary" in block
+    assert "Task requires a prep phase" in block
+    assert "| File | Functions | Why |" in block
+    assert "megaplan/prompts.py" in block
+    assert "FAIL_TO_PASS::prep-phase" in block
+    assert "Do not break standard robustness routing." in block
+    assert "Render the brief before the raw task context in downstream prompts." in block
+    assert instruction == "The engineering brief above was produced by analyzing the codebase. Use it as primary context."
+
+
 def test_light_plan_prompt_uses_normal_plan_prompt(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     state["config"]["robustness"] = "light"
@@ -398,7 +457,7 @@ def test_revise_prompt_contains_intent(tmp_path: Path) -> None:
 
 def test_codex_matches_claude_for_shared_steps(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
-    for step in ["plan", "critique", "revise", "gate", "execute"]:
+    for step in ["plan", "prep", "research", "critique", "revise", "gate", "execute"]:
         claude_prompt = create_claude_prompt(step, state, plan_dir)
         codex_prompt = create_codex_prompt(step, state, plan_dir)
         assert claude_prompt == codex_prompt, f"Prompts differ for step '{step}'"

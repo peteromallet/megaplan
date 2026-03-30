@@ -16,6 +16,60 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["plan", "questions", "success_criteria", "assumptions"],
     },
+    "prep.json": {
+        "type": "object",
+        "properties": {
+            "skip": {"type": "boolean"},
+            "task_summary": {"type": "string"},
+            "key_evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "point": {"type": "string"},
+                        "source": {"type": "string"},
+                        "relevance": {"type": "string", "enum": ["high", "medium", "low"]},
+                    },
+                    "required": ["point", "source", "relevance"],
+                },
+            },
+            "relevant_code": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "why": {"type": "string"},
+                        "functions": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["file_path", "why"],
+                },
+            },
+            "test_expectations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "test_id": {"type": "string"},
+                        "what_it_checks": {"type": "string"},
+                        "status": {"type": "string", "enum": ["fail_to_pass", "pass_to_pass"]},
+                    },
+                    "required": ["test_id", "what_it_checks", "status"],
+                },
+            },
+            "constraints": {"type": "array", "items": {"type": "string"}},
+            "suggested_approach": {"type": "string"},
+        },
+        "required": [
+            "skip",
+            "task_summary",
+            "key_evidence",
+            "relevant_code",
+            "test_expectations",
+            "constraints",
+            "suggested_approach",
+        ],
+    },
     "revise.json": {
         "type": "object",
         "properties": {
@@ -101,6 +155,26 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["flags", "verified_flag_ids", "disputed_flag_ids"],
     },
+    "research.json": {
+        "type": "object",
+        "properties": {
+            "considerations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "point": {"type": "string"},
+                        "severity": {"type": "string", "enum": ["critical", "important", "minor"]},
+                        "detail": {"type": "string"},
+                        "source": {"type": "string"},
+                    },
+                    "required": ["severity"],
+                },
+            },
+            "summary": {"type": "string"},
+        },
+        "required": ["considerations", "summary"],
+    },
     "finalize.json": {
         "type": "object",
         "properties": {
@@ -185,6 +259,30 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
         "required": ["output", "files_changed", "commands_run", "deviations", "task_updates", "sense_check_acknowledgments"],
+    },
+    "loop_plan.json": {
+        "type": "object",
+        "properties": {
+            "spec_updates": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            "next_action": {"type": "string"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["spec_updates", "next_action", "reasoning"],
+    },
+    "loop_execute.json": {
+        "type": "object",
+        "properties": {
+            "diagnosis": {"type": "string"},
+            "fix_description": {"type": "string"},
+            "files_to_change": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "string"},
+            "outcome": {"type": "string"},
+            "should_pause": {"type": "boolean"},
+        },
+        "required": ["diagnosis", "fix_description", "files_to_change", "confidence", "outcome", "should_pause"],
     },
     "review.json": {
         "type": "object",

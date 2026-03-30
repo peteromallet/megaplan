@@ -35,7 +35,9 @@ from megaplan.types import (
     STATE_FINALIZED,
     STATE_GATED,
     STATE_INITIALIZED,
+    STATE_PREPPED,
     STATE_PLANNED,
+    STATE_RESEARCHED,
     TERMINAL_STATES,
 )
 
@@ -671,11 +673,14 @@ class Transition:
 
 WORKFLOW: dict[str, list[Transition]] = {
     STATE_INITIALIZED: [
+        Transition("prep", STATE_PREPPED),
+    ],
+    STATE_PREPPED: [
         Transition("plan", STATE_PLANNED),
     ],
     STATE_PLANNED: [
-        Transition("plan", STATE_PLANNED),
         Transition("critique", STATE_CRITIQUED),
+        Transition("plan", STATE_PLANNED),
     ],
     STATE_CRITIQUED: [
         Transition("gate", STATE_GATED, "gate_unset"),
@@ -700,7 +705,21 @@ WORKFLOW: dict[str, list[Transition]] = {
     ],
 }
 
-WORKFLOW_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
+# Each level's *own* overrides (not inherited).  Levels inherit from the
+# level below them via _ROBUSTNESS_HIERARCHY so shared transitions are
+# declared once: heavy has none, standard keeps the planned->critique
+# routing documented explicitly, and light adds gate/review skips.
+_ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
+    "heavy": {},
+    "standard": {
+        STATE_INITIALIZED: [
+            Transition("plan", STATE_PLANNED),
+        ],
+        STATE_PLANNED: [
+            Transition("critique", STATE_CRITIQUED),
+            Transition("plan", STATE_PLANNED),
+        ],
+    },
     "light": {
         STATE_CRITIQUED: [
             Transition("revise", STATE_GATED),
@@ -708,6 +727,10 @@ WORKFLOW_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
         STATE_EXECUTED: [],
     },
 }
+
+# Ordered from most to least rigorous.  Each level inherits all overrides
+# from every level to its right (i.e. less rigorous levels accumulate).
+_ROBUSTNESS_HIERARCHY: tuple[str, ...] = ("heavy", "standard", "light")
 
 _STEP_CONTEXT_STATES = {
     STATE_PLANNED,
@@ -732,10 +755,17 @@ def _workflow_robustness_from_state(state: PlanState) -> str:
 
 def _workflow_for_robustness(robustness: str) -> dict[str, list[Transition]]:
     normalized = _normalize_workflow_robustness(robustness)
-    return {
-        **WORKFLOW,
-        **WORKFLOW_OVERRIDES.get(normalized, {}),
-    }
+    # Compose overrides: start from the target level and accumulate every
+    # level above it in the hierarchy (more rigorous levels' overrides are
+    # included because less rigorous levels inherit them).
+    merged: dict[str, list[Transition]] = {}
+    try:
+        target_index = _ROBUSTNESS_HIERARCHY.index(normalized)
+    except ValueError:
+        target_index = _ROBUSTNESS_HIERARCHY.index("standard")
+    for level in _ROBUSTNESS_HIERARCHY[: target_index + 1]:
+        merged.update(_ROBUSTNESS_OVERRIDES.get(level, {}))
+    return {**WORKFLOW, **merged}
 
 
 def _transition_matches(state: PlanState, condition: str) -> bool:

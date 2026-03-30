@@ -31,7 +31,9 @@ from megaplan.types import (
     STATE_FINALIZED,
     STATE_GATED,
     STATE_INITIALIZED,
+    STATE_PREPPED,
     STATE_PLANNED,
+    STATE_RESEARCHED,
     StepResponse,
 )
 from megaplan._core import (
@@ -440,12 +442,13 @@ def _step_add(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> Ste
         action="add",
         action_summary=action_summary,
     )
+    next_steps = workflow_next(state)
     return {
         "success": True,
         "step": "step",
         "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
         "artifacts": [plan_filename, meta_filename],
-        "next_step": "critique",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_PLANNED,
         "warnings": structure_warnings,
     }
@@ -468,12 +471,13 @@ def _step_remove(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> 
         action="remove",
         action_summary=action_summary,
     )
+    next_steps = workflow_next(state)
     return {
         "success": True,
         "step": "step",
         "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
         "artifacts": [plan_filename, meta_filename],
-        "next_step": "critique",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_PLANNED,
         "warnings": structure_warnings,
     }
@@ -500,12 +504,13 @@ def _step_move(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> St
         action="move",
         action_summary=action_summary,
     )
+    next_steps = workflow_next(state)
     return {
         "success": True,
         "step": "step",
         "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
         "artifacts": [plan_filename, meta_filename],
-        "next_step": "critique",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_PLANNED,
         "warnings": structure_warnings,
     }
@@ -647,6 +652,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
             "project_dir": str(project_dir),
             "auto_approve": auto_approve,
             "robustness": robustness,
+            "agent": "hermes" if getattr(args, "hermes", None) is not None else "",
         },
         "sessions": {},
         "plan_versions": [],
@@ -676,6 +682,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
+    next_steps = workflow_next(state)
     return {
         "success": True,
         "step": "init",
@@ -683,7 +690,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
         "state": STATE_INITIALIZED,
         "summary": f"Initialized plan '{plan_name}' for project {project_dir}",
         "artifacts": ["state.json"],
-        "next_step": "plan",
+        "next_step": next_steps[0] if next_steps else None,
         "auto_approve": auto_approve,
         "robustness": robustness,
     }
@@ -691,7 +698,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
 
 def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "plan", {STATE_INITIALIZED, STATE_PLANNED})
+    require_state(state, "plan", {STATE_INITIALIZED, STATE_PREPPED, STATE_PLANNED})
     rerun = state["current_state"] == STATE_PLANNED
     version = state["iteration"] if rerun else state["iteration"] + 1
     try:
@@ -746,6 +753,8 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
             artifact_hash=meta["hash"],
         ),
     )
+    save_state(plan_dir, state)
+    next_steps = workflow_next(state)
     response: StepResponse = {
         "success": True,
         "step": "plan",
@@ -755,20 +764,109 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
             f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
         ),
         "artifacts": [plan_filename, meta_filename],
-        "next_step": "critique",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_PLANNED,
         "questions": payload["questions"],
         "assumptions": payload["assumptions"],
         "success_criteria": payload["success_criteria"],
     }
+    attach_agent_fallback(response, args)
+    return response
+
+
+def handle_research(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    require_state(state, "research", {STATE_PLANNED})
+    iteration = state["iteration"]
+    try:
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("research", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="research", iteration=iteration, error=error)
+        raise
+    research_filename = "research.json"
+    atomic_write_json(plan_dir / research_filename, worker.payload)
+    state["current_state"] = STATE_RESEARCHED
+    apply_session_update(state, "research", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    append_history(
+        state,
+        make_history_entry(
+            "research",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=research_filename,
+            artifact_hash=sha256_file(plan_dir / research_filename),
+        ),
+    )
     save_state(plan_dir, state)
+    next_steps = workflow_next(state)
+    apis_count = len(worker.payload.get("apis_found", []))
+    response: StepResponse = {
+        "success": True,
+        "step": "research",
+        "iteration": iteration,
+        "summary": f"Research complete: found {apis_count} framework-specific API(s) to verify.",
+        "artifacts": [research_filename],
+        "next_step": next_steps[0] if next_steps else None,
+        "state": STATE_RESEARCHED,
+    }
+    attach_agent_fallback(response, args)
+    return response
+
+
+def handle_prep(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    require_state(state, "prep", {STATE_INITIALIZED})
+    iteration = state["iteration"]
+    try:
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("prep", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="prep", iteration=iteration, error=error)
+        raise
+    prep_filename = "prep.json"
+    atomic_write_json(plan_dir / prep_filename, worker.payload)
+    state["current_state"] = STATE_PREPPED
+    apply_session_update(state, "prep", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    append_history(
+        state,
+        make_history_entry(
+            "prep",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=prep_filename,
+            artifact_hash=sha256_file(plan_dir / prep_filename),
+        ),
+    )
+    save_state(plan_dir, state)
+    next_steps = workflow_next(state)
+    relevant_code_count = len(worker.payload.get("relevant_code", []))
+    test_expectation_count = len(worker.payload.get("test_expectations", []))
+    response: StepResponse = {
+        "success": True,
+        "step": "prep",
+        "iteration": iteration,
+        "summary": (
+            f"Prep complete: captured {relevant_code_count} relevant code reference(s) "
+            f"and {test_expectation_count} test expectation(s)."
+        ),
+        "artifacts": [prep_filename],
+        "next_step": next_steps[0] if next_steps else None,
+        "state": STATE_PREPPED,
+    }
     attach_agent_fallback(response, args)
     return response
 
 
 def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "critique", {STATE_PLANNED})
+    require_state(state, "critique", {STATE_PLANNED, STATE_RESEARCHED})
     iteration = state["iteration"]
     state["last_gate"] = {}
     try:
@@ -1102,6 +1200,70 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     return response
 
 
+def _ensure_verification_task(payload: dict, state: dict) -> None:
+    """Ensure the task list ends with a test verification task.
+
+    If the last task already looks like a verification/test task, leave it.
+    Otherwise append one that depends on all other tasks.
+    """
+    tasks = payload.get("tasks", [])
+    if not tasks:
+        return
+
+    # Check if last task is already a verification task
+    last_desc = (tasks[-1].get("description") or "").lower()
+    test_keywords = ("run test", "run the test", "verify", "verification", "pytest", "test suite", "run existing test")
+    if any(kw in last_desc for kw in test_keywords):
+        return
+
+    # Build the verification task
+    all_ids = [t["id"] for t in tasks]
+    next_num = max((int(t["id"].lstrip("T")) for t in tasks if t["id"].startswith("T")), default=0) + 1
+    task_id = f"T{next_num}"
+
+    # Pull specific test IDs from the original prompt if available
+    idea = state.get("idea", "") or ""
+    notes = "\n".join(state.get("notes", []) or [])
+    source_text = idea + "\n" + notes
+
+    if "FAIL_TO_PASS" in source_text or "test must pass" in source_text.lower() or "verification" in source_text.lower():
+        desc = (
+            "Run the tests specified in the task description to verify the fix. "
+            "Run the project's existing test suite — do NOT create new test files. "
+            "If any test fails, read the error, fix the code, and re-run until all tests pass."
+        )
+    else:
+        desc = (
+            "Run tests relevant to the changed files to verify correctness and check for regressions. "
+            "Find and run the project's existing test suite — do NOT create new test files. "
+            "If any test fails, read the error, fix the code, and re-run until all tests pass."
+        )
+
+    verification_task = {
+        "id": task_id,
+        "description": desc,
+        "depends_on": [all_ids[-1]],
+        "status": "pending",
+        "executor_notes": "",
+        "files_changed": [],
+        "commands_run": [],
+        "evidence_files": [],
+        "reviewer_verdict": "",
+    }
+    tasks.append(verification_task)
+
+    # Add a sense check for it
+    sense_checks = payload.get("sense_checks", [])
+    sc_num = max((int(sc["id"].lstrip("SC")) for sc in sense_checks if sc["id"].startswith("SC")), default=0) + 1
+    sense_checks.append({
+        "id": f"SC{sc_num}",
+        "task_id": task_id,
+        "question": "Did the verification tests pass? Were any regressions found and fixed?",
+        "executor_note": "",
+        "verdict": "",
+    })
+
+
 def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "finalize", {STATE_GATED})
@@ -1111,6 +1273,7 @@ def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="finalize", iteration=state["iteration"], error=error)
         raise
     payload = worker.payload
+    _ensure_verification_task(payload, state)
     atomic_write_json(plan_dir / "finalize.json", payload)
     atomic_write_text(plan_dir / "final.md", render_final_md(payload))
     state["current_state"] = STATE_FINALIZED
@@ -1449,14 +1612,15 @@ def _override_replan(root: Path, plan_dir: Path, state: PlanState, args: argpars
     if args.note:
         _append_to_meta(state, "notes", {"timestamp": now_utc(), "note": args.note})
     save_state(plan_dir, state)
+    next_steps = workflow_next(state)
     return {
         "success": True,
         "step": "override",
         "summary": f"Re-entered planning loop at iteration {state['iteration']}. Reason: {reason}",
-        "next_step": "critique",
+        "next_step": next_steps[0] if next_steps else None,
         "state": STATE_PLANNED,
         "plan_file": str(plan_file),
-        "message": f"Edit {plan_file.name} to incorporate your changes, then run critique.",
+        "message": f"Edit {plan_file.name} to incorporate your changes, then run the next step.",
     }
 
 

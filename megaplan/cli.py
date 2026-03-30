@@ -43,9 +43,17 @@ from megaplan.handlers import (
     handle_init,
     handle_override,
     handle_plan,
+    handle_prep,
+    handle_research,
     handle_review,
     handle_revise,
     handle_step,
+)
+from megaplan.loop.handlers import (
+    handle_loop_init,
+    handle_loop_pause,
+    handle_loop_run,
+    handle_loop_status,
 )
 
 
@@ -431,7 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
-    for name in ["plan", "critique", "revise", "gate", "finalize", "execute", "review"]:
+    for name in ["plan", "prep", "research", "critique", "revise", "gate", "finalize", "execute", "review"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
         step_parser.add_argument("--agent", choices=["claude", "codex", "hermes"])
@@ -496,12 +504,56 @@ def build_parser() -> argparse.ArgumentParser:
     debt_resolve_parser.add_argument("debt_id")
     debt_resolve_parser.add_argument("--plan")
 
+    loop_init_parser = subparsers.add_parser("loop-init", help="Initialize a MegaLoop workflow")
+    loop_init_parser.add_argument("--project-dir", required=True)
+    loop_init_parser.add_argument("--command", required=True)
+    loop_init_parser.add_argument("--goal", dest="goal_option")
+    loop_init_parser.add_argument("--name")
+    loop_init_parser.add_argument("--iterations", type=int, default=3)
+    loop_init_parser.add_argument("--time-budget", type=int, default=300)
+    loop_init_parser.add_argument("--observe-interval", type=int)
+    loop_init_parser.add_argument("--observe-break-patterns")
+    loop_init_parser.add_argument("--agent", choices=["claude", "codex", "hermes"])
+    loop_init_parser.add_argument("--hermes", nargs="?", const="", default=None,
+                                  help="Use Hermes agent for loop phases. Optional: specify default model")
+    loop_init_parser.add_argument("--phase-model", action="append", default=[],
+                                  help="Per-phase model override: --phase-model loop_execute=hermes:openai/gpt-5")
+    loop_init_parser.add_argument("--fresh", action="store_true")
+    loop_init_parser.add_argument("--persist", action="store_true")
+    loop_init_parser.add_argument("--ephemeral", action="store_true")
+    loop_init_parser.add_argument("goal", nargs="?")
+
+    loop_run_parser = subparsers.add_parser("loop-run", help="Run an existing MegaLoop workflow")
+    loop_run_parser.add_argument("name")
+    loop_run_parser.add_argument("--project-dir")
+    loop_run_parser.add_argument("--iterations", type=int)
+    loop_run_parser.add_argument("--time-budget", type=int)
+    loop_run_parser.add_argument("--agent", choices=["claude", "codex", "hermes"])
+    loop_run_parser.add_argument("--hermes", nargs="?", const="", default=None,
+                                 help="Use Hermes agent for loop phases. Optional: specify default model")
+    loop_run_parser.add_argument("--phase-model", action="append", default=[],
+                                 help="Per-phase model override: --phase-model loop_execute=hermes:openai/gpt-5")
+    loop_run_parser.add_argument("--fresh", action="store_true")
+    loop_run_parser.add_argument("--persist", action="store_true")
+    loop_run_parser.add_argument("--ephemeral", action="store_true")
+
+    loop_status_parser = subparsers.add_parser("loop-status", help="Show MegaLoop state")
+    loop_status_parser.add_argument("name")
+    loop_status_parser.add_argument("--project-dir")
+
+    loop_pause_parser = subparsers.add_parser("loop-pause", help="Pause a MegaLoop workflow")
+    loop_pause_parser.add_argument("name")
+    loop_pause_parser.add_argument("--project-dir")
+    loop_pause_parser.add_argument("--reason", default="")
+
     return parser
 
 
 COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "init": handle_init,
     "plan": handle_plan,
+    "prep": handle_prep,
+    "research": handle_research,
     "critique": handle_critique,
     "revise": handle_revise,
     "gate": handle_gate,
@@ -512,6 +564,10 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "audit": handle_audit,
     "progress": handle_progress,
     "list": handle_list,
+    "loop-init": handle_loop_init,
+    "loop-run": handle_loop_run,
+    "loop-status": handle_loop_status,
+    "loop-pause": handle_loop_pause,
     "debt": handle_debt,
     "step": handle_step,
     "override": handle_override,

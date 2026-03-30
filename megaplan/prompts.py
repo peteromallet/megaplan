@@ -199,6 +199,7 @@ def _finalize_debt_block(plan_dir: Path, root: Path | None) -> str:
 
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
     clarification = state.get("clarification", {})
     if clarification:
         clarification_block = textwrap.dedent(
@@ -213,6 +214,10 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         f"""
         You are creating an implementation plan for the following idea.
 
+        {prep_block}
+
+        {prep_instruction}
+
         {intent_and_notes_block(state)}
 
         Project directory:
@@ -221,21 +226,78 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         {clarification_block}
 
         Requirements:
-        - Inspect the actual repository before planning.
+        - If the engineering brief above already identifies the exact file, line, and fix, trust it. Verify with at most 1-2 file reads, then produce the plan. Do NOT re-explore the codebase for information the brief already provides.
+        - If the brief is absent, incomplete, or says "skip", inspect the repository yourself before planning.
         - Produce a concrete implementation plan in markdown.
         - Define observable success criteria.
         - Use the `questions` field for ambiguities that would materially change implementation.
         - Use the `assumptions` field for defaults you are making so planning can proceed now.
         - Prefer cheap validation steps early.
+        - Keep the plan proportional to the task. A 1-line fix needs a 2-step plan (apply fix + run tests), not a 5-step investigation.
         - If user notes answer earlier questions, incorporate them into the draft plan instead of re-asking them.
+        - Fix the problem fully. Do not limit scope just to avoid breaking existing tests — update the tests too if needed.
+        - Prefer the simplest, most direct fix. No fallbacks, type conversions, or defensive wrappers without concrete evidence they are needed.
+        - If the task or issue hints suggest a specific approach, follow it. Only deviate with concrete counter-evidence.
 
         {PLAN_TEMPLATE}
         """
     ).strip()
 
 
+def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
+    del plan_dir
+    project_dir = Path(state["config"]["project_dir"])
+    project_root = root if root is not None else project_dir
+    return textwrap.dedent(
+        f"""
+        Prepare a concise engineering brief for the task below. This brief will be the primary context for all subsequent planning and execution.
+
+        Task:
+        {state["idea"]}
+
+        Project: {project_dir}
+
+        First, assess: does this task need codebase investigation?
+
+        Set "skip": true if ALL of these are true:
+        - The task names the exact file(s) to change
+        - The required change is clearly described
+        - No ambiguity about the approach
+
+        Set "skip": false if ANY of these are true:
+        - The task doesn't say which files to change
+        - Multiple approaches seem possible
+        - The task references concepts, APIs, or patterns you'd need to look up in the codebase
+        - The task involves more than 2-3 files
+        - There are hints or references that need investigation
+
+        If skipping, leave everything else empty. The original task description will be used directly.
+        If not skipping, fill in the brief:
+        1. Search the codebase (Glob, Grep, Read) for relevant files and functions.
+        2. If tests exist for the affected code, read them — they reveal what the fix must actually do, which may differ from what the task description suggests.
+        3. Extract evidence from the task description — hints, references, error messages.
+        4. Challenge the obvious path: if the task or hints point to a specific location, verify it's actually the right place. Trace the call chain — where does data flow? Where does it go wrong? The obvious file may be a symptom, not the root cause.
+        5. If the task describes a bug or incorrect behavior, seriously consider whether it is a symptom of a larger issue. Before proposing a fix, trace the root cause. Ask: why does this happen? Could the same root cause produce other failures? Is the fix a patch on one case, or does it need to address an underlying gap? If the codebase has related functionality that is also incomplete or broken, note it — a narrow fix may not be enough.
+        6. If you find that a suggested fix already exists in the code, say so explicitly — this means the root cause is elsewhere.
+        7. Distill into a brief that adds value beyond the raw task description.
+
+        Brief fields:
+        - skip: true if no investigation needed, false if brief has useful content.
+        - task_summary: What needs to be done, in 2-3 sentences.
+        - key_evidence: Facts from the task and codebase not obvious from reading the task alone.
+        - relevant_code: File paths and key functions found by searching.
+        - test_expectations: Tests that verify the affected behavior.
+        - constraints: What must not break.
+        - suggested_approach: A concrete approach grounded in what you found.
+
+        IMPORTANT: After you finish searching and reading files, you MUST output the prep.json as your final message. Do not end with a tool call — end with the JSON object as plain text.
+        """
+    ).strip()
+
+
 def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     gate = read_json(plan_dir / "gate.json")
@@ -257,6 +319,9 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         Project directory:
         {project_dir}
 
+        {prep_block}
+        {prep_instruction}
+
         {intent_and_notes_block(state)}
 
         Current plan (markdown):
@@ -272,6 +337,7 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         {json_dump(open_flags).strip()}
 
         Requirements:
+        - Before addressing individual flags, check: does any flag suggest the plan is targeting the wrong code or the wrong root cause? If so, consider whether the plan needs a new approach rather than adjustments. Explain your reasoning.
         - Update the plan to address the significant issues.
         - Keep the plan readable and executable.
         - Return flags_addressed with the exact flag IDs you addressed.
@@ -285,8 +351,243 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
+def _research_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
+    del root
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    package_json_path = project_dir / "package.json"
+    try:
+        package_json = read_json(package_json_path)
+        dependency_versions = {
+            **package_json.get("dependencies", {}),
+            **package_json.get("devDependencies", {}),
+            **package_json.get("peerDependencies", {}),
+            **package_json.get("optionalDependencies", {}),
+        }
+        package_json_block = textwrap.dedent(
+            f"""
+            package.json detected at:
+            {package_json_path}
+
+            Dependency and framework version hints:
+            {json_dump(dependency_versions).strip()}
+            """
+        ).strip()
+    except FileNotFoundError:
+        package_json_block = "no package.json detected"
+
+    return textwrap.dedent(
+        f"""
+        You are doing targeted documentation research for the plan that was just created.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Plan:
+        {latest_plan}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        {package_json_block}
+
+        Your job is to find things the plan might be getting wrong OR missing based on current documentation.
+        You are NOT validating the plan — you are a devil's advocate looking for problems, gaps, and outdated approaches.
+
+        You MUST do FOUR searches minimum:
+
+        Search 1 — CHECK WHAT THE TASK ASKS FOR:
+        Read the Original Task carefully. Extract every technical term, API name, directive, file convention,
+        and feature name that is NOT a standard well-known API. For each extracted term, search:
+        "[framework] [version] [term]"
+        e.g. "next.js 16 use cache directive", "next.js 16 proxy.ts", "next.js 16 unstable_instant"
+        If the task names something the plan doesn't mention, that's likely a CRITICAL gap.
+
+        Search 2 — CHECK WHAT THE PLAN DOES:
+        For each framework-specific API/pattern in the plan, search for "[framework] [version] [API]"
+        e.g. "next.js 16 unstable_cache", "next.js 16 force-dynamic"
+        If the docs say this API is deprecated or replaced, that's a CRITICAL consideration.
+
+        Search 3 — CHECK WHAT THE PLAN IS MISSING:
+        Search for "[framework] [version] [task type] best practices" or "checklist" or "migration guide"
+        e.g. "next.js 16 app router migration checklist", "next.js 16 caching best practices"
+        Compare the checklist against the plan. Every recommended step the plan omits is a consideration.
+
+        Search 4 — CHECK FOR BREAKING CHANGES:
+        Search for "[framework] [version] breaking changes" or "new features"
+        e.g. "next.js 16 breaking changes", "next.js 16 new APIs"
+        If the plan uses patterns that changed in this version, that's a CRITICAL consideration.
+
+        After all searches, re-read the plan one final time and compare it against the Original Task:
+        - Does the task name a specific API or pattern that the plan does NOT use? Flag as CRITICAL.
+        - Is there ANY API the plan uses that the docs say should be done differently?
+        - Is there ANY required config flag or file that the plan doesn't mention?
+        - Is there ANY naming convention (file names, exports) that the plan gets wrong?
+
+        Severity rules:
+        - CRITICAL: docs recommend a DIFFERENT API/approach than the plan uses, OR a required config/file is missing
+        - IMPORTANT: docs show a best practice the plan doesn't follow
+        - MINOR: style or preference difference
+
+        Output:
+        - Each consideration must have a clear point, detail, and severity
+        - The summary must list key findings — NEVER say "everything looks correct" unless you truly found zero issues
+        - If you found issues, the summary should start with "Found N issues:" followed by a brief list
+        """
+    ).strip()
+
+
+def _render_research_block(plan_dir: Path) -> tuple[str, str]:
+    """Render research findings for injection into critique/review prompts.
+    Returns (research_block, research_instruction)."""
+    research_path = plan_dir / "research.json"
+    if not research_path.exists():
+        return "", ""
+    research = read_json(research_path)
+    considerations = research.get("considerations", [])
+    severity_order = {"critical": 0, "important": 1, "minor": 2}
+    considerations.sort(key=lambda c: severity_order.get(c.get("severity", "minor"), 2))
+    if considerations:
+        consideration_lines = []
+        for c in considerations:
+            severity = c.get("severity", "minor")
+            point = c.get("point") or c.get("topic") or c.get("name") or ""
+            detail = c.get("detail") or c.get("issue") or c.get("description") or ""
+            recommendation = c.get("recommendation") or ""
+            source = c.get("source") or ""
+            line = f"- [{severity.upper()}] {point}"
+            if detail:
+                line += f"\n  {detail}"
+            if recommendation:
+                line += f"\n  Recommendation: {recommendation}"
+            if source:
+                line += f"\n  Source: {source}"
+            consideration_lines.append(line)
+        considerations_block = "\n".join(consideration_lines)
+    else:
+        considerations_block = "- No noteworthy considerations found."
+    research_block = textwrap.dedent(
+        f"""
+        A researcher recommended you consider these points in executing the task:
+
+        {considerations_block}
+        """
+    ).strip()
+    research_instruction = (
+        "- The research considerations above are based on current documentation searches. "
+        "Any item marked CRITICAL or IMPORTANT should be flagged if the plan doesn't address it."
+    )
+    return research_block, research_instruction
+
+
+def _render_prep_block(plan_dir: Path) -> tuple[str, str]:
+    prep_path = plan_dir / "prep.json"
+    if not prep_path.exists():
+        return "", ""
+    prep = read_json(prep_path)
+    # If prep decided to skip (task was simple enough), return empty —
+    # downstream phases will use the original task description as-is
+    if prep.get("skip", False):
+        return "", ""
+    prep = read_json(prep_path)
+
+    def _cell(value: object) -> str:
+        if isinstance(value, list):
+            value = ", ".join(str(item).strip() for item in value if str(item).strip())
+        text = str(value).strip()
+        if not text:
+            return "-"
+        return text.replace("|", "\\|").replace("\n", " ")
+
+    task_summary = str(prep.get("task_summary", "")).strip() or "No task summary provided."
+
+    evidence_items = prep.get("key_evidence", [])
+    if isinstance(evidence_items, list) and evidence_items:
+        evidence_lines = []
+        for item in evidence_items:
+            if not isinstance(item, dict):
+                continue
+            point = str(item.get("point", "")).strip() or "Unspecified evidence"
+            source = str(item.get("source", "")).strip() or "unspecified source"
+            relevance = str(item.get("relevance", "")).strip() or "unspecified relevance"
+            evidence_lines.append(f"- {point} (source: {source}; relevance: {relevance})")
+        evidence_block = "\n".join(evidence_lines) if evidence_lines else "- No key evidence captured."
+    else:
+        evidence_block = "- No key evidence captured."
+
+    relevant_code_items = prep.get("relevant_code", [])
+    if isinstance(relevant_code_items, list) and relevant_code_items:
+        code_lines = [
+            "| File | Functions | Why |",
+            "| --- | --- | --- |",
+        ]
+        for item in relevant_code_items:
+            if not isinstance(item, dict):
+                continue
+            code_lines.append(
+                f"| {_cell(item.get('file_path', ''))} | {_cell(item.get('functions', []))} | {_cell(item.get('why', ''))} |"
+            )
+        relevant_code_block = "\n".join(code_lines) if len(code_lines) > 2 else "- No directly relevant code captured."
+    else:
+        relevant_code_block = "- No directly relevant code captured."
+
+    test_expectation_items = prep.get("test_expectations", [])
+    if isinstance(test_expectation_items, list) and test_expectation_items:
+        test_lines = []
+        for item in test_expectation_items:
+            if not isinstance(item, dict):
+                continue
+            test_id = str(item.get("test_id", "")).strip() or "unnamed test"
+            status = str(item.get("status", "")).strip() or "unknown"
+            what_it_checks = str(item.get("what_it_checks", "")).strip() or "No description provided."
+            test_lines.append(f"- [{status}] {test_id}: {what_it_checks}")
+        test_expectations_block = "\n".join(test_lines) if test_lines else "- No explicit test expectations captured."
+    else:
+        test_expectations_block = "- No explicit test expectations captured."
+
+    constraints = prep.get("constraints", [])
+    if isinstance(constraints, list) and constraints:
+        constraint_lines = [f"- {str(item).strip()}" for item in constraints if str(item).strip()]
+        constraints_block = "\n".join(constraint_lines) if constraint_lines else "- No explicit constraints captured."
+    else:
+        constraints_block = "- No explicit constraints captured."
+
+    suggested_approach = str(prep.get("suggested_approach", "")).strip() or "No suggested approach provided."
+
+    prep_block = textwrap.dedent(
+        f"""
+        Engineering brief produced from the codebase and task details:
+
+        ### Task Summary
+        {task_summary}
+
+        ### Key Evidence
+        {evidence_block}
+
+        ### Relevant Code
+        {relevant_code_block}
+
+        ### Test Expectations
+        {test_expectations_block}
+
+        ### Constraints
+        {constraints_block}
+
+        ### Suggested Approach
+        {suggested_approach}
+        """
+    ).strip()
+    prep_instruction = "The engineering brief above was produced by analyzing the codebase. Use it as primary context."
+    return prep_block, prep_instruction
+
+
 def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
+    research_block, research_instruction = _render_research_block(plan_dir)
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     structure_warnings = latest_meta.get("structure_warnings", [])
@@ -310,6 +611,10 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         Project directory:
         {project_dir}
 
+        {prep_block}
+
+        {prep_instruction}
+
         {intent_and_notes_block(state)}
 
         Plan:
@@ -324,9 +629,12 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         Existing flags:
         {json_dump(unresolved).strip()}
 
+        {research_block}
+
         {debt_block}
 
         Requirements:
+        - First, assess whether the plan targets the correct root cause. If the proposed fix already exists in the codebase, or if the plan contradicts evidence you find, flag this as CRITICAL — the plan needs a fundamentally different approach, not just adjustments.
         - Consider whether the plan is at the right level of abstraction.
         - Reuse existing flag IDs when the same concern is still open.
         - `verified_flag_ids` should list previously addressed flags that now appear resolved.
@@ -337,9 +645,12 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         - Missing required sections or step coverage (for example: no H1, no `## Overview`, or no step sections at all) should be flagged as category `completeness` with severity_hint `likely-significant`.
         - Structural formatting within steps (for example: prose instead of numbered substeps, or a missing file reference inside an otherwise actionable step) should usually be category `completeness` with severity_hint `likely-minor` because the executor can still follow the instructions.
         - Ask whether the plan is the simplest approach that solves the stated problem, whether it could use fewer steps or less machinery, and whether it introduces unnecessary complexity.
+        - If the task hints suggest a specific approach and the plan deviates, flag it. The issue author often knows the correct fix.
+        - If the plan limits scope to avoid breaking tests, flag as a potential under-fix.
         - Over-engineering concerns should use category `maintainability`, should usually prefix the concern with "Over-engineering:", and should scale severity_hint to the practical impact.
         - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
         - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
+        {research_instruction}
         """
     ).strip()
 
@@ -355,6 +666,7 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         {
             "id": flag["id"],
             "concern": flag["concern"],
+            "evidence": flag.get("evidence", ""),
             "category": flag["category"],
             "severity": flag.get("severity", "unknown"),
             "status": flag["status"],
@@ -392,7 +704,8 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
 
         Requirements:
         - Decide exactly one of: PROCEED, ITERATE, ESCALATE.
-        - Use the weighted score, flag details, plan delta, recurring critiques, loop summary, and preflight results as judgment context, not as a fixed decision table.
+        - Use the weighted score, flag details (including the `evidence` field — not just `concern`), plan delta, recurring critiques, loop summary, and preflight results as judgment context, not as a fixed decision table.
+        - Unresolved correctness flags (wrong root cause, missing code locations, under-scoped fix) should block PROCEED unless you can explain with evidence why the flag is wrong.
         - PROCEED when execution should move forward now.
         - ITERATE when revising the plan is the best next move.
         - ESCALATE when the loop is stuck, churn is recurring, or user intervention is needed.
@@ -454,6 +767,7 @@ def _flag_summary(registry: FlagRegistry) -> list[dict[str, object]]:
         {
             "id": f["id"],
             "concern": f["concern"],
+            "evidence": f.get("evidence", ""),
             "status": f["status"],
             "severity": f.get("severity", "unknown"),
         }
@@ -463,6 +777,7 @@ def _flag_summary(registry: FlagRegistry) -> list[dict[str, object]]:
 
 def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     gate = read_json(plan_dir / "gate.json")
@@ -475,6 +790,10 @@ def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         Project directory:
         {project_dir}
+
+        {prep_block}
+
+        {prep_instruction}
 
         {intent_and_notes_block(state)}
 
@@ -513,12 +832,15 @@ def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         - `meta_commentary` must be a single string with execution guidance, gotchas, or judgment calls that help the executor succeed.
         - Preserve information that strong existing artifacts already capture well: execution ordering, watch-outs, reviewer checkpoints, and practical context.
         - The structured output should be self-contained: an executor reading only `finalize.json` should have everything needed to work.
+        - Keep the task count proportional to the work. A simple 1-2 file fix should be 2 tasks: (1) apply the fix, (2) run tests. Do NOT create separate "inspect" or "read" tasks for simple changes — the executor can read and fix in one step. Only create more tasks when the work has genuinely independent stages.
+        - The FINAL task MUST always be to run tests and verify the changes work. If specific test IDs or commands are mentioned in the original task, include them. Otherwise, the executor should find and run the tests most relevant to the files changed. If any test fails, read the error, fix the code, and re-run until they pass. Do NOT create new test files — run the project's existing test suite.
         """
     ).strip()
 
 
 def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
     # Codex execute often cannot write back into plan_dir during --full-auto, so
     # checkpoint instructions must stay best-effort rather than mandatory.
     finalize_path = str(plan_dir / "finalize.json")
@@ -595,6 +917,10 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         Project directory:
         {project_dir}
 
+        {prep_block}
+
+        {prep_instruction}
+
         {intent_and_notes_block(state)}
 
         Execution tracking source of truth (`finalize.json`):
@@ -620,6 +946,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         - Implement the intent, not just the text.
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
+        - Do not over-engineer beyond what the plan prescribes — no str() wraps, .get() fallbacks, or try/except guards unless the plan called for them or you found a concrete reason.
+        - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
         - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
         - Use the tasks in `finalize.json` as the execution boundary.
         - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
@@ -833,6 +1161,7 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     robustness = configured_robustness(state)
     settled_decisions_block = _settled_decisions_block(gate)
     settled_decisions_instruction = _settled_decisions_instruction(gate)
+    review_research_block, review_research_instruction = _render_research_block(plan_dir)
     robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
@@ -868,6 +1197,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {settled_decisions_block}
 
+        {review_research_block}
+
         Execution summary:
         {json_dump(execution).strip()}
 
@@ -881,6 +1212,7 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         - Be critical and call out real misses.
         {robustness_lines}
         {settled_decisions_instruction}
+        {review_research_instruction}
         - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself is acceptable.
         - Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.
         - Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.
@@ -927,6 +1259,7 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     robustness = configured_robustness(state)
     settled_decisions_block = _settled_decisions_block(gate)
     settled_decisions_instruction = _settled_decisions_instruction(gate)
+    review_research_block, review_research_instruction = _render_research_block(plan_dir)
     robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
@@ -962,6 +1295,8 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {settled_decisions_block}
 
+        {review_research_block}
+
         Execution summary:
         {json_dump(execution).strip()}
 
@@ -975,6 +1310,7 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         - Verify each success criterion explicitly.
         {robustness_lines}
         {settled_decisions_instruction}
+        {review_research_instruction}
         - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself checks out.
         - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
         - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
@@ -1015,6 +1351,8 @@ _PromptBuilder = Callable[..., str]
 
 _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
+    "prep": _prep_prompt,
+    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -1025,6 +1363,8 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 
 _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
+    "prep": _prep_prompt,
+    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -1036,6 +1376,8 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 
 _HERMES_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
+    "prep": _prep_prompt,
+    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -1049,7 +1391,7 @@ def create_claude_prompt(step: str, state: PlanState, plan_dir: Path, root: Path
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
-    if step in {"critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
@@ -1058,7 +1400,7 @@ def create_codex_prompt(step: str, state: PlanState, plan_dir: Path, root: Path 
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
-    if step in {"critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
@@ -1067,6 +1409,6 @@ def create_hermes_prompt(step: str, state: PlanState, plan_dir: Path, root: Path
     builder = _HERMES_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Hermes step '{step}'")
-    if step in {"critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)

@@ -252,8 +252,8 @@ def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
         return []
     previous = read_json(current_iteration_artifact(plan_dir, "critique", iteration - 1))
     current = read_json(current_iteration_artifact(plan_dir, "critique", iteration))
-    previous_concerns = {normalize_text(flag["concern"]) for flag in previous.get("flags", [])}
-    current_concerns = {normalize_text(flag["concern"]) for flag in current.get("flags", [])}
+    previous_concerns = {normalize_text(flag.get("concern", "")) for flag in previous.get("flags", []) if isinstance(flag, dict)}
+    current_concerns = {normalize_text(flag.get("concern", "")) for flag in current.get("flags", []) if isinstance(flag, dict)}
     return sorted(previous_concerns.intersection(current_concerns))
 
 
@@ -568,13 +568,15 @@ def run_gate_checks(
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
     lookup = command_lookup or (lambda name: None)
-    checks = {
+    configured_agent = state.get("config", {}).get("agent", "")
+    checks: dict[str, bool] = {
         "project_dir_exists": project_dir.exists(),
         "project_dir_writable": os.access(project_dir, os.W_OK),
         "success_criteria_present": bool(meta.get("success_criteria")),
-        "claude_available": bool(lookup("claude")),
-        "codex_available": bool(lookup("codex")),
     }
+    if configured_agent != "hermes":
+        checks["claude_available"] = bool(lookup("claude"))
+        checks["codex_available"] = bool(lookup("codex"))
     return {
         "passed": all(checks.values()),
         "criteria_check": {

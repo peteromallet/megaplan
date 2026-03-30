@@ -3,6 +3,53 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+# Common field name aliases that models use instead of the canonical names.
+# Models often use finalize.json's field names (e.g. "id") instead of the
+# execute schema's names (e.g. "task_id").
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "task_id": ("id", "taskId", "task"),
+    "sense_check_id": ("id", "senseCheckId", "check_id"),
+    "executor_notes": ("notes", "executor_note", "note"),
+    "executor_note": ("notes", "executor_notes", "note"),
+    "concern": ("summary", "description", "issue", "finding"),
+    "evidence": ("detail", "details", "explanation", "reasoning"),
+}
+
+
+# Normalize enum values to canonical forms.
+_VALUE_ALIASES: dict[str, dict[str, str]] = {
+    "status": {"completed": "done", "complete": "done", "skip": "skipped"},
+}
+
+
+def _normalize_field_aliases(entry: dict[str, Any], required_fields: tuple[str, ...]) -> dict[str, Any]:
+    """Copy aliased field values to canonical names if the canonical name is missing,
+    and normalize enum value synonyms."""
+    for field in required_fields:
+        if field in entry:
+            continue
+        aliases = _FIELD_ALIASES.get(field, ())
+        for alias in aliases:
+            if alias in entry:
+                entry[field] = entry[alias]
+                break
+    # Default missing array fields to [] and missing string fields to ""
+    # rather than rejecting. Models often omit empty arrays/strings.
+    for field in required_fields:
+        if field not in entry:
+            if field in ("files_changed", "commands_run"):
+                entry[field] = []
+            elif field in ("executor_notes", "executor_note"):
+                entry[field] = "(not provided)"
+    # Normalize enum value aliases
+    for field, value_map in _VALUE_ALIASES.items():
+        if field in entry and isinstance(entry[field], str):
+            canonical = value_map.get(entry[field])
+            if canonical is not None:
+                entry[field] = canonical
+    return entry
+
+
 def _validate_merge_inputs(
     entries: Any,
     *,
@@ -24,6 +71,8 @@ def _validate_merge_inputs(
             if deviations is not None:
                 deviations.append(f"Skipped malformed {label}[{index}]: expected object.")
             continue
+        # Normalize field aliases before checking required fields
+        _normalize_field_aliases(entry, required_fields)
         if any(field not in entry for field in required_fields):
             if deviations is not None:
                 deviations.append(f"Skipped malformed {label}[{index}]: missing required keys.")

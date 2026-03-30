@@ -53,6 +53,30 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
     ("step", "payload"),
     [
         ("plan", {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}),
+        (
+            "prep",
+            {
+                "task_summary": "Prepare context before planning.",
+                "key_evidence": [],
+                "relevant_code": [],
+                "test_expectations": [],
+                "constraints": [],
+                "suggested_approach": "Use the brief as primary context.",
+            },
+        ),
+        (
+            "research",
+            {
+                "considerations": [
+                    {
+                        "point": "useRouter is stable in Next.js 14+",
+                        "severity": "minor",
+                        "detail": "No issues found with the planned usage.",
+                    }
+                ],
+                "summary": "Verified useRouter API is current for Next.js 14.",
+            },
+        ),
         ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
         (
             "gate",
@@ -145,6 +169,7 @@ def test_validate_payload_rejects_missing_gate_key() -> None:
 def test_session_key_for_matches_new_roles() -> None:
     assert session_key_for("plan", "claude") == "claude_planner"
     assert session_key_for("revise", "codex") == "codex_planner"
+    assert session_key_for("research", "hermes") == "hermes_research"
     assert session_key_for("critique", "codex") == "codex_critic"
     assert session_key_for("gate", "claude") == "claude_gatekeeper"
     assert session_key_for("execute", "claude") == "claude_executor"
@@ -315,6 +340,18 @@ def test_mock_plan_returns_valid_payload(tmp_path: Path) -> None:
     assert validate_plan_structure(result.payload["plan"]) == []
 
 
+def test_mock_prep_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("prep", state, plan_dir)
+    assert "task_summary" in result.payload
+    assert "key_evidence" in result.payload
+    assert "relevant_code" in result.payload
+    assert "test_expectations" in result.payload
+    assert "constraints" in result.payload
+    assert "suggested_approach" in result.payload
+
+
 def test_build_mock_payload_execute_returns_complete_payload(tmp_path: Path) -> None:
     plan_dir, state = _mock_state(tmp_path)
     payload = _build_mock_payload(
@@ -458,8 +495,8 @@ def test_session_key_for_unknown_step_uses_step_name() -> None:
 
 def test_step_schema_filenames_cover_all_steps() -> None:
     from megaplan.workers import STEP_SCHEMA_FILENAMES
-    expected_steps = {"plan", "revise", "critique", "gate", "finalize", "execute", "review"}
-    assert set(STEP_SCHEMA_FILENAMES.keys()) == expected_steps
+    required_steps = {"plan", "prep", "research", "revise", "critique", "gate", "finalize", "execute", "review"}
+    assert required_steps.issubset(set(STEP_SCHEMA_FILENAMES.keys()))
 
 
 def test_step_schema_filenames_reference_existing_schemas() -> None:

@@ -372,53 +372,59 @@ def _merge_batch_results(
     pre_merge_statuses = _snapshot_task_statuses(
         [task for task in finalize_data.get("tasks", []) if task.get("id") in batch_task_id_set]
     )
-    batch_tasks_by_id = {
+    # Accept task_updates for ANY valid task, not just the current batch.
+    # Models often complete multiple batches' worth of work in one pass —
+    # rejecting the extra work as "unknown task_id" wastes correct results.
+    all_tasks_by_id = {
         task["id"]: task
         for task in finalize_data.get("tasks", [])
-        if task.get("id") in batch_task_id_set
+        if isinstance(task, dict) and isinstance(task.get("id"), str)
     }
-    merged_count, total_batch_tasks = _validate_and_merge_batch(
+    merged_count, _ = _validate_and_merge_batch(
         payload.get("task_updates"),
         required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
-        targets_by_id=batch_tasks_by_id,
+        targets_by_id=all_tasks_by_id,
         id_field="task_id",
         merge_fields=("status", "executor_notes", "files_changed", "commands_run"),
         issues=issues,
         validation_label="task_updates",
         merge_label="task_update",
-        incomplete_message=(
-            lambda merged, total: (
-                f"{total - merged}/{total} batch tasks have no executor update — tracking is incomplete."
-            )
-        ),
-        enum_fields={"status": {"done", "skipped"}},
+        # Don't flag incomplete based on all tasks — check batch coverage below
+        incomplete_message=None,
+        enum_fields={"status": {"done", "skipped", "completed"}},
         nonempty_fields={"executor_notes"},
         array_fields=("files_changed", "commands_run"),
     )
-    batch_sense_checks_by_id = {
+    # Check batch-specific coverage: how many of THIS batch's tasks got updates?
+    total_batch_tasks = len(batch_task_id_set)
+    batch_merged = sum(1 for tid in batch_task_id_set if all_tasks_by_id.get(tid, {}).get("status") in ("done", "skipped"))
+    if batch_merged < total_batch_tasks:
+        issues.append(f"{total_batch_tasks - batch_merged}/{total_batch_tasks} batch tasks have no executor update — tracking is incomplete.")
+    # Same for sense checks — accept any valid sense check ID.
+    all_sense_checks_by_id = {
         sense_check["id"]: sense_check
         for sense_check in finalize_data.get("sense_checks", [])
-        if sense_check.get("id") in batch_sense_check_id_set
+        if isinstance(sense_check, dict) and isinstance(sense_check.get("id"), str)
     }
-    acknowledged_count, total_batch_checks = _validate_and_merge_batch(
+    acknowledged_count, _ = _validate_and_merge_batch(
         payload.get("sense_check_acknowledgments"),
         required_fields=("sense_check_id", "executor_note"),
-        targets_by_id=batch_sense_checks_by_id,
+        targets_by_id=all_sense_checks_by_id,
         id_field="sense_check_id",
         merge_fields=("executor_note",),
         issues=issues,
         validation_label="sense_check_acknowledgments",
         merge_label="sense_check_acknowledgment",
-        incomplete_message=(
-            lambda merged, total: (
-                f"{total - merged}/{total} batch sense checks have no executor acknowledgment — tracking is incomplete."
-            )
-        ),
+        incomplete_message=None,
         nonempty_fields={"executor_note"},
     )
+    total_batch_checks = len(batch_sense_check_id_set)
+    batch_acknowledged = sum(1 for sid in batch_sense_check_id_set if all_sense_checks_by_id.get(sid, {}).get("executor_note"))
+    if batch_acknowledged < total_batch_checks:
+        issues.append(f"{total_batch_checks - batch_acknowledged}/{total_batch_checks} batch sense checks have no executor acknowledgment — tracking is incomplete.")
     _append_execute_reconciliation_advisories(
         before_statuses=pre_merge_statuses,
-        tasks_by_id=batch_tasks_by_id,
+        tasks_by_id=all_tasks_by_id,
         issues=issues,
     )
     return merged_count, total_batch_tasks, acknowledged_count, total_batch_checks
@@ -603,7 +609,7 @@ def _merge_timeout_checkpoint(
         issues=issues,
         validation_label=f"{checkpoint_name}.task_updates",
         merge_label="checkpoint task_update",
-        enum_fields={"status": {"done", "skipped"}},
+        enum_fields={"status": {"done", "skipped", "completed"}},
         nonempty_fields={"executor_notes"},
         array_fields=("files_changed", "commands_run"),
     )

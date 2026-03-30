@@ -2,7 +2,7 @@
 
 from megaplan.types import (
     PlanState, PlanConfig, PlanMeta, FlagRecord, StepResponse,
-    STATE_INITIALIZED, STATE_PLANNED, STATE_CRITIQUED,
+    STATE_INITIALIZED, STATE_PLANNED, STATE_RESEARCHED, STATE_CRITIQUED,
     STATE_GATED, STATE_FINALIZED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, MOCK_ENV_VAR,
     CliError,
@@ -24,6 +24,7 @@ from megaplan.evaluation import (
 from megaplan.handlers import (
     handle_init,
     handle_plan,
+    handle_research,
     handle_critique,
     handle_revise,
     handle_gate,
@@ -46,13 +47,13 @@ __all__ = [
     # Types
     "PlanState", "PlanConfig", "PlanMeta", "FlagRecord", "StepResponse",
     # State constants
-    "STATE_INITIALIZED", "STATE_PLANNED", "STATE_CRITIQUED",
+    "STATE_INITIALIZED", "STATE_PLANNED", "STATE_RESEARCHED", "STATE_CRITIQUED",
     "STATE_GATED", "STATE_FINALIZED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
     "TERMINAL_STATES", "MOCK_ENV_VAR",
     # Error and result types
     "CliError", "CommandResult", "WorkerResult",
     # Handlers
-    "handle_init", "handle_plan", "handle_critique",
+    "handle_init", "handle_plan", "handle_research", "handle_critique",
     "handle_revise", "handle_gate", "handle_finalize", "handle_execute",
     "handle_review", "handle_step", "handle_status", "handle_audit", "handle_progress", "handle_list",
     "handle_override", "handle_setup", "handle_setup_global", "handle_config",

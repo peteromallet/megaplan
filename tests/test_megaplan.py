@@ -17,8 +17,9 @@ import megaplan.cli
 import megaplan._core
 import megaplan.workers
 from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
-from megaplan._core import WORKFLOW, WORKFLOW_OVERRIDES, ensure_runtime_layout, load_plan, workflow_next
+from megaplan._core import WORKFLOW, _ROBUSTNESS_OVERRIDES, ensure_runtime_layout, load_plan, workflow_next
 from megaplan.prompts import create_claude_prompt
+from megaplan.types import STATE_PREPPED
 from megaplan.workers import WorkerResult, _build_mock_payload
 
 
@@ -143,7 +144,7 @@ def test_init_sets_last_gate_and_next_step_plan(plan_fixture: PlanFixture) -> No
     assert state["iteration"] == 0
 
 
-def test_init_response_points_to_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_response_points_to_next_step_by_robustness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "root"
     project_dir = tmp_path / "project"
     root.mkdir()
@@ -153,13 +154,20 @@ def test_init_response_points_to_plan(tmp_path: Path, monkeypatch: pytest.Monkey
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
-    response = megaplan.handle_init(root, make_args_factory(project_dir)())
-    assert response["next_step"] == "plan"
+    make_args = make_args_factory(project_dir)
+    standard = megaplan.handle_init(root, make_args(name="standard-plan", robustness="standard"))
+    light = megaplan.handle_init(root, make_args(name="light-plan", robustness="light"))
+    heavy = megaplan.handle_init(root, make_args(name="heavy-plan", robustness="heavy"))
+    assert standard["next_step"] == "plan"
+    assert light["next_step"] == "plan"
+    assert heavy["next_step"] == "prep"
 
 
 _LEGACY_STATE_MACHINE_CASES = [
     ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, ["plan"]),
-    ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, ["plan", "critique", "step"]),
+    ({"current_state": STATE_PREPPED, "last_gate": {}}, ["plan"]),
+    ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, ["critique", "plan", "step"]),
+    ({"current_state": megaplan.STATE_RESEARCHED, "last_gate": {}}, ["critique", "step"]),
     ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, ["gate", "step"]),
     ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}, ["revise", "step"]),
     (
@@ -214,6 +222,7 @@ def test_workflow_definition_is_complete_for_standard_flow() -> None:
     expected_states = {
         megaplan.STATE_INITIALIZED,
         megaplan.STATE_PLANNED,
+        megaplan.STATE_RESEARCHED,
         megaplan.STATE_CRITIQUED,
         megaplan.STATE_GATED,
         megaplan.STATE_FINALIZED,
@@ -223,7 +232,7 @@ def test_workflow_definition_is_complete_for_standard_flow() -> None:
     assert expected_states.issubset(WORKFLOW)
     for state_name, transitions in WORKFLOW.items():
         assert transitions or state_name in megaplan.TERMINAL_STATES
-    for robustness, overrides in WORKFLOW_OVERRIDES.items():
+    for robustness, overrides in _ROBUSTNESS_OVERRIDES.items():
         assert robustness in megaplan._core.ROBUSTNESS_LEVELS
         assert set(overrides).issubset(WORKFLOW)
 
@@ -268,6 +277,54 @@ def test_workflow_walk_matches_documented_standard_flow() -> None:
     ]
 
 
+def test_workflow_walk_matches_documented_robust_flow() -> None:
+    robust_config = {"config": {"robustness": "heavy"}}
+    walk = [
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **robust_config}, "prep"),
+        ({"current_state": STATE_PREPPED, "last_gate": {}, **robust_config}, "plan"),
+        ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}, **robust_config}, "research"),
+        ({"current_state": megaplan.STATE_RESEARCHED, "last_gate": {}, **robust_config}, "critique"),
+        ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, **robust_config}, "gate"),
+        (
+            {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}, **robust_config},
+            "revise",
+        ),
+        ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}, **robust_config}, "research"),
+        ({"current_state": megaplan.STATE_RESEARCHED, "last_gate": {}, **robust_config}, "critique"),
+        (
+            {
+                "current_state": megaplan.STATE_CRITIQUED,
+                "last_gate": {"recommendation": "PROCEED", "passed": True},
+                **robust_config,
+            },
+            "gate",
+        ),
+        ({"current_state": megaplan.STATE_GATED, "last_gate": {}, **robust_config}, "finalize"),
+        ({"current_state": megaplan.STATE_FINALIZED, "last_gate": {}, **robust_config}, "execute"),
+        ({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, **robust_config}, "review"),
+    ]
+
+    actual_steps: list[str] = []
+    for state, expected_step in walk:
+        assert expected_step in workflow_next(state)
+        actual_steps.append(expected_step)
+
+    assert actual_steps == [
+        "prep",
+        "plan",
+        "research",
+        "critique",
+        "gate",
+        "revise",
+        "research",
+        "critique",
+        "gate",
+        "finalize",
+        "execute",
+        "review",
+    ]
+
+
 def test_workflow_walk_matches_documented_light_flow() -> None:
     light_config = {"config": {"robustness": "light"}}
     walk = [
@@ -285,6 +342,23 @@ def test_workflow_walk_matches_documented_light_flow() -> None:
 
     assert workflow_next({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, **light_config}) == []
     assert actual_steps == ["plan", "critique", "revise", "finalize", "execute"]
+
+
+def test_light_and_standard_skip_research() -> None:
+    """Light and standard robustness go directly from planned to critique, skipping research."""
+    for level in ("light", "standard"):
+        state = {"current_state": megaplan.STATE_PLANNED, "last_gate": {}, "config": {"robustness": level}}
+        next_steps = workflow_next(state)
+        assert "critique" in next_steps, f"{level} should offer critique"
+        assert "research" not in next_steps, f"{level} should skip research"
+
+
+def test_robust_includes_research() -> None:
+    """Robust robustness routes from planned to research before critique."""
+    robust_state = {"current_state": megaplan.STATE_PLANNED, "last_gate": {}, "config": {"robustness": "heavy"}}
+    next_steps = workflow_next(robust_state)
+    assert "research" in next_steps
+    assert next_steps[0] == "research"
 
 
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
@@ -307,16 +381,39 @@ def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixt
     assert (plan_fixture.plan_dir / "critique_v1.json").exists()
 
 
-def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
+def test_workflow_mock_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from megaplan.handlers import handle_prep
+
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="heavy")
     make_args = plan_fixture.make_args
+    recorded_steps: list[str] = []
+    original_run_step = megaplan.workers.run_step_with_worker
+
+    def _record(step: str, *args: object, **kwargs: object) -> tuple[WorkerResult, str, str, bool]:
+        recorded_steps.append(step)
+        if step == "research":
+            worker = WorkerResult(
+                payload={"considerations": [], "summary": "Mock research summary."},
+                raw_output="{}",
+                duration_ms=1,
+                cost_usd=0.0,
+                session_id="research-mock",
+            )
+            return worker, "claude", "persistent", False
+        return original_run_step(step, *args, **kwargs)
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _record)
     megaplan.handle_override(
         plan_fixture.root,
         make_args(plan=plan_fixture.plan_name, override_action="add-note", note="keep changes scoped"),
     )
+    prep = handle_prep(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     plan = megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    research1 = megaplan.handle_research(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     critique1 = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     gate1 = megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     revise = megaplan.handle_revise(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    research2 = megaplan.handle_research(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     critique2 = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     gate2 = megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     finalize = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
@@ -335,10 +432,16 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     revise_meta = read_json(plan_fixture.plan_dir / "plan_v2.meta.json")
     state = load_state(plan_fixture.plan_dir)
 
+    assert prep["state"] == STATE_PREPPED
+    assert prep["next_step"] == "plan"
     assert plan["state"] == megaplan.STATE_PLANNED
+    assert plan["next_step"] == "research"
+    assert research1["state"] == megaplan.STATE_RESEARCHED
     assert critique1["state"] == megaplan.STATE_CRITIQUED
     assert gate1["recommendation"] == "ITERATE"
     assert revise["state"] == megaplan.STATE_PLANNED
+    assert revise["next_step"] == "research"
+    assert research2["state"] == megaplan.STATE_RESEARCHED
     assert critique2["iteration"] == 2
     assert gate2["state"] == megaplan.STATE_GATED
     assert gate2["recommendation"] == "PROCEED"
@@ -347,6 +450,7 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert revise_meta["structure_warnings"] == []
     assert (plan_fixture.plan_dir / "final.md").exists()
     assert (plan_fixture.plan_dir / "finalize.json").exists()
+    assert (plan_fixture.plan_dir / "prep.json").exists()
     assert finalized_tracking["tasks"][0]["status"] == "pending"
     assert "# Execution Checklist" in final_md_after_finalize
     assert execute["state"] == megaplan.STATE_EXECUTED
@@ -362,6 +466,20 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     review_entry = next(entry for entry in state["history"] if entry["step"] == "review")
     assert execute_entry["finalize_hash"].startswith("sha256:")
     assert review_entry["finalize_hash"].startswith("sha256:")
+    assert recorded_steps == [
+        "prep",
+        "plan",
+        "research",
+        "critique",
+        "gate",
+        "revise",
+        "research",
+        "critique",
+        "gate",
+        "finalize",
+        "execute",
+        "review",
+    ]
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
 
 
@@ -409,6 +527,17 @@ def test_workflow_light_robustness_single_pass(
         "finalize",
         "execute",
     ]
+
+
+def test_cli_registers_prep_command() -> None:
+    parser = megaplan.cli.build_parser()
+    parsed = parser.parse_args(["prep", "--plan", "demo"])
+
+    assert parsed.command == "prep"
+    assert parsed.plan == "demo"
+    from megaplan.handlers import handle_prep
+
+    assert megaplan.cli.COMMAND_HANDLERS["prep"] is handle_prep
 
 
 def test_light_critique_routes_to_revise(

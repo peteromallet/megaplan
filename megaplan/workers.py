@@ -39,16 +39,21 @@ from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
 WORKER_TIMEOUT_SECONDS = 7200
+_EXECUTE_STEPS = {"execute", "loop_execute"}
 
 # Shared mapping from step name to schema filename, used by both
 # run_claude_step and run_codex_step.
 STEP_SCHEMA_FILENAMES: dict[str, str] = {
     "plan": "plan.json",
+    "prep": "prep.json",
+    "research": "research.json",
     "revise": "revise.json",
     "critique": "critique.json",
     "gate": "gate.json",
     "finalize": "finalize.json",
     "execute": "execution.json",
+    "loop_plan": "loop_plan.json",
+    "loop_execute": "loop_execute.json",
     "review": "review.json",
 }
 
@@ -290,6 +295,54 @@ def _default_mock_plan_payload(state: PlanState, plan_dir: Path) -> dict[str, An
     return payload
 
 
+def _default_mock_prep_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+    del plan_dir
+    return {
+        "task_summary": str(state.get("idea", "")).strip() or "Prepare a concise engineering brief for the requested task.",
+        "key_evidence": [],
+        "relevant_code": [],
+        "test_expectations": [],
+        "constraints": [],
+        "suggested_approach": "Inspect the code paths named in the task, read nearby tests first when they exist, then carry the distilled brief into planning.",
+    }
+
+
+def _loop_goal(state: dict[str, Any]) -> str:
+    return str(state.get("idea", state.get("spec", {}).get("goal", "")))
+
+
+def _default_mock_loop_plan_payload(state: dict[str, Any], plan_dir: Path) -> dict[str, Any]:
+    spec = state.get("spec", {})
+    goal = _loop_goal(state)
+    return {
+        "spec_updates": {
+            "known_issues": spec.get("known_issues", []),
+            "tried_and_failed": spec.get("tried_and_failed", []),
+            "best_result_summary": f"Most recent mock planning pass for: {goal}",
+        },
+        "next_action": "Run the project command, inspect the failures, and prepare the next minimal fix.",
+        "reasoning": "The loop spec is initialized and ready for an execution pass based on the current goal and retained context.",
+    }
+
+
+def _default_mock_loop_execute_payload(
+    state: dict[str, Any],
+    plan_dir: Path,
+    *,
+    prompt_override: str | None = None,
+) -> dict[str, Any]:
+    spec = state.get("spec", {})
+    goal = _loop_goal(state)
+    return {
+        "diagnosis": f"Mock execution diagnosis for goal: {goal}",
+        "fix_description": "Inspect the command failure, update the smallest relevant file, and rerun the command.",
+        "files_to_change": list(spec.get("allowed_changes", []))[:3],
+        "confidence": "medium",
+        "outcome": "continue",
+        "should_pause": False,
+    }
+
+
 def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     iteration = state["iteration"] or 1
     if iteration == 1:
@@ -527,31 +580,44 @@ def _default_mock_review_payload(state: PlanState, plan_dir: Path) -> dict[str, 
     }
 
 
-_MockPayloadBuilder = Callable[[PlanState, Path], dict[str, Any]]
+_MockPayloadBuilder = Callable[[dict[str, Any], Path], dict[str, Any]]
 
 _MOCK_DEFAULTS: dict[str, _MockPayloadBuilder] = {
     "plan": _default_mock_plan_payload,
+    "prep": _default_mock_prep_payload,
+    "loop_plan": _default_mock_loop_plan_payload,
     "critique": _default_mock_critique_payload,
     "revise": _default_mock_revise_payload,
     "gate": _default_mock_gate_payload,
     "finalize": _default_mock_finalize_payload,
     "execute": _default_mock_execute_payload,
+    "loop_execute": _default_mock_loop_execute_payload,
     "review": _default_mock_review_payload,
 }
 
 
-def _build_mock_payload(step: str, state: PlanState, plan_dir: Path, **overrides: Any) -> dict[str, Any]:
+def _build_mock_payload(step: str, state: dict[str, Any], plan_dir: Path, **overrides: Any) -> dict[str, Any]:
     builder = _MOCK_DEFAULTS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
     prompt_override = overrides.pop("prompt_override", None)
-    if step == "execute":
+    if step in _EXECUTE_STEPS:
+        if step == "loop_execute":
+            return _deep_merge(_default_mock_loop_execute_payload(state, plan_dir, prompt_override=prompt_override), overrides)
         return _deep_merge(_default_mock_execute_payload(state, plan_dir, prompt_override=prompt_override), overrides)
     return _deep_merge(builder(state, plan_dir), overrides)
 
 
 def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("plan", state, plan_dir))
+
+
+def _mock_prep(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("prep", state, plan_dir))
+
+
+def _mock_loop_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("loop_plan", state, plan_dir))
 
 
 def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -579,6 +645,13 @@ def _mock_execute(state: PlanState, plan_dir: Path, *, prompt_override: str | No
     )
 
 
+def _mock_loop_execute(state: PlanState, plan_dir: Path, *, prompt_override: str | None = None) -> WorkerResult:
+    return _mock_result(
+        _build_mock_payload("loop_execute", state, plan_dir, prompt_override=prompt_override),
+        trace_output='{"event":"mock-loop-execute"}\n',
+    )
+
+
 def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("review", state, plan_dir))
 
@@ -587,11 +660,14 @@ _MockHandler = Callable[..., WorkerResult]
 
 _MOCK_DISPATCH: dict[str, _MockHandler] = {
     "plan": _mock_plan,
+    "prep": _mock_prep,
+    "loop_plan": _mock_loop_plan,
     "critique": _mock_critique,
     "revise": _mock_revise,
     "gate": _mock_gate,
     "finalize": _mock_finalize,
     "execute": _mock_execute,
+    "loop_execute": _mock_loop_execute,
     "review": _mock_review,
 }
 
@@ -606,7 +682,7 @@ def mock_worker_output(
     handler = _MOCK_DISPATCH.get(step)
     if handler is None:
         raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
-    if step == "execute":
+    if step in _EXECUTE_STEPS:
         return handler(state, plan_dir, prompt_override=prompt_override)
     return handler(state, plan_dir)
 
@@ -670,7 +746,7 @@ def run_claude_step(
     session = state["sessions"].get(session_key, {})
     session_id = session.get("id")
     command = ["claude", "-p", "--output-format", "json", "--json-schema", schema_text, "--add-dir", str(project_dir)]
-    if step == "execute":
+    if step in _EXECUTE_STEPS:
         command.extend(["--permission-mode", "bypassPermissions"])
     if session_id and not fresh:
         command.extend(["--resume", session_id])
@@ -725,7 +801,7 @@ def run_codex_step(
         # codex exec resume does not support --output-schema; we rely on
         # validate_payload() after parsing the output file instead.
         command = ["codex", "exec", "resume"]
-        if step == "execute":
+        if step in _EXECUTE_STEPS:
             command.append("--full-auto")
         if json_trace:
             command.append("--json")
@@ -738,7 +814,7 @@ def run_codex_step(
         command = ["codex", "exec", "--skip-git-repo-check", "-C", str(project_dir), "-o", str(output_path)]
         if not persistent:
             command.append("--ephemeral")
-        if step == "execute":
+        if step in _EXECUTE_STEPS:
             command.append("--full-auto")
         if json_trace:
             command.append("--json")
