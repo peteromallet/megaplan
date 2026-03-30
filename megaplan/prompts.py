@@ -292,6 +292,7 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - test_expectations: Tests that verify the affected behavior.
         - constraints: What must not break.
         - suggested_approach: A concrete approach grounded in what you found.
+        - estimated_scope: How big is this change? (e.g., "1-line fix in one file", "changes needed in 3 files", "new function/class required", "refactor of existing subsystem"). Be honest — if this needs significant new code, say so.
 
         IMPORTANT: After you finish searching and reading files, you MUST output the prep.json as your final message. Do not end with a tool call — end with the JSON object as plain text.
         """
@@ -951,6 +952,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         - Report deviations explicitly.
         - Do not over-engineer beyond what the plan prescribes — no str() wraps, .get() fallbacks, or try/except guards unless the plan called for them or you found a concrete reason.
         - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
+        - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
         - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
         - Use the tasks in `finalize.json` as the execution boundary.
         - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
