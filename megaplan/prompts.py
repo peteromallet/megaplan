@@ -282,7 +282,9 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         7. Once you identify the function, parameter, or pattern that needs fixing, grep for ALL other usages of it in the codebase. If the same parameter is passed in 3 places, all 3 may need the fix. List every call site in relevant_code — do not stop at the first one.
         8. If the code has a `NotImplementedError`, `raise`, `TODO`, or explicit skip for certain inputs, and the bug involves those inputs, the fix likely needs to implement the missing functionality — not just patch around it. Flag this in the brief so the plan knows a larger change is needed.
         9. Look for existing helper functions, utilities, or patterns in the codebase that handle similar cases. If there is existing machinery (e.g., a merge function, a validation helper, a base class method), the fix should use it rather than reinventing.
-        10. Distill into a brief that adds value beyond the raw task description.
+        10. Before finalizing, ask: if I change this function, are there other callers that rely on its current behavior? A function called from multiple code paths may need different fixes for different callers — or a new method instead of modifying the existing one.
+        11. List all usages as a numbered list (1. file:line — description, 2. file:line — description, etc.) so none are missed.
+        12. Distill into a brief that adds value beyond the raw task description.
 
         Brief fields:
         - skip: true if no investigation needed, false if brief has useful content.
@@ -951,6 +953,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
         - Do not over-engineer beyond what the plan prescribes — no str() wraps, .get() fallbacks, or try/except guards unless the plan called for them or you found a concrete reason.
+        - Do NOT modify test files. Do NOT fix unrelated issues you encounter (e.g., dependency compatibility, Python version workarounds). Only change files directly needed for the task.
         - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
         - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
         - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
