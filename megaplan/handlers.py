@@ -138,6 +138,8 @@ def resolve_severity(hint: str) -> str:
         return "significant"
     if hint == "likely-minor":
         return "minor"
+    if hint == "uncertain":
+        return "minor"  # Don't auto-escalate uncertainty to blocking
     return "significant"
 
 
@@ -263,18 +265,20 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
     check_category_map = build_check_category_map()
     for check in critique.get("checks", []):
         check_id = check.get("id", "")
-        for finding in check.get("findings", []):
-            if finding.get("flagged"):
-                check_def = get_check_by_id(check_id)
-                severity = check_def.get("default_severity", "uncertain") if check_def else "uncertain"
-                synthetic_flag = {
-                    "id": check_id,
-                    "concern": f"{check.get('question', '')}: {finding.get('detail', '')}",
-                    "category": check_category_map.get(check_id, "correctness"),
-                    "severity_hint": severity,
-                    "evidence": finding.get("detail", ""),
-                }
-                critique.setdefault("flags", []).append(synthetic_flag)
+        flagged_findings = [f for f in check.get("findings", []) if f.get("flagged")]
+        for i, finding in enumerate(flagged_findings):
+            check_def = get_check_by_id(check_id)
+            severity = check_def.get("default_severity", "uncertain") if check_def else "uncertain"
+            # Unique ID per finding to avoid overwrites when same check flags multiple issues
+            flag_id = check_id if len(flagged_findings) == 1 else f"{check_id}-{i + 1}"
+            synthetic_flag = {
+                "id": flag_id,
+                "concern": f"{check.get('question', '')}: {finding.get('detail', '')}",
+                "category": check_category_map.get(check_id, "correctness"),
+                "severity_hint": severity,
+                "evidence": finding.get("detail", ""),
+            }
+            critique.setdefault("flags", []).append(synthetic_flag)
 
     for raw_flag in critique.get("flags", []):
         proposed_id = raw_flag.get("id")
