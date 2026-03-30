@@ -639,30 +639,32 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         {debt_block}
 
-        Requirements — check these in order:
+        You MUST fill in ALL 5 checks below. For each, state what you found. Set flagged=true only for concrete issues. "No issue found" is valid.
 
-        Correctness (check first — these catch real failures):
-        - Does the plan target the correct root cause? If the fix already exists in the codebase or contradicts evidence, flag CRITICAL.
-        - Does the plan change a function that has multiple callers? If so, will the change break any of them? A function called from different code paths may need a NEW method rather than modifying the existing one.
-        - Does the plan touch ALL locations where this bug/pattern exists? Grep the codebase to verify — don't trust the plan's file list.
-        - Does the plan's approach match how the codebase handles similar cases (optional params, error handling, return patterns)? Flag deviations from the codebase's conventions.
-        - If the task hints suggest a specific approach and the plan deviates, flag it. The issue author often knows the correct fix.
-        - If the plan limits scope to avoid breaking tests, flag as a potential under-fix.
+        The 5 required checks:
 
-        Simplicity:
-        - Is this the simplest approach? Could it use fewer steps or less machinery?
-        - Over-engineering concerns should use category `maintainability` with "Over-engineering:" prefix.
-        - Flag scope creep when the plan grows beyond the original idea.
+        1. id="callers" — "Does the plan change a function with multiple callers? Would the change break any?"
+           Search for callers of the function being modified. If called from different code paths, it may need a NEW method instead.
 
-        Alignment:
-        - Verify the plan remains aligned with the user's original intent.
+        2. id="all_locations" — "Does the plan touch ALL locations where this bug/pattern exists?"
+           Grep the codebase for the parameter/pattern being fixed. Don't trust the plan's file list — verify.
+
+        3. id="conventions" — "Does the plan's approach match the codebase's conventions?"
+           Read 2-3 similar functions in the same file. Check optional params, error handling, return patterns. Flag deviations.
+
+        4. id="issue_hints" — "Does the plan follow what the issue/hints suggest?"
+           If the task suggests a specific approach and the plan deviates, flag it.
+
+        5. id="scope" — "Is the scope appropriate?"
+           Not too narrow (under-fix) or too broad (scope creep). If scope is limited to avoid breaking tests, flag.
+
+        After filling in checks, add any ADDITIONAL issues to the `flags` array using the standard format (id, concern, category, severity_hint, evidence).
+
+        Additional guidelines:
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
-
-        Housekeeping:
         - Reuse existing flag IDs when the same concern is still open.
         - `verified_flag_ids` should list previously addressed flags that now appear resolved.
-        - Assign severity_hint carefully. Implementation details the executor will naturally resolve should be `likely-minor`.
-        - Focus on concrete issues that would cause real problems, not structural formatting.
+        - Focus on concrete issues, not structural formatting.
         {research_instruction}
         """
     ).strip()

@@ -257,6 +257,26 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
         if disputed_id in by_id:
             by_id[disputed_id]["status"] = "disputed"
 
+    # Convert flagged checks into standard flags
+    check_category_map = {
+        "callers": "correctness",
+        "all_locations": "correctness",
+        "conventions": "correctness",
+        "issue_hints": "correctness",
+        "scope": "completeness",
+    }
+    for check in critique.get("checks", []):
+        if check.get("flagged"):
+            check_id = check.get("id", "")
+            synthetic_flag = {
+                "id": check_id,
+                "concern": f"{check.get('question', '')}: {check.get('finding', '')}",
+                "category": check_category_map.get(check_id, "correctness"),
+                "severity_hint": "likely-significant",
+                "evidence": check.get("finding", ""),
+            }
+            critique.setdefault("flags", []).append(synthetic_flag)
+
     for raw_flag in critique.get("flags", []):
         proposed_id = raw_flag.get("id")
         if not proposed_id or proposed_id in {"", "FLAG-000"}:
@@ -936,6 +956,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         "step": "critique",
         "iteration": iteration,
         "summary": f"Recorded {len(worker.payload.get('flags', []))} critique flags.",
+        "checks": worker.payload.get("checks", []),
         "artifacts": [critique_filename, "faults.json"],
         "next_step": next_steps[0] if next_steps else None,
         "state": STATE_CRITIQUED,

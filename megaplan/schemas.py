@@ -123,6 +123,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "critique.json": {
         "type": "object",
         "properties": {
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "finding": {"type": "string"},
+                        "flagged": {"type": "boolean"},
+                    },
+                    "required": ["id", "question", "finding", "flagged"],
+                },
+            },
             "flags": {
                 "type": "array",
                 "items": {
@@ -153,7 +166,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "verified_flag_ids": {"type": "array", "items": {"type": "string"}},
             "disputed_flag_ids": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["flags", "verified_flag_ids", "disputed_flag_ids"],
+        "required": ["checks", "flags", "verified_flag_ids", "disputed_flag_ids"],
     },
     "research.json": {
         "type": "object",
