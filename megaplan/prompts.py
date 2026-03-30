@@ -653,6 +653,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         - Ask whether the plan is the simplest approach that solves the stated problem, whether it could use fewer steps or less machinery, and whether it introduces unnecessary complexity.
         - If the task hints suggest a specific approach and the plan deviates, flag it. The issue author often knows the correct fix.
         - If the plan limits scope to avoid breaking tests, flag as a potential under-fix.
+        - Check if the plan's approach matches the codebase's existing conventions — how it handles optional params, error cases, return patterns. Flag deviations from the codebase's style.
         - Over-engineering concerns should use category `maintainability`, should usually prefix the concern with "Over-engineering:", and should scale severity_hint to the practical impact.
         - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
         - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
