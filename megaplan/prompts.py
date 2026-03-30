@@ -613,21 +613,35 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
             if prior_checks:
                 # Build template showing what was found last time
                 registry = load_flag_registry(plan_dir)
-                flag_status = {f["id"]: f.get("status", "open") for f in registry.get("flags", [])}
+                # Build status lookup: flag IDs can be check_id or check_id-N
+                flag_status = {}
+                for f in registry.get("flags", []):
+                    flag_status[f["id"]] = f.get("status", "open")
                 enriched = []
                 for check in prior_checks:
                     cid = check.get("id", "")
+                    flagged_findings = [f for f in check.get("findings", []) if f.get("flagged")]
+                    prior_findings_list = []
+                    for fi, f in enumerate(check.get("findings", [])):
+                        pf = {
+                            "detail": f.get("detail", ""),
+                            "flagged": f.get("flagged", False),
+                        }
+                        if f.get("flagged"):
+                            # Match flag ID: check_id for single, check_id-N for multiple
+                            if len(flagged_findings) == 1:
+                                fid = cid
+                            else:
+                                flagged_idx = [j for j, ff in enumerate(check.get("findings", [])) if ff.get("flagged")].index(fi) if fi < len(check.get("findings", [])) else 0
+                                fid = f"{cid}-{flagged_idx + 1}"
+                            pf["status"] = flag_status.get(fid, flag_status.get(cid, "open"))
+                        else:
+                            pf["status"] = "n/a"
+                        prior_findings_list.append(pf)
                     entry = {
                         "id": cid,
                         "question": check.get("question", ""),
-                        "prior_findings": [
-                            {
-                                "detail": f.get("detail", ""),
-                                "flagged": f.get("flagged", False),
-                                "status": flag_status.get(cid, "open") if f.get("flagged") else "n/a",
-                            }
-                            for f in check.get("findings", [])
-                        ],
+                        "prior_findings": prior_findings_list,
                         "findings": [],
                     }
                     enriched.append(entry)

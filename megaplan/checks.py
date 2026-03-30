@@ -11,7 +11,6 @@ VALID_SEVERITY_HINTS: Final[set[str]] = {"likely-significant", "likely-minor", "
 class CritiqueCheckSpec(TypedDict):
     id: str
     question: str
-    instruction: str
     guidance: str
     category: str
     default_severity: str
@@ -21,10 +20,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "issue_hints",
         "question": "Did the work fully address the issue hints, user notes, and approved plan requirements?",
-        "instruction": (
-            "Cross-check the result against explicit user notes, critique corrections, and watch items. "
-            "Flag anything the implementation ignored, contradicted, or only partially covered."
-        ),
         "guidance": (
             "Cross-check the result against explicit user notes, critique corrections, and watch items. "
             "Flag anything the implementation ignored, contradicted, or only partially covered."
@@ -35,10 +30,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "correctness",
         "question": "Are the proposed changes technically correct?",
-        "instruction": (
-            "Look for logic errors, invalid assumptions, broken invariants, schema mismatches, "
-            "or behavior that would fail at runtime."
-        ),
         "guidance": (
             "Look for logic errors, invalid assumptions, broken invariants, schema mismatches, "
             "or behavior that would fail at runtime."
@@ -49,10 +40,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "scope",
         "question": "Is the work scoped appropriately to the approved task?",
-        "instruction": (
-            "Flag missing required work, out-of-scope edits, or changes that expand behavior without "
-            "clear justification from the approved plan."
-        ),
         "guidance": (
             "Flag missing required work, out-of-scope edits, or changes that expand behavior without "
             "clear justification from the approved plan."
@@ -63,10 +50,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "all_locations",
         "question": "Does the change touch all locations where this bug or pattern exists?",
-        "instruction": (
-            "Consider related handlers, schemas, prompts, tests, alternate runtimes, and other linked "
-            "code paths that must stay in sync."
-        ),
         "guidance": (
             "Consider related handlers, schemas, prompts, tests, alternate runtimes, and other linked "
             "code paths that must stay in sync."
@@ -77,10 +60,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "callers",
         "question": "Would this change break any callers or downstream consumers?",
-        "instruction": (
-            "Check function signatures, data contracts, artifact formats, schema compatibility, and "
-            "other entry points that rely on the old behavior."
-        ),
         "guidance": (
             "Check function signatures, data contracts, artifact formats, schema compatibility, and "
             "other entry points that rely on the old behavior."
@@ -91,10 +70,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "conventions",
         "question": "Does the change follow repository conventions and existing patterns?",
-        "instruction": (
-            "Review naming, structure, typing, and how similar logic is implemented elsewhere in the "
-            "codebase. Do not spend findings on trivial stylistic preferences."
-        ),
         "guidance": (
             "Review naming, structure, typing, and how similar logic is implemented elsewhere in the "
             "codebase. Do not spend findings on trivial stylistic preferences."
@@ -105,10 +80,6 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
         "id": "verification",
         "question": "Is there convincing verification for the change?",
-        "instruction": (
-            "Flag missing tests, weak manual-only validation, or cases where the claimed verification "
-            "does not actually exercise the changed behavior."
-        ),
         "guidance": (
             "Flag missing tests, weak manual-only validation, or cases where the claimed verification "
             "does not actually exercise the changed behavior."
@@ -139,9 +110,6 @@ def build_empty_template() -> list[dict[str, Any]]:
             "id": check["id"],
             "question": check["question"],
             "findings": [],
-            # Keep a top-level placeholder for backward-compatible templates; the
-            # authoritative flagged state now lives on each finding entry.
-            "flagged": False,
         }
         for check in CRITIQUE_CHECKS
     ]
