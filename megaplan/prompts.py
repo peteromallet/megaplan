@@ -639,24 +639,30 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         {debt_block}
 
-        Requirements:
-        - First, assess whether the plan targets the correct root cause. If the proposed fix already exists in the codebase, or if the plan contradicts evidence you find, flag this as CRITICAL — the plan needs a fundamentally different approach, not just adjustments.
-        - Consider whether the plan is at the right level of abstraction.
-        - Reuse existing flag IDs when the same concern is still open.
-        - `verified_flag_ids` should list previously addressed flags that now appear resolved.
-        - Focus on concrete issues that would cause real problems.
-        - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
-        - Verify that the plan remains aligned with the user's original intent.
-        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered step sections (`### Step N:` under `## Phase` headers, or flat `## Step N:`) with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`.
-        - Missing required sections or step coverage (for example: no H1, no `## Overview`, or no step sections at all) should be flagged as category `completeness` with severity_hint `likely-significant`.
-        - Structural formatting within steps (for example: prose instead of numbered substeps, or a missing file reference inside an otherwise actionable step) should usually be category `completeness` with severity_hint `likely-minor` because the executor can still follow the instructions.
-        - Ask whether the plan is the simplest approach that solves the stated problem, whether it could use fewer steps or less machinery, and whether it introduces unnecessary complexity.
+        Requirements — check these in order:
+
+        Correctness (check first — these catch real failures):
+        - Does the plan target the correct root cause? If the fix already exists in the codebase or contradicts evidence, flag CRITICAL.
+        - Does the plan change a function that has multiple callers? If so, will the change break any of them? A function called from different code paths may need a NEW method rather than modifying the existing one.
+        - Does the plan touch ALL locations where this bug/pattern exists? Grep the codebase to verify — don't trust the plan's file list.
+        - Does the plan's approach match how the codebase handles similar cases (optional params, error handling, return patterns)? Flag deviations from the codebase's conventions.
         - If the task hints suggest a specific approach and the plan deviates, flag it. The issue author often knows the correct fix.
         - If the plan limits scope to avoid breaking tests, flag as a potential under-fix.
-        - Check if the plan's approach matches the codebase's existing conventions — how it handles optional params, error cases, return patterns. Flag deviations from the codebase's style.
-        - Over-engineering concerns should use category `maintainability`, should usually prefix the concern with "Over-engineering:", and should scale severity_hint to the practical impact.
-        - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
-        - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
+
+        Simplicity:
+        - Is this the simplest approach? Could it use fewer steps or less machinery?
+        - Over-engineering concerns should use category `maintainability` with "Over-engineering:" prefix.
+        - Flag scope creep when the plan grows beyond the original idea.
+
+        Alignment:
+        - Verify the plan remains aligned with the user's original intent.
+        - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
+
+        Housekeeping:
+        - Reuse existing flag IDs when the same concern is still open.
+        - `verified_flag_ids` should list previously addressed flags that now appear resolved.
+        - Assign severity_hint carefully. Implementation details the executor will naturally resolve should be `likely-minor`.
+        - Focus on concrete issues that would cause real problems, not structural formatting.
         {research_instruction}
         """
     ).strip()
