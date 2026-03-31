@@ -32,9 +32,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "question": "Are the proposed changes technically correct?",
         "guidance": (
             "Look for logic errors, invalid assumptions, broken invariants, schema mismatches, "
-            "or behavior that would fail at runtime. For each code path the plan modifies, ask: "
-            "does this path already handle the case correctly? If so, the fix may be to leave it "
-            "alone rather than override it."
+            "or behavior that would fail at runtime."
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
