@@ -54,9 +54,8 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "question": "Does the change touch all locations AND supporting infrastructure?",
         "guidance": (
             "Search for all instances of the symbol/pattern being changed. Also ask: does this "
-            "feature require supporting infrastructure (merge functions, init wiring, registries, "
-            "configuration hooks) that doesn't exist yet? Missing infrastructure causes test failures "
-            "even when the core logic is correct."
+            "feature require setup, registration, or integration code beyond the core logic? "
+            "Missing glue code causes test failures even when the core fix is correct."
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
@@ -66,8 +65,8 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "question": "Is the change in the right place, and would it break any callers?",
         "guidance": (
             "First ask: should this change be HERE, or in a caller, callee, or new method? "
-            "Then check function signatures, data contracts, and other entry points that rely on "
-            "the current behavior."
+            "Then check function signatures, return types, and any code that calls or depends on "
+            "the changed function."
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
