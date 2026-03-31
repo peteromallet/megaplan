@@ -101,39 +101,46 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         Requirements:
         - Decide exactly one of: PROCEED, ITERATE, ESCALATE.
         - Use the weighted score, flag details (including the `evidence` field — not just `concern`), plan delta, recurring critiques, loop summary, and preflight results as judgment context, not as a fixed decision table.
-        - Unresolved correctness flags (wrong root cause, missing code locations, under-scoped fix) should block PROCEED unless you can explain with evidence why the flag is wrong.
         - PROCEED when execution should move forward now.
         - ITERATE when revising the plan is the best next move.
         - ESCALATE when the loop is stuck, churn is recurring, or user intervention is needed.
         - `signals_assessment` should summarize the score trajectory, plan delta, recurring critiques, unresolved flag weight, and preflight posture in one compact paragraph.
         - Put any cautionary notes in `warnings`.
         - Populate `settled_decisions` with design choices that are now settled and should carry into review without being re-litigated. Return `[]` when there are no such decisions.
-        - When recommending `PROCEED` with unresolved flags, populate `accepted_tradeoffs` with one entry per accepted unresolved flag using:
+
+        Flag resolution — severity determines what you must do:
+        - `likely-significant`: You MUST explicitly resolve each one in `flag_resolutions`. Either "iterate" (fix it), "disputed" (explain with evidence why the critique is wrong), or "accepted" (explain why it's safe to proceed despite the concern). You cannot PROCEED if any likely-significant flag is unresolved.
+        - `likely-minor`: You MUST acknowledge each one in `flag_resolutions` — same options as above, but the bar for "accepted" is lower. A sentence is enough.
+        - `uncertain`: No resolution required. Address if you choose.
+
+        Populate `flag_resolutions` with one entry per resolved flag:
           - `flag_id`: the exact flag ID
-          - `subsystem`: a semantically meaningful subsystem tag like `timeout-recovery` or `execute-paths`, not the flag category
-          - `concern`: the accepted limitation phrased clearly
-          - `rationale`: why proceeding is still acceptable
-        - When recommending `ITERATE` or `ESCALATE`, return `"accepted_tradeoffs": []`.
+          - `disposition`: one of "iterate", "accepted", "disputed"
+          - `rationale`: why (required for likely-significant, brief for likely-minor)
         - Example output shape:
         ```json
         {{
           "recommendation": "PROCEED",
-          "rationale": "The remaining issues are executor-level details rather than planning blockers.",
-          "signals_assessment": "Weighted score is falling, plan delta is stabilizing, and preflight remains clean.",
+          "rationale": "All significant flags resolved. Minor convention concern accepted.",
+          "signals_assessment": "Weighted score stable, plan delta clean, preflight passed.",
           "warnings": ["Double-check FLAG-005 while executing."],
-          "accepted_tradeoffs": [
+          "flag_resolutions": [
             {{
-              "flag_id": "FLAG-005",
-              "subsystem": "timeout-recovery",
-              "concern": "Timeout recovery: retry backoff remains basic for this pass.",
-              "rationale": "The plan contains enough guardrails to execute safely, and the remaining gap is a known tradeoff rather than a blocker."
+              "flag_id": "correctness-1",
+              "disposition": "disputed",
+              "rationale": "The critique flagged missing null check, but the caller guarantees non-null per line 42."
+            }},
+            {{
+              "flag_id": "conventions-1",
+              "disposition": "accepted",
+              "rationale": "Both API patterns are valid; the chosen one is simpler."
             }}
           ],
           "settled_decisions": [
             {{
               "id": "DECISION-001",
-              "decision": "Treat FLAG-006 softening as approved gate guidance during review.",
-              "rationale": "The gate already accepted this tradeoff and review should verify compliance, not reopen it."
+              "decision": "Use allow_migrate over allow_migrate_model — accepted at gate.",
+              "rationale": "Convention flag resolved as accepted tradeoff."
             }}
           ]
         }}
