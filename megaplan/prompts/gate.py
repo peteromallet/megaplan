@@ -44,8 +44,8 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
     ]
     robustness = configured_robustness(state)
     debt_block = _gate_debt_block(plan_dir, root)
-    # Load critique checks for gate visibility — include ALL findings so the gate
-    # can promote unflagged concerns to flags if it disagrees with the critique.
+    # Critique check summary — flagged counts only (unflagged findings are in the
+    # artifact JSON for audit but not injected into the gate prompt).
     critique_checks_block = ""
     critique_path = current_iteration_artifact(plan_dir, "critique", state["iteration"])
     if Path(critique_path).exists():
@@ -55,19 +55,11 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
             check_lines = []
             for check in checks:
                 findings = check.get("findings", [])
-                flagged = [f for f in findings if f.get("flagged")]
-                unflagged = [f for f in findings if not f.get("flagged")]
-                flagged_count = len(flagged)
+                flagged_count = sum(1 for f in findings if f.get("flagged"))
                 status = f"{flagged_count} flagged" if flagged_count else "clear"
                 check_lines.append(f"- {check.get('id', '?')}: {status}")
-                # Show unflagged findings as FYI — gate can promote if needed
-                for f in unflagged:
-                    detail = f.get("detail", "").strip()
-                    if detail and len(detail) > 30:  # skip trivial "no issue" findings
-                        check_lines.append(f"    FYI (not flagged): {detail[:200]}")
             critique_checks_block = (
-                "Critique checks (flagged findings are flags; FYI findings are the critique's "
-                "unflagged observations — review them and promote to a flag if any look risky):\n        "
+                "Critique check summary:\n        "
                 + "\n        ".join(check_lines)
             )
     return textwrap.dedent(
@@ -100,49 +92,32 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
 
         Requirements:
         - Decide exactly one of: PROCEED, ITERATE, ESCALATE.
-        - Use the weighted score, flag details (including the `evidence` field — not just `concern`), plan delta, recurring critiques, loop summary, and preflight results as judgment context, not as a fixed decision table.
+        - Use the weighted score, flag details (including `evidence`), plan delta, recurring critiques, and preflight results as judgment context.
         - PROCEED when execution should move forward now.
         - ITERATE when revising the plan is the best next move.
         - ESCALATE when the loop is stuck, churn is recurring, or user intervention is needed.
-        - `signals_assessment` should summarize the score trajectory, plan delta, recurring critiques, unresolved flag weight, and preflight posture in one compact paragraph.
-        - Put any cautionary notes in `warnings`.
-        - Populate `settled_decisions` with design choices that are now settled and should carry into review without being re-litigated. Return `[]` when there are no such decisions.
+        - `signals_assessment`: one paragraph summarizing score trajectory, flag status, and preflight posture.
 
-        Flag resolution — severity determines what you must do:
-        - `likely-significant`: You MUST explicitly resolve each one in `flag_resolutions`. Either "iterate" (fix it), "disputed" (explain with evidence why the critique is wrong), or "accepted" (explain why it's safe to proceed despite the concern). You cannot PROCEED if any likely-significant flag is unresolved.
-        - `likely-minor`: You MUST acknowledge each one in `flag_resolutions` — same options as above, but the bar for "accepted" is lower. A sentence is enough.
-        - `uncertain`: No resolution required. Address if you choose.
+        Flags come in two tiers:
+        - **Blocking** (severity = significant/likely-significant): You cannot PROCEED unless you address ALL of them. The handler enforces this — it will override PROCEED to ITERATE if blocking flags remain open.
+        - **Noted** (everything else): Acknowledge in your rationale but they don't block PROCEED.
 
-        Populate `flag_resolutions` with one entry per resolved flag:
-          - `flag_id`: the exact flag ID
-          - `disposition`: one of "iterate", "accepted", "disputed"
-          - `rationale`: why (required for likely-significant, brief for likely-minor)
-        - Example output shape:
+        If there are blocking flags and you want to PROCEED, write a `resolution_summary` — one paragraph explaining how you accounted for each blocking flag (accepted with reason, or disputed with evidence). List the flag IDs you're resolving in `resolved_flag_ids`.
+
+        If there are no blocking flags, `resolution_summary` and `resolved_flag_ids` can be omitted.
+
+        Populate `settled_decisions` with design choices that should carry into review without re-litigation. Return `[]` when there are none.
+
+        Example:
         ```json
         {{
           "recommendation": "PROCEED",
-          "rationale": "All significant flags resolved. Minor convention concern accepted.",
-          "signals_assessment": "Weighted score stable, plan delta clean, preflight passed.",
-          "warnings": ["Double-check FLAG-005 while executing."],
-          "flag_resolutions": [
-            {{
-              "flag_id": "correctness-1",
-              "disposition": "disputed",
-              "rationale": "The critique flagged missing null check, but the caller guarantees non-null per line 42."
-            }},
-            {{
-              "flag_id": "conventions-1",
-              "disposition": "accepted",
-              "rationale": "Both API patterns are valid; the chosen one is simpler."
-            }}
-          ],
-          "settled_decisions": [
-            {{
-              "id": "DECISION-001",
-              "decision": "Use allow_migrate over allow_migrate_model — accepted at gate.",
-              "rationale": "Convention flag resolved as accepted tradeoff."
-            }}
-          ]
+          "rationale": "Core fix is correct. Convention concern accepted.",
+          "signals_assessment": "Score stable at 2.5, preflight passed, no recurring critiques.",
+          "warnings": ["Verify edge case with composite moduli during execution."],
+          "resolution_summary": "The correctness flag about allow_migrate vs allow_migrate_model is accepted — both APIs produce identical behavior for this use case (verified at django/db/utils.py:286). The convention flag is noted but non-blocking.",
+          "resolved_flag_ids": ["correctness-1", "conventions-1"],
+          "settled_decisions": []
         }}
         ```
         """

@@ -215,7 +215,11 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
     if active_checks:
         critique_review_block = textwrap.dedent(
             f"""
-            Fill in ALL {len(active_checks)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a concern). When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees. {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
+            Fill in ALL {len(active_checks)} checks below. For each finding, "detail" must describe what you specifically checked and what you found (at least a sentence — not just "no issue"). "flagged" is true if it's a concern. When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees.
+
+            Good: {{"detail": "Checked callers of nthroot_mod in solveset.py line 1205 — passes prime moduli only, consistent with the fix.", "flagged": false}}
+            Good: {{"detail": "The fix handles empty tuples but not single-element tuples which need a trailing comma.", "flagged": true}}
+            Bad: {{"detail": "No issue found", "flagged": false}}  ← too brief, will be rejected
 
             {_render_critique_checks(active_checks)}
 
@@ -225,7 +229,9 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
     else:
         critique_review_block = textwrap.dedent(
             """
-            General review only for this robustness level. Return `checks: []` and place any concrete concerns in the `flags` array using the standard format (id, concern, category, severity_hint, evidence). If there are no concerns, `flags` can be empty.
+            Review the plan with a broad scope. Consider whether the approach is correct, whether it covers all the places it needs to, whether it would break callers or violate codebase conventions, and whether its verification strategy is adequate.
+
+            Return `checks: []` and place any concrete concerns in the `flags` array using the standard format (id, concern, category, severity_hint, evidence). If there are no concerns, `flags` can be empty.
         """
         ).strip()
     return textwrap.dedent(

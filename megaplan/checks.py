@@ -156,6 +156,9 @@ def build_empty_template(checks: tuple[CritiqueCheckSpec, ...] | None = None) ->
     ]
 
 
+_MIN_FINDING_DETAIL_LENGTH = 40  # Must describe what was checked, not just "No issue"
+
+
 def _valid_findings(findings: Any) -> bool:
     if not isinstance(findings, list) or not findings:
         return False
@@ -165,6 +168,8 @@ def _valid_findings(findings: Any) -> bool:
         detail = finding.get("detail")
         flagged = finding.get("flagged")
         if not isinstance(detail, str) or not detail.strip():
+            return False
+        if len(detail.strip()) < _MIN_FINDING_DETAIL_LENGTH:
             return False
         if not isinstance(flagged, bool):
             return False

@@ -468,21 +468,25 @@ def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robus
     result = "success"
     summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
 
-    # Enforce: can't PROCEED with unresolved significant flags
+    # Enforce: can't PROCEED with unresolved blocking flags (open, addressed, or disputed)
     if gate_summary["recommendation"] == "PROCEED":
         unresolved = gate_summary.get("unresolved_flags", [])
-        significant_unresolved = [
+        blocking_unresolved = [
             f for f in unresolved
             if f.get("severity") in ("significant", "likely-significant")
-            and f.get("status") in ("open", "addressed")
+            and f.get("status") in ("open", "addressed", "disputed")
         ]
-        if significant_unresolved:
-            flag_ids = [f.get("id", "?") for f in significant_unresolved]
+        if blocking_unresolved:
+            flag_ids = [f.get("id", "?") for f in blocking_unresolved]
+            concerns = [f"{f.get('id','?')}: {str(f.get('concern',''))[:80]}" for f in blocking_unresolved]
             gate_summary["recommendation"] = "ITERATE"
             summary = (
-                f"Gate recommended PROCEED but {len(significant_unresolved)} significant "
-                f"flag(s) are unresolved ({', '.join(flag_ids)}). "
-                f"Overriding to ITERATE — resolve or explicitly dispute them first."
+                f"Gate recommended PROCEED but {len(blocking_unresolved)} blocking "
+                f"flag(s) are unresolved. Overriding to ITERATE.\n"
+                f"Unresolved flags:\n"
+                + "\n".join(f"  - {c}" for c in concerns)
+                + "\nTo proceed: revise the plan to address these, or the gate must "
+                f"write a resolution_summary explaining why each is accepted/disputed."
             )
 
     if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
