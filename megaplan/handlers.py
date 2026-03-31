@@ -468,14 +468,27 @@ def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robus
     result = "success"
     summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
 
-    # Enforce: can't PROCEED with unresolved blocking flags (open, addressed, or disputed)
+    # Enforce: can't PROCEED with unresolved blocking flags unless the gate
+    # explicitly resolved them (resolution_summary + resolved_flag_ids).
     if gate_summary["recommendation"] == "PROCEED":
         unresolved = gate_summary.get("unresolved_flags", [])
+        # The gate can resolve flags by listing them in resolved_flag_ids
+        # with a resolution_summary explaining why. Check the gate payload.
+        gate_resolved_ids = set(gate_summary.get("resolved_flag_ids", []))
+        has_resolution_summary = bool(gate_summary.get("resolution_summary", "").strip())
         blocking_unresolved = [
             f for f in unresolved
             if f.get("severity") in ("significant", "likely-significant")
             and f.get("status") in ("open", "addressed", "disputed")
+            and f.get("id") not in gate_resolved_ids
         ]
+        # If gate listed resolved flags but no summary, still block
+        if not blocking_unresolved and gate_resolved_ids and not has_resolution_summary:
+            blocking_unresolved = [
+                f for f in unresolved
+                if f.get("severity") in ("significant", "likely-significant")
+                and f.get("status") in ("open", "addressed", "disputed")
+            ]
         if blocking_unresolved:
             flag_ids = [f.get("id", "?") for f in blocking_unresolved]
             concerns = [f"{f.get('id','?')}: {str(f.get('concern',''))[:80]}" for f in blocking_unresolved]

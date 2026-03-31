@@ -289,11 +289,8 @@ def parse_plan_sections(plan_text: str) -> list[PlanSection]:
 
     boundaries: list[tuple[int, int, str, str | None]] = []
     inside_fence = False
-    fence_open_line = -1
     for index, line in enumerate(lines):
         if line.startswith("```"):
-            if not inside_fence:
-                fence_open_line = index
             inside_fence = not inside_fence
             continue
         if inside_fence:
@@ -612,6 +609,9 @@ def build_gate_artifact(
         "orchestrator_guidance": orchestrator_guidance,
         "robustness": signals.get("robustness"),
         "signals": signals["signals"],
+        # Gate's flag resolution — used by handler to allow PROCEED past blocking flags
+        "resolved_flag_ids": list(gate_payload.get("resolved_flag_ids", [])),
+        "resolution_summary": gate_payload.get("resolution_summary", ""),
     }
 
 
