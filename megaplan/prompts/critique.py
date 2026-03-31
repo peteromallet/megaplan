@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any
 
-from megaplan.checks import CRITIQUE_CHECKS, build_empty_template
+from megaplan.checks import build_empty_template, checks_for_robustness
 from megaplan._core import (
     configured_robustness,
     intent_and_notes_block,
@@ -79,10 +80,10 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _render_critique_checks() -> str:
-    """Render check questions and guidance from CRITIQUE_CHECKS."""
+def _render_critique_checks(checks: tuple[dict[str, Any], ...]) -> str:
+    """Render check questions and guidance for the active check set."""
     lines = []
-    for i, check in enumerate(CRITIQUE_CHECKS, 1):
+    for i, check in enumerate(checks, 1):
         lines.append(
             f"{i}. id=\"{check['id']}\" — \"{check['question']}\"\n"
             f"           {check.get('guidance', check.get('instruction', ''))}"
@@ -90,14 +91,36 @@ def _render_critique_checks() -> str:
     return "\n\n        ".join(lines)
 
 
-def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
-    """Render the JSON template the model fills in, with prior findings if iteration 2+."""
+def _render_critique_template(
+    plan_dir: Path,
+    state: PlanState,
+    checks: tuple[dict[str, Any], ...],
+) -> str:
+    """Render the JSON template the model fills in for the active check set."""
+    if not checks:
+        return textwrap.dedent(
+            """
+            General review only for this robustness level. Return `checks: []` and put every concern in `flags`.
+            {
+              "checks": [],
+              "flags": [],
+              "verified_flag_ids": [],
+              "disputed_flag_ids": []
+            }
+        """
+        ).strip()
+
     iteration = state.get("iteration", 1)
+    active_check_ids = {check["id"] for check in checks}
     if iteration > 1:
         prior_path = plan_dir / f"critique_v{iteration - 1}.json"
         if prior_path.exists():
             prior = read_json(prior_path)
-            prior_checks = prior.get("checks", [])
+            prior_checks = [
+                check
+                for check in prior.get("checks", [])
+                if isinstance(check, dict) and check.get("id") in active_check_ids
+            ]
             if prior_checks:
                 # Build template showing what was found last time
                 registry = load_flag_registry(plan_dir)
@@ -141,7 +164,7 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
                     enriched.append(entry)
                 # Add any new checks not in prior
                 prior_ids = {c.get("id") for c in prior_checks}
-                for check_def in CRITIQUE_CHECKS:
+                for check_def in checks:
                     if check_def["id"] not in prior_ids:
                         enriched.append(
                             {
@@ -163,7 +186,7 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
     return textwrap.dedent(
         f"""
         Fill in this template with your findings:
-        {json_dump(build_empty_template()).strip()}
+        {json_dump(build_empty_template(checks)).strip()}
     """
     ).strip()
 
@@ -177,6 +200,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
     structure_warnings = latest_meta.get("structure_warnings", [])
     flag_registry = load_flag_registry(plan_dir)
     robustness = configured_robustness(state)
+    active_checks = checks_for_robustness(robustness)
     unresolved = [
         {
             "id": flag["id"],
@@ -188,6 +212,22 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         if flag["status"] in {"addressed", "open", "disputed"}
     ]
     debt_block = _planning_debt_block(plan_dir, root)
+    if active_checks:
+        critique_review_block = textwrap.dedent(
+            f"""
+            Fill in ALL {len(active_checks)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a problem or could affect whether tests pass). When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees. {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
+
+            {_render_critique_checks(active_checks)}
+
+            After filling in checks, add any additional concerns to the `flags` array (e.g., security, performance, dependencies). Use the standard format (id, concern, category, severity_hint, evidence). This array can be empty.
+        """
+        ).strip()
+    else:
+        critique_review_block = textwrap.dedent(
+            """
+            General review only for this robustness level. Return `checks: []` and place any concrete concerns in the `flags` array using the standard format (id, concern, category, severity_hint, evidence). If there are no concerns, `flags` can be empty.
+        """
+        ).strip()
     return textwrap.dedent(
         f"""
         You are an independent reviewer. Critique the plan against the actual repository.
@@ -217,13 +257,9 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         {debt_block}
 
-        Fill in ALL {len(CRITIQUE_CHECKS)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a problem). {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
+        {critique_review_block}
 
-        {_render_critique_checks()}
-
-        After filling in checks, add any additional concerns to the `flags` array (e.g., security, performance, dependencies). Use the standard format (id, concern, category, severity_hint, evidence). This array can be empty.
-
-        {_render_critique_template(plan_dir, state)}
+        {_render_critique_template(plan_dir, state, active_checks)}
 
         Additional guidelines:
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
