@@ -50,10 +50,12 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     },
     {
         "id": "all_locations",
-        "question": "Does the change touch all locations where this bug or pattern exists?",
+        "question": "Does the change touch all locations AND supporting infrastructure?",
         "guidance": (
-            "Consider related handlers, schemas, prompts, tests, alternate runtimes, and other linked "
-            "code paths that must stay in sync."
+            "Search for all instances of the symbol/pattern being changed. Also ask: does this "
+            "feature require supporting infrastructure (merge functions, init wiring, registries, "
+            "configuration hooks) that doesn't exist yet? Missing infrastructure causes test failures "
+            "even when the core logic is correct."
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
@@ -84,8 +86,9 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "id": "verification",
         "question": "Is there convincing verification for the change?",
         "guidance": (
-            "Flag missing tests, weak manual-only validation, or cases where the claimed verification "
-            "does not actually exercise the changed behavior."
+            "Flag missing tests or weak validation. If verification tests exist, trace the test's "
+            "execution path through your patch — does every branch it exercises produce the expected "
+            "result? A patch can look correct but fail because it misses one code path the test covers."
         ),
         "category": "completeness",
         "default_severity": "uncertain",
