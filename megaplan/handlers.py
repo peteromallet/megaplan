@@ -6,15 +6,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 import megaplan.workers as worker_module
-from megaplan.checks import validate_critique_checks
+from megaplan.checks import checks_for_robustness, validate_critique_checks
 from megaplan.execution import (
     _check_done_task_evidence,
     handle_execute_auto_loop as dispatch_execute_auto_loop,
     handle_execute_one_batch as dispatch_execute_one_batch,
 )
 from megaplan.flags import update_flags_after_critique, update_flags_after_revise
-from megaplan.merge import _validate_and_merge_batch, _validate_merge_inputs
-from megaplan.step_edit import handle_step, next_plan_artifact_name
+from megaplan.merge import _validate_and_merge_batch
+from megaplan.merge import _validate_merge_inputs  # noqa: F401
+from megaplan.step_edit import next_plan_artifact_name
 from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
     ROBUSTNESS_LEVELS,
@@ -466,6 +467,24 @@ def _store_last_gate(state: PlanState, gate_summary: dict[str, Any]) -> None:
 def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robustness: str) -> tuple[str, str, str]:
     result = "success"
     summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
+
+    # Enforce: can't PROCEED with unresolved significant flags
+    if gate_summary["recommendation"] == "PROCEED":
+        unresolved = gate_summary.get("unresolved_flags", [])
+        significant_unresolved = [
+            f for f in unresolved
+            if f.get("severity") in ("significant", "likely-significant")
+            and f.get("status") in ("open", "addressed")
+        ]
+        if significant_unresolved:
+            flag_ids = [f.get("id", "?") for f in significant_unresolved]
+            gate_summary["recommendation"] = "ITERATE"
+            summary = (
+                f"Gate recommended PROCEED but {len(significant_unresolved)} significant "
+                f"flag(s) are unresolved ({', '.join(flag_ids)}). "
+                f"Overriding to ITERATE — resolve or explicitly dispute them first."
+            )
+
     if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
         state["current_state"] = STATE_GATED
         state["meta"].pop("user_approved_gate", None)
@@ -644,9 +663,12 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "critique", {STATE_PLANNED, STATE_RESEARCHED})
     iteration = state["iteration"]
+    robustness = configured_robustness(state)
+    active_checks = checks_for_robustness(robustness)
+    expected_ids = [check["id"] for check in active_checks]
     state["last_gate"] = {}
     worker, agent, mode, refreshed = _run_worker("critique", state, plan_dir, args, root=root)
-    invalid_checks = validate_critique_checks(worker.payload)
+    invalid_checks = validate_critique_checks(worker.payload, expected_ids=expected_ids)
     if invalid_checks:
         _raise_step_validation_error(plan_dir=plan_dir, state=state, step="critique", iteration=iteration, worker=worker, code="invalid_critique", message="Critique output failed check validation: " + ", ".join(invalid_checks))
     critique_filename = f"critique_v{iteration}.json"
@@ -657,7 +679,6 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     recurring = compute_recurring_critiques(plan_dir, iteration)
     _append_to_meta(state, "recurring_critiques", recurring)
     state["current_state"] = STATE_CRITIQUED
-    robustness = configured_robustness(state)
     skip_gate = not workflow_includes_step(robustness, "gate")
     if skip_gate:
         minimal_gate: dict[str, Any] = {
@@ -1019,11 +1040,6 @@ def _resolve_review_outcome(
         or bool(missing_evidence)
     )
     if blocked:
-        message = _build_review_blocked_message(
-            verdict_count=verdict_count, total_tasks=total_tasks,
-            check_count=check_count, total_checks=total_checks,
-            missing_reviewer_evidence=missing_evidence,
-        )
         return "blocked", STATE_EXECUTED, "review"
 
     rework_requested = review_verdict == "needs_rework"
