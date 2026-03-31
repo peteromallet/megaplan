@@ -32,7 +32,9 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "question": "Are the proposed changes technically correct?",
         "guidance": (
             "Look for logic errors, invalid assumptions, broken invariants, schema mismatches, "
-            "or behavior that would fail at runtime."
+            "or behavior that would fail at runtime. When the fix adds a conditional branch "
+            "(if/else, try/except, regex alternative), enumerate all cases that branch handles "
+            "— a fix that covers 2 of 3 cases often introduces a regression on the third."
         ),
         "category": "correctness",
         "default_severity": "likely-significant",

@@ -831,13 +831,13 @@ def _ensure_verification_task(payload: dict, state: dict) -> None:
 
     if "FAIL_TO_PASS" in source_text or "test must pass" in source_text.lower() or "verification" in source_text.lower():
         desc = (
-            "Run the tests specified in the task description to verify the fix. "
+            "Run the tests specified in the task description to verify the fix — run the full test file/module, not just individual functions. "
             "Run the project's existing test suite — do NOT create new test files. "
             "If any test fails, read the error, fix the code, and re-run until all tests pass."
         )
     else:
         desc = (
-            "Run tests relevant to the changed files to verify correctness and check for regressions. "
+            "Run tests relevant to the changed files to verify correctness and check for regressions — run the full test file/module, not just individual functions. "
             "Find and run the project's existing test suite — do NOT create new test files. "
             "If any test fails, read the error, fix the code, and re-run until all tests pass."
         )
