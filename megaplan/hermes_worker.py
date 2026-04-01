@@ -199,6 +199,10 @@ def run_hermes_step(
         resolved_model = resolved_model[len("zhipu:"):]
         agent_kwargs["base_url"] = os.environ.get("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
         agent_kwargs["api_key"] = os.environ.get("ZHIPU_API_KEY", "")
+    elif resolved_model.startswith("minimax:"):
+        resolved_model = resolved_model[len("minimax:"):]
+        agent_kwargs["base_url"] = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+        agent_kwargs["api_key"] = os.environ.get("MINIMAX_API_KEY", "")
 
     # Instantiate AIAgent
     agent = AIAgent(
