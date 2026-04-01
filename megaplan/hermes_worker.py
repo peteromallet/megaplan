@@ -268,8 +268,28 @@ def run_hermes_step(
         except Exception as exc:
             print(f"[hermes-worker] Template prompt failed: {exc}", file=sys.stderr)
 
-    # Try parsing the final response directly
-    payload = _parse_json_response(raw_output)
+    # For template-file phases, check the template file FIRST — we told the
+    # model to write there, so it's the primary output path.
+    payload = None
+    if output_path and output_path.exists():
+        try:
+            candidate_payload = json.loads(output_path.read_text(encoding="utf-8"))
+            # Only use if the model actually filled something in (not just the empty template)
+            if isinstance(candidate_payload, dict):
+                has_content = any(
+                    v for k, v in candidate_payload.items()
+                    if isinstance(v, list) and v  # non-empty arrays
+                    or isinstance(v, str) and v.strip()  # non-empty strings
+                )
+                if has_content:
+                    payload = candidate_payload
+                    print(f"[hermes-worker] Read JSON from template file: {output_path}", file=sys.stderr)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Try parsing the final text response
+    if payload is None:
+        payload = _parse_json_response(raw_output)
 
     # Fallback: some models (GLM-5) put JSON in reasoning/think tags
     # instead of content. Just grab it from there.
@@ -297,16 +317,16 @@ def run_hermes_step(
         if payload is not None:
             print(f"[hermes-worker] Reconstructed execute payload from tool calls", file=sys.stderr)
 
-    # Fallback: the model may have written the JSON to a file via the write tool
-    # instead of outputting it as text. Check common locations.
+    # Fallback: the model may have written the JSON to a different file location
     if payload is None:
         schema_filename = STEP_SCHEMA_FILENAMES.get(step, f"{step}.json")
         for candidate in [
+            plan_dir / f"{step}_output.json",  # template file path
             project_dir / schema_filename,
             plan_dir / schema_filename,
             project_dir / f"{step}.json",
         ]:
-            if candidate.exists():
+            if candidate.exists() and candidate != output_path:  # skip if already checked
                 try:
                     payload = json.loads(candidate.read_text(encoding="utf-8"))
                     print(f"[hermes-worker] Read JSON from file written by model: {candidate}", file=sys.stderr)
