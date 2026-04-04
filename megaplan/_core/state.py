@@ -148,6 +148,9 @@ def make_history_entry(
     recommendation: str | None = None,
     approval_mode: str | None = None,
     environment: dict[str, bool] | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
 ) -> HistoryEntry:
     entry: HistoryEntry = {
         "step": step,
@@ -156,6 +159,10 @@ def make_history_entry(
         "cost_usd": cost_usd,
         "result": result,
     }
+    if total_tokens > 0:
+        entry["prompt_tokens"] = prompt_tokens
+        entry["completion_tokens"] = completion_tokens
+        entry["total_tokens"] = total_tokens
     if worker is not None and agent is not None and mode is not None:
         entry["session_mode"] = mode
         entry["session_id"] = worker.session_id

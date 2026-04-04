@@ -108,7 +108,7 @@ def test_run_parallel_critique_merges_in_original_order(monkeypatch: pytest.Monk
             _check_payload(check, f"Checked {check['id']} in detail for ordered merge coverage.", flagged=False),
             [f"FLAG-00{index + 1}"],
             [],
-            0.25,
+            0.25, 0, 0, 0,
         )
 
     monkeypatch.setattr("megaplan.parallel_critique._run_check", fake_run_check)
@@ -138,6 +138,7 @@ def test_run_parallel_critique_disputed_flags_override_verified(
             verified,
             disputed,
             0.1,
+            0, 0, 0,
         )
 
     monkeypatch.setattr("megaplan.parallel_critique._run_check", fake_run_check)
@@ -237,6 +238,7 @@ def test_run_parallel_critique_reraises_subagent_failures(
             [],
             [],
             0.1,
+            0, 0, 0,
         )
 
     monkeypatch.setattr("megaplan.parallel_critique._run_check", fake_run_check)
@@ -270,6 +272,7 @@ def test_run_parallel_critique_does_not_mutate_session_state(
             [],
             [],
             0.0,
+            0, 0, 0,
         )
 
     monkeypatch.setattr("megaplan.parallel_critique._run_check", fake_run_check)
@@ -403,7 +406,7 @@ def test_run_check_uses_same_parse_fallback_chain_as_hermes_worker(
     sys.modules["run_agent"].AIAgent = FakeAIAgent
     sys.modules["hermes_state"].SessionDB = FakeSessionDB
 
-    index, check_payload, verified_ids, disputed_ids, cost_usd = _run_check(
+    index, check_payload, verified_ids, disputed_ids, cost_usd, pt, ct, tt = _run_check(
         0,
         check,
         state=state,

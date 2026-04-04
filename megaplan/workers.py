@@ -84,6 +84,9 @@ class WorkerResult:
     cost_usd: float
     session_id: str | None = None
     trace_output: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 def run_command(

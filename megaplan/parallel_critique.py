@@ -111,11 +111,14 @@ def _run_check(
             verified if isinstance(verified, list) else [],
             disputed if isinstance(disputed, list) else [],
             float(current_result.get("estimated_cost_usd", 0.0) or 0.0),
+            int(current_result.get("prompt_tokens", 0) or 0),
+            int(current_result.get("completion_tokens", 0) or 0),
+            int(current_result.get("total_tokens", 0) or 0),
         )
 
     agent = _make_agent(resolved_model, agent_kwargs)
     try:
-        _result, check_payload, verified_ids, disputed_ids, cost_usd = _run_attempt(agent, output_path)
+        _result, check_payload, verified_ids, disputed_ids, cost_usd, pt, ct, tt = _run_attempt(agent, output_path)
     except Exception as exc:
         # Report 429 to key pool so it cools down this key
         if "429" in str(exc) and model and model.startswith("minimax:"):
@@ -138,7 +141,7 @@ def _run_check(
                 output_path = write_single_check_template(plan_dir, state, check, f"critique_check_{check['id']}.json")
                 agent = _make_agent(fallback_model, fallback_kwargs)
                 try:
-                    _result, check_payload, verified_ids, disputed_ids, cost_usd = _run_attempt(agent, output_path)
+                    _result, check_payload, verified_ids, disputed_ids, cost_usd, pt, ct, tt = _run_attempt(agent, output_path)
                 except Exception as fallback_exc:
                     raise CliError(
                         "worker_error",
@@ -159,6 +162,9 @@ def _run_check(
         verified_ids,
         disputed_ids,
         cost_usd,
+        pt,
+        ct,
+        tt,
     )
 
 
@@ -188,6 +194,9 @@ def run_parallel_critique(
     project_dir = Path(state["config"]["project_dir"])
     results: list[tuple[dict[str, Any], list[str], list[str]] | None] = [None] * len(checks)
     total_cost = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
 
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
@@ -209,9 +218,12 @@ def run_parallel_critique(
                 for index, check in enumerate(checks)
             ]
             for future in as_completed(futures):
-                index, check_payload, verified_ids, disputed_ids, cost_usd = future.result()
+                index, check_payload, verified_ids, disputed_ids, cost_usd, pt, ct, tt = future.result()
                 results[index] = (check_payload, verified_ids, disputed_ids)
                 total_cost += cost_usd
+                total_prompt_tokens += pt
+                total_completion_tokens += ct
+                total_tokens += tt
     finally:
         sys.stdout = real_stdout
 
@@ -240,4 +252,7 @@ def run_parallel_critique(
         duration_ms=int((time.monotonic() - started) * 1000),
         cost_usd=total_cost,
         session_id=None,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_tokens,
     )

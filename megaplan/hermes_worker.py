@@ -529,6 +529,9 @@ def run_hermes_step(
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     cost_usd = result.get("estimated_cost_usd", 0.0) or 0.0
+    prompt_tokens = int(result.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(result.get("completion_tokens", 0) or 0)
+    total_tokens = int(result.get("total_tokens", 0) or 0)
 
     return WorkerResult(
         payload=payload,
@@ -536,6 +539,9 @@ def run_hermes_step(
         duration_ms=elapsed_ms,
         cost_usd=float(cost_usd),
         session_id=session_id,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
     )
 
 
