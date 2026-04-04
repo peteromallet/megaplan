@@ -92,6 +92,10 @@ Megaplan is being tested live against Claude 4.5 Opus on SWE-bench Verified:
 - **[Live dashboard](https://peteromallet.github.io/swe-bench-challenge/)** — watch the experiment in real time
 - **[hermes-megaplan](https://github.com/peteromallet/hermes-megaplan)** — experiment orchestration code
 
+## Code Health
+
+<img src="scorecard.png" width="100%">
+
 ## License
 
 MIT
