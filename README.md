@@ -15,7 +15,7 @@ Instead of attempting tasks in one shot, Megaplan gives models a rigorous proces
 
 ## Quick Start
 
-Megaplan uses [Hermes Agent](https://github.com/peteromallet/megaplan-autoimprover) as the execution backend — any model accessible via OpenRouter (or direct provider APIs) works out of the box.
+Megaplan uses [hermes-megaplan](https://github.com/peteromallet/hermes-megaplan) as the execution backend — any model accessible via OpenRouter (or direct provider APIs) works out of the box.
 
 ### 1. Install
 
@@ -83,7 +83,7 @@ Or use any OpenRouter model for everything:
 Megaplan is being used in a live experiment to test whether open-source models can beat Claude Opus 4.5 on [SWE-bench Verified](https://www.swebench.com):
 
 - **Live dashboard**: [peteromallet.github.io/swe-bench-challenge](https://peteromallet.github.io/swe-bench-challenge/)
-- **Experiment code**: [megaplan-autoimprover](https://github.com/peteromallet/megaplan-autoimprover)
+- **Experiment code**: [hermes-megaplan](https://github.com/peteromallet/hermes-megaplan)
 
 ## License
 
