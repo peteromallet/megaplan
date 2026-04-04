@@ -1,44 +1,50 @@
 # Megaplan
 
-A general-purpose planning and execution harness for LLMs. Megaplan helps any model solve complex tasks through structured phases — prep, plan, critique, gate, execute, and review.
+A planning and execution harness that helps LLMs solve complex tasks through structured phases — prep, plan, critique, gate, execute, and review. Instead of one-shot attempts, Megaplan gives any model a rigorous process with independent critique and gating.
 
-Instead of attempting tasks in one shot, Megaplan gives models a rigorous process: plan the approach, critique it for issues, gate whether to proceed or revise, then execute with verification.
+## Quick Start — Claude Code / Codex
 
-## Features
+Copy and give this to your agent:
 
-- **Structured phases**: prep → plan → critique → gate → finalize → execute → review
-- **Critique with flags**: Parallel per-check critique that raises typed flags (blocking, significant, minor)
-- **Gate enforcement**: LLM-driven gate decides proceed vs iterate, with structured flag resolutions
-- **Provider routing**: Support for multiple LLM providers (OpenRouter, Zhipu/GLM, MiniMax, Google Gemini) with API key pooling and automatic failover
-- **Robustness levels**: light (no structured critique), standard (4 checks), heavy (8 checks + prep research)
-- **Model-agnostic**: Use different models for different phases (e.g. GLM for execution, MiniMax for critique)
+```
+Please install megaplan and set it up for this project:
 
-## Quick Start
-
-Megaplan uses [hermes-megaplan](https://github.com/peteromallet/hermes-megaplan) as the execution backend — any model accessible via OpenRouter (or direct provider APIs) works out of the box.
-
-### 1. Install
-
-```bash
 pip install megaplan-harness
-pip install hermes-agent
+megaplan setup
+
+Once you're done, ask me what I need megaplan for.
 ```
 
-### 2. Configure API keys
+## Quick Start — Open Models via OpenRouter
 
-Add your keys to `~/.hermes/.env`:
+Copy and give this to your agent:
 
-```bash
-# OpenRouter (works with any model)
-OPENROUTER_API_KEY=sk-or-v1-...
+```
+Please install megaplan with the open-model backend and set it up:
 
-# Or use direct provider APIs for better performance:
-# ZHIPU_API_KEY=...          # for zhipu: prefix (GLM models)
-# MINIMAX_API_KEY=...        # for minimax: prefix
-# GEMINI_API_KEY=...         # for google: prefix
+pip install megaplan-harness hermes-agent
+
+Then create ~/.hermes/.env with:
+OPENROUTER_API_KEY=<my key>
+
+Then run: megaplan setup
+
+Once you're done, ask me what I need megaplan for.
 ```
 
-### 3. Run
+Get an OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys). Any model on OpenRouter works — Qwen, Llama, Mistral, DeepSeek, etc.
+
+---
+
+## How it works
+
+```
+prep → plan → critique → gate → [revise → critique → gate]* → finalize → execute → review
+```
+
+Each phase can use a different model. The critique phase uses an independent model to review the plan and raise flags. The gate decides whether to proceed or iterate. This prevents models from rubber-stamping their own work.
+
+## Running manually
 
 ```bash
 megaplan init --project-dir . "Fix the authentication bug in login.py"
@@ -49,9 +55,9 @@ megaplan finalize --plan <name>
 megaplan execute --plan <name>
 ```
 
-### Using different models per phase
+## Using different models per phase
 
-You can specify models with provider prefixes. Models without a prefix route through OpenRouter:
+Models with provider prefixes route to direct APIs. Models without a prefix go through OpenRouter:
 
 ```json
 {
@@ -65,25 +71,26 @@ You can specify models with provider prefixes. Models without a prefix route thr
 }
 ```
 
-Or use any OpenRouter model for everything:
+Configure direct provider keys in `~/.hermes/.env`:
 
-```json
-{
-  "models": {
-    "prep": "qwen/qwen3.5-27b",
-    "plan": "qwen/qwen3.5-27b",
-    "critique": "qwen/qwen3.5-27b",
-    "execute": "qwen/qwen3.5-27b"
-  }
-}
+```bash
+ZHIPU_API_KEY=...          # for zhipu: prefix
+MINIMAX_API_KEY=...        # for minimax: prefix
+GEMINI_API_KEY=...         # for google: prefix
 ```
+
+## Robustness levels
+
+- **light** — no structured critique, fast
+- **standard** — 4 critique checks (default)
+- **heavy** — 8 critique checks + prep research phase
 
 ## SWE-bench Experiment
 
-Megaplan is being used in a live experiment to test whether open-source models can beat Claude Opus 4.5 on [SWE-bench Verified](https://www.swebench.com):
+Megaplan is being tested live against Claude 4.5 Opus on SWE-bench Verified:
 
-- **Live dashboard**: [peteromallet.github.io/swe-bench-challenge](https://peteromallet.github.io/swe-bench-challenge/)
-- **Experiment code**: [hermes-megaplan](https://github.com/peteromallet/hermes-megaplan)
+- **[Live dashboard](https://peteromallet.github.io/swe-bench-challenge/)** — watch the experiment in real time
+- **[hermes-megaplan](https://github.com/peteromallet/hermes-megaplan)** — experiment orchestration code
 
 ## License
 
