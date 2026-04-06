@@ -85,6 +85,42 @@ GEMINI_API_KEY=...         # for google: prefix
 - **standard** — 4 critique checks (default)
 - **heavy** — 8 critique checks + prep phase
 
+## Observability
+
+```bash
+megaplan watch --plan <name>
+```
+
+Shows current state, last completed phase, pending notes, and execution progress.
+
+## Subagent mode (Claude Code)
+
+Subagent mode delegates the full workflow to an autonomous Claude Code agent, returning control only at defined breakpoints. It is the default orchestration mode for Claude Code. Codex and Cursor continue to run inline.
+
+```bash
+megaplan config set orchestration.mode subagent   # default
+megaplan config set orchestration.mode inline      # switch back
+```
+
+## Configuration & Defaults
+
+View all settings with `megaplan config show`. Override with `megaplan config set <key> <value>`. Reset with `megaplan config reset`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `orchestration.mode` | `subagent` | `inline` or `subagent` (Claude Code only) |
+| `orchestration.max_critique_concurrency` | `2` | Max parallel critique checks |
+| `execution.worker_timeout_seconds` | `7200` | Worker process timeout (seconds) |
+| `execution.max_execute_no_progress` | `3` | No-progress execute attempts before escalation |
+| `execution.max_review_rework_cycles` | `3` | Review→rework loops before force-proceeding |
+| `agents.<step>` | varies | Agent for each phase (`claude`, `codex`, `hermes`) |
+
+```bash
+megaplan config set execution.worker_timeout_seconds 3600
+megaplan config set agents.critique hermes
+megaplan config reset
+```
+
 ## SWE-bench Experiment
 
 Megaplan is being tested live against Claude 4.5 Opus on SWE-bench Verified:

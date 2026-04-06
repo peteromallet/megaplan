@@ -61,6 +61,7 @@ from megaplan._core import (
     sha256_text,
     slugify,
     unresolved_significant_flags,
+    get_effective,
     workflow_includes_step,
     workflow_transition,
     workflow_next,
@@ -1061,9 +1062,6 @@ def _merge_review_verdicts(
     return verdict_count, total_tasks, check_count, total_checks, missing_evidence
 
 
-_MAX_REVIEW_REWORK_CYCLES = 3
-
-
 def _resolve_review_outcome(
     review_verdict: str,
     verdict_count: int,
@@ -1088,13 +1086,14 @@ def _resolve_review_outcome(
 
     rework_requested = review_verdict == "needs_rework"
     if rework_requested:
+        max_review_rework_cycles = get_effective("execution", "max_review_rework_cycles")
         prior_rework_count = sum(
             1 for entry in state.get("history", [])
             if entry.get("step") == "review" and entry.get("result") == "needs_rework"
         )
-        if prior_rework_count >= _MAX_REVIEW_REWORK_CYCLES:
+        if prior_rework_count >= max_review_rework_cycles:
             issues.append(
-                f"Max review rework cycles ({_MAX_REVIEW_REWORK_CYCLES}) reached. "
+                f"Max review rework cycles ({max_review_rework_cycles}) reached. "
                 "Force-proceeding to done despite unresolved review issues."
             )
         else:

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from megaplan._core import read_json, schemas_root
+from megaplan._core import get_effective, read_json, schemas_root
 from megaplan.hermes_worker import _toolsets_for_phase, clean_parsed_payload, parse_agent_output
 from megaplan.prompts.critique import single_check_critique_prompt, write_single_check_template
 from megaplan.types import CliError, PlanState
@@ -173,9 +173,6 @@ def _run_check(
     )
 
 
-_DEFAULT_MAX_CONCURRENT = 2
-
-
 def run_parallel_critique(
     state: PlanState,
     plan_dir: Path,
@@ -206,7 +203,7 @@ def run_parallel_critique(
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
-        concurrency = min(max_concurrent or _DEFAULT_MAX_CONCURRENT, len(checks))
+        concurrency = min(max_concurrent or get_effective("orchestration", "max_critique_concurrency"), len(checks))
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [
                 executor.submit(

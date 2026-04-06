@@ -10,9 +10,11 @@ from typing import Any, Callable
 from megaplan.types import (
     CliError,
     DEFAULT_AGENT_ROUTING,
+    DEFAULTS,
     KNOWN_AGENTS,
     ROBUSTNESS_LEVELS,
     StepResponse,
+    _SETTABLE_NUMERIC,
 )
 from megaplan._core import (
     active_plan_dirs,
@@ -23,6 +25,7 @@ from megaplan._core import (
     detect_available_agents,
     escalated_subsystems,
     ensure_runtime_layout,
+    get_effective,
     infer_next_steps,
     json_dump,
     load_config,
@@ -294,8 +297,23 @@ def bundled_agents_md() -> str:
     return _canonical_instructions()
 
 
+def _claude_subagent_appendix() -> str:
+    content = resources.files("megaplan").joinpath("data", "claude_subagent_appendix.md").read_text(encoding="utf-8")
+    content = content.replace(
+        "{max_execute_no_progress}",
+        str(get_effective("execution", "max_execute_no_progress")),
+    )
+    content = content.replace(
+        "{max_review_rework_cycles}",
+        str(get_effective("execution", "max_review_rework_cycles")),
+    )
+    return content
+
+
 def bundled_global_file(name: str) -> str:
     content = _canonical_instructions()
+    if name == "claude_skill.md":
+        return _SKILL_HEADER + content + "\n\n" + _claude_subagent_appendix()
     if name == "skill.md":
         return _SKILL_HEADER + content
     if name == "cursor_rule.mdc":
@@ -304,7 +322,7 @@ def bundled_global_file(name: str) -> str:
 
 
 _GLOBAL_TARGETS = [
-    {"agent": "claude", "detect": ".claude", "path": ".claude/skills/megaplan/SKILL.md", "data": "skill.md"},
+    {"agent": "claude", "detect": ".claude", "path": ".claude/skills/megaplan/SKILL.md", "data": "claude_skill.md"},
     {"agent": "codex", "detect": ".codex", "path": ".codex/skills/megaplan/SKILL.md", "data": "skill.md"},
     {"agent": "cursor", "detect": ".cursor", "path": ".cursor/rules/megaplan.mdc", "data": "cursor_rule.mdc"},
 ]
@@ -384,21 +402,55 @@ def handle_config(args: argparse.Namespace) -> StepResponse:
     action = args.config_action
     if action == "show":
         config = load_config()
-        effective = {step: config.get("agents", {}).get(step, default) for step, default in DEFAULT_AGENT_ROUTING.items()}
-        return {"success": True, "step": "config", "action": "show", "config_path": str(config_dir() / "config.json"), "routing": effective, "raw_config": config}
+        effective_routing = {step: config.get("agents", {}).get(step, default) for step, default in DEFAULT_AGENT_ROUTING.items()}
+        effective_settings = {
+            dot_key: get_effective(section, setting)
+            for dot_key in sorted(DEFAULTS)
+            for section, setting in [dot_key.split(".", 1)]
+        }
+        return {
+            "success": True,
+            "step": "config",
+            "action": "show",
+            "config_path": str(config_dir() / "config.json"),
+            "routing": effective_routing,
+            "effective_settings": effective_settings,
+            "raw_config": config,
+        }
     if action == "set":
         key, value = args.key, args.value
         parts = key.split(".", 1)
-        if len(parts) != 2 or parts[0] != "agents":
-            raise CliError("invalid_args", f"Key must be 'agents.<step>', got '{key}'")
-        if parts[1] not in DEFAULT_AGENT_ROUTING:
-            raise CliError("invalid_args", f"Unknown step '{parts[1]}'. Valid steps: {', '.join(DEFAULT_AGENT_ROUTING)}")
-        if value not in KNOWN_AGENTS:
-            raise CliError("invalid_args", f"Unknown agent '{value}'. Valid agents: {', '.join(KNOWN_AGENTS)}")
         config = load_config()
-        config.setdefault("agents", {})[parts[1]] = value
+        valid_keys = [*(f"agents.{step}" for step in DEFAULT_AGENT_ROUTING), "orchestration.mode", *sorted(_SETTABLE_NUMERIC)]
+        if len(parts) != 2:
+            raise CliError(
+                "invalid_args",
+                f"Unknown config key '{key}'. Valid keys: {', '.join(valid_keys)}",
+            )
+        section, setting = parts
+        if section == "agents":
+            if setting not in DEFAULT_AGENT_ROUTING:
+                raise CliError("invalid_args", f"Unknown step '{setting}'. Valid steps: {', '.join(DEFAULT_AGENT_ROUTING)}")
+            if value not in KNOWN_AGENTS:
+                raise CliError("invalid_args", f"Unknown agent '{value}'. Valid agents: {', '.join(KNOWN_AGENTS)}")
+            config.setdefault("agents", {})[setting] = value
+        elif key == "orchestration.mode":
+            if value not in {"inline", "subagent"}:
+                raise CliError("invalid_args", "orchestration.mode must be 'inline' or 'subagent'")
+            config.setdefault("orchestration", {})["mode"] = value
+        elif key in _SETTABLE_NUMERIC:
+            try:
+                parsed_value = int(value)
+            except ValueError as exc:
+                raise CliError("invalid_args", f"{key} must be an integer, got '{value}'") from exc
+            config.setdefault(section, {})[setting] = parsed_value
+        else:
+            raise CliError(
+                "invalid_args",
+                f"Unknown config key '{key}'. Valid keys: {', '.join(valid_keys)}",
+            )
         save_config(config)
-        return {"success": True, "step": "config", "action": "set", "key": key, "value": value}
+        return {"success": True, "step": "config", "action": "set", "key": key, "value": config[section][setting]}
     if action == "reset":
         path = config_dir() / "config.json"
         if path.exists():

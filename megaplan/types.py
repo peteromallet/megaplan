@@ -284,6 +284,21 @@ SCOPE_CREEP_TERMS = (
     "expanded scope",
 )
 
+DEFAULTS = {
+    "execution.worker_timeout_seconds": 7200,
+    "execution.max_review_rework_cycles": 3,
+    "execution.max_execute_no_progress": 3,
+    "orchestration.max_critique_concurrency": 2,
+    "orchestration.mode": "subagent",
+}
+
+_SETTABLE_NUMERIC = {
+    "execution.worker_timeout_seconds",
+    "execution.max_review_rework_cycles",
+    "execution.max_execute_no_progress",
+    "orchestration.max_critique_concurrency",
+}
+
 
 # ---------------------------------------------------------------------------
 # Exception

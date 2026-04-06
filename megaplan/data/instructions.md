@@ -3,11 +3,11 @@ Route every step through the `megaplan` CLI. Never call agents directly.
 ## Triage
 Pick the right level based on the task:
 - **Skip megaplan**: single-file fixes, bug fixes with clear cause, simple refactors, config changes, adding tests for existing code. Just do it.
-- **Light** (default for megaplan): multi-file changes with clear scope, well-understood features, straightforward additions. One critique pass, no iteration loop.
-- **Standard**: cross-cutting changes touching many subsystems, unfamiliar codebase areas, ambiguous requirements, changes with high breakage risk, or anything where the plan itself needs debate.
+- **Light**: multi-file changes with clear scope, well-understood features, straightforward additions. One critique pass, no iteration loop.
+- **Standard** (default for megaplan): cross-cutting changes touching many subsystems, unfamiliar codebase areas, ambiguous requirements, changes with high breakage risk, or anything where the plan itself needs debate.
 - **Heavy**: high-stakes changes where getting it wrong is expensive — security-critical code, data migrations, public API changes. Adds a prep phase that deeply investigates the codebase before planning, and uses 8 critique checks instead of 4.
 
-Default to light unless the task clearly needs standard. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
+Default to standard unless the task is clearly simple enough for light. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
 ## Start
 Ask execution mode (auto-approve or review) before `init`. Pick robustness yourself per the triage guidance above.
 ```bash
@@ -88,6 +88,9 @@ Each edit writes a new same-iteration plan artifact, preserves the latest plan m
 - `--persist`: explicit persistent mode.
 - Keep moving and show results at each step.
 - Only pause at finalize to execute in review mode.
+## Configuration
+View current defaults with `megaplan config show`. Override with `megaplan config set <key> <value>`. Reset with `megaplan config reset`.
+When routing or behavior depends on config, check `megaplan config show` and respect user overrides instead of assuming defaults.
 ## Commands
 ```bash
 megaplan status --plan <name>
@@ -109,4 +112,8 @@ megaplan override add-note --plan <name> --note "..."
 megaplan override force-proceed --plan <name> --reason "..."
 megaplan override replan --plan <name> --reason "..." [--note "..."]
 megaplan override abort --plan <name> --reason "..."
+megaplan watch --plan <name>
+megaplan config show
+megaplan config set <key> <value>
+megaplan config reset
 ```

@@ -30,6 +30,7 @@ from megaplan.types import (
 from megaplan._core import (
     configured_robustness,
     detect_available_agents,
+    get_effective,
     json_dump,
     latest_plan_meta_path,
     load_config,
@@ -93,9 +94,10 @@ def run_command(
     *,
     cwd: Path,
     stdin_text: str | None = None,
-    timeout: int | None = WORKER_TIMEOUT_SECONDS,
+    timeout: int | None = None,
 ) -> CommandResult:
     started = time.monotonic()
+    timeout = timeout or get_effective("execution", "worker_timeout_seconds")
     try:
         process = subprocess.run(
             command,

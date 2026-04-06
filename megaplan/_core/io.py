@@ -247,6 +247,19 @@ def save_config(config: dict[str, Any], home: Path | None = None) -> Path:
     return path
 
 
+def get_effective(section: str, key: str) -> Any:
+    from megaplan.types import DEFAULTS
+
+    default_key = f"{section}.{key}"
+    if default_key not in DEFAULTS:
+        raise KeyError(default_key)
+    config = load_config()
+    section_config = config.get(section)
+    if isinstance(section_config, dict) and key in section_config:
+        return section_config[key]
+    return DEFAULTS[default_key]
+
+
 def detect_available_agents() -> list[str]:
     # Access shutil via the _core package so monkeypatches on megaplan._core.shutil work.
     import megaplan._core as _core_pkg
