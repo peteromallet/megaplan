@@ -3,6 +3,16 @@ Version 0.2 - March 24, 2026
 
 Copyright (c) 2025-2026 Peter O'Malley
 
+TL;DR (not legally binding — see full text below)
+
+- Free for anyone to use internally, including commercial companies. Use it
+  on personal projects, in research, or as a tool inside your business —
+  no fee, no registration.
+- Free to ship inside a product you sell IF your company is itself open
+  source (primary business assets under an OSI-approved license or OSNL).
+- Paid tiers only apply if you redistribute the Program in a product/service
+  AND your company is not open source — see Section 2(c) for the tiers.
+
 Preamble
 
 The Open Source Native License (OSNL) allows anyone — individuals and
@@ -35,7 +45,7 @@ use, reproduce, modify, distribute, and sublicense the Program, subject to
 the termination provisions in Section 6 and provided that any sublicense is
 granted under the terms of this License.
 
-a) Internal Use
+a) Using the Program — Always Free (Anyone, Including Companies)
 
    Any person or organization may use, modify, and contribute to the Program
    for their own internal purposes without restriction. This includes personal
@@ -44,7 +54,7 @@ a) Internal Use
    nonprofit, or a commercial entity. No additional license is required for
    internal use.
 
-b) Commercialization by Open Source Entities
+b) Shipping the Program in Your Product — Free for Open Source Companies
 
    If you distribute the Program or a derivative as part of a product or
    service, or otherwise offer it to third parties, you may do so freely and
@@ -53,7 +63,7 @@ b) Commercialization by Open Source Entities
    open source license or under this License (OSNL). This condition applies
    only to primary business assets, not to ancillary or peripheral services.
 
-c) Commercialization by Non-Open Source Entities
+c) Shipping the Program in Your Product — Paid Tiers for Non-Open Source Companies
 
    If you wish to distribute the Program or a derivative as part of a product
    or service, or otherwise offer it to third parties, and you do not meet the
