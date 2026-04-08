@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -10,10 +11,22 @@ from megaplan.types import PlanState
 from megaplan._core import (
     atomic_write_json,
     atomic_write_text,
+    collect_git_diff_summary,
+    intent_and_notes_block,
+    json_dump,
+    latest_plan_meta_path,
+    latest_plan_path,
     load_debt_registry,
+    read_json,
     resolve_debt,
     save_debt_registry,
     save_flag_registry,
+)
+from megaplan.prompts.review import (
+    _review_prompt,
+    _settled_decisions_block,
+    _settled_decisions_instruction,
+    heavy_criteria_review_prompt,
 )
 from megaplan.prompts import (
     _execute_batch_prompt,
@@ -219,6 +232,140 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
         },
     )
     return plan_dir, state
+
+
+def _render_codex_review_prompt(
+    state: PlanState,
+    plan_dir: Path,
+    *,
+    pre_check_flags: list[dict[str, object]] | None = None,
+) -> str:
+    return _review_prompt(
+        state,
+        plan_dir,
+        review_intro="Review the implementation against the success criteria.",
+        criteria_guidance="Verify each success criterion explicitly.",
+        task_guidance="Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.",
+        sense_check_guidance="Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.",
+        pre_check_flags=pre_check_flags,
+    )
+
+
+def _baseline_codex_review_prompt_snapshot(state: PlanState, plan_dir: Path) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    execution = read_json(plan_dir / "execution.json")
+    gate = read_json(plan_dir / "gate.json")
+    finalize_data = read_json(plan_dir / "finalize.json")
+    settled_decisions_block = _settled_decisions_block(gate)
+    settled_decisions_instruction = _settled_decisions_instruction(gate)
+    diff_summary = collect_git_diff_summary(project_dir)
+    audit_path = plan_dir / "execution_audit.json"
+    if audit_path.exists():
+        audit_block = textwrap.dedent(
+            f"""
+            Execution audit (`execution_audit.json`):
+            {json_dump(read_json(audit_path)).strip()}
+            """
+        ).strip()
+    else:
+        audit_block = "Execution audit (`execution_audit.json`): not present. Skip that artifact gracefully and rely on `finalize.json`, `execution.json`, and the git diff."
+    return textwrap.dedent(
+        f"""
+        Review the implementation against the success criteria.
+
+        Project directory:
+        {project_dir}
+
+        {intent_and_notes_block(state)}
+
+        Approved plan:
+        {latest_plan}
+
+        Execution tracking state (`finalize.json`):
+        {json_dump(finalize_data).strip()}
+
+        Plan metadata:
+        {json_dump(latest_meta).strip()}
+
+        Gate summary:
+        {json_dump(gate).strip()}
+
+        {settled_decisions_block}
+
+        Execution summary:
+        {json_dump(execution).strip()}
+
+        {audit_block}
+
+        Git diff summary:
+        {diff_summary}
+
+        Requirements:
+        - Verify each success criterion explicitly.
+        - Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.
+        - Each criterion has a `priority` (`must`, `should`, or `info`). Apply these rules:
+          - `must` criteria are hard gates. A `must` criterion that fails means `needs_rework`.
+          - `should` criteria are quality targets. If the spirit is met but the letter is not, mark `pass` with evidence explaining the gap. Only mark `fail` if the intent was clearly missed. A `should` failure alone does NOT require `needs_rework`.
+          - `info` criteria are for human reference. Mark them `waived` with a note — do not evaluate them.
+          - If a criterion (any priority) cannot be verified in this context (e.g., requires manual testing or runtime observation), mark it `waived` with an explanation.
+        - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
+        {settled_decisions_instruction}
+        - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
+        - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
+        - Follow this JSON shape exactly:
+        ```json
+        {{
+          "review_verdict": "approved",
+          "criteria": [
+            {{
+              "name": "All existing tests pass",
+              "priority": "must",
+              "pass": "pass",
+              "evidence": "Test suite ran green — 42 passed, 0 failed."
+            }},
+            {{
+              "name": "File under ~300 lines",
+              "priority": "should",
+              "pass": "pass",
+              "evidence": "File is 375 lines — above the target but reasonable given the component's responsibilities. Spirit met."
+            }},
+            {{
+              "name": "Manual smoke tests pass",
+              "priority": "info",
+              "pass": "waived",
+              "evidence": "Cannot be verified in automated review. Noted for manual QA."
+            }}
+          ],
+          "issues": [],
+          "rework_items": [],
+          "summary": "Approved. All must criteria pass. The should criterion on line count is close enough given the component scope.",
+          "task_verdicts": [
+            {{
+              "task_id": "T6",
+              "reviewer_verdict": "Pass. Claimed handler changes and command evidence match the repo state.",
+              "evidence_files": ["megaplan/handlers.py", "megaplan/evaluation.py"]
+            }}
+          ],
+          "sense_check_verdicts": [
+            {{
+              "sense_check_id": "SC6",
+              "verdict": "Confirmed. The execute blocker only fires when both evidence arrays are empty."
+            }}
+          ]
+        }}
+        ```
+        - `rework_items` must be an array of structured rework directives. When `review_verdict` is `needs_rework`, populate one entry per issue with:
+          - `task_id`: which finalize task this issue relates to
+          - `issue`: what is wrong
+          - `expected`: what correct behavior looks like
+          - `actual`: what was observed
+          - `evidence_file` (optional): file path supporting the finding
+        - `issues` must still be populated as a flat one-line-per-item summary derived from `rework_items` (for backward compatibility). When approved, both `issues` and `rework_items` should be empty arrays.
+        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; make `issues`, `rework_items`, `summary`, and task verdicts specific enough for the executor to act on directly.
+        """
+    ).strip()
 
 
 def _write_debt_registry(tmp_path: Path, entries: list[dict[str, object]]) -> None:
@@ -590,6 +737,85 @@ def test_review_prompts_request_verdict_arrays(tmp_path: Path) -> None:
     assert "final.md" not in codex_prompt
 
 
+def test_review_prompt_includes_reverify_block_for_addressed_flags(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    save_flag_registry(
+        plan_dir,
+        {
+            "flags": [
+                {
+                    "id": "FLAG-ADDRESSED-001",
+                    "concern": "The addressed branch still needs final-diff verification.",
+                    "category": "correctness",
+                    "severity_hint": "likely-significant",
+                    "severity": "significant",
+                    "status": "addressed",
+                }
+            ]
+        },
+    )
+
+    prompt = create_codex_prompt("review", state, plan_dir)
+
+    assert "FLAG-ADDRESSED-001" in prompt
+    assert "verify whether the final diff actually addresses the concern" in prompt
+
+
+def test_review_prompt_includes_reverify_block_for_open_flags(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    save_flag_registry(
+        plan_dir,
+        {
+            "flags": [
+                {
+                    "id": "FLAG-OPEN-001",
+                    "concern": "The open branch still needs final-diff verification.",
+                    "category": "correctness",
+                    "severity_hint": "likely-significant",
+                    "severity": "significant",
+                    "status": "open",
+                }
+            ]
+        },
+    )
+
+    prompt = create_codex_prompt("review", state, plan_dir)
+
+    assert "FLAG-OPEN-001" in prompt
+    assert "verify whether the final diff actually addresses the concern" in prompt
+
+
+def test_review_prompt_without_flags_or_prechecks_matches_snapshot(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    save_flag_registry(plan_dir, {"flags": []})
+
+    prompt = _render_codex_review_prompt(state, plan_dir, pre_check_flags=None)
+
+    assert prompt == _baseline_codex_review_prompt_snapshot(state, plan_dir)
+
+
+def test_review_prompt_with_only_prechecks_adds_mechanical_block(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    save_flag_registry(plan_dir, {"flags": []})
+
+    prompt = _render_codex_review_prompt(
+        state,
+        plan_dir,
+        pre_check_flags=[
+            {
+                "id": "PRECHECK-1",
+                "check": "source_touch",
+                "detail": "Advisory only.",
+                "severity": "minor",
+            }
+        ],
+    )
+
+    assert "Advisory mechanical pre-check flags" in prompt
+    assert "Copy this list verbatim into the output `pre_check_flags` field." in prompt
+    assert "Critique flags to re-verify against the final diff" not in prompt
+
+
 def test_execute_prompt_includes_previous_review_when_present(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     atomic_write_json(
@@ -760,6 +986,42 @@ def test_review_prompt_omits_settled_decisions_when_empty(tmp_path: Path) -> Non
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_codex_prompt("review", state, plan_dir)
     assert "Settled decisions (verify the executor implemented these correctly)" not in prompt
+
+
+def test_heavy_criteria_review_prompt_uses_issue_anchored_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "gate.json",
+        {
+            "settled_decisions": [
+                {
+                    "id": "DECISION-001",
+                    "decision": "Keep the parser fix source-local.",
+                    "rationale": "The gate already approved this tradeoff.",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "megaplan.prompts.review.collect_git_diff_patch",
+        lambda project_dir: "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n+print('patched')\n",
+    )
+
+    prompt = heavy_criteria_review_prompt(state, plan_dir, tmp_path, plan_dir / "review_criteria_verdict.json")
+
+    assert "Approved plan:" not in prompt
+    assert "Plan metadata:" not in prompt
+    assert "Execution summary:" not in prompt
+    assert "Execution audit" not in prompt
+    assert "Gate summary:" not in prompt
+    assert intent_and_notes_block(state) in prompt
+    assert "diff --git a/app.py b/app.py" in prompt
+    assert '"tasks": [' in prompt
+    assert "DECISION-001" in prompt
+    assert "Keep the parser fix source-local." in prompt
 
 
 def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:

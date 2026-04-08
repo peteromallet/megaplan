@@ -64,7 +64,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
-        "tier": "extended",
+        "tier": "core",
     },
     {
         "id": "callers",
@@ -76,7 +76,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
-        "tier": "extended",
+        "tier": "core",
     },
     {
         "id": "conventions",
@@ -101,7 +101,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "likely-minor",
-        "tier": "core",
+        "tier": "extended",
     },
     {
         "id": "criteria_quality",
@@ -139,7 +139,7 @@ def build_check_category_map() -> dict[str, str]:
 def checks_for_robustness(robustness: str) -> tuple[CritiqueCheckSpec, ...]:
     if robustness == "heavy":
         return CRITIQUE_CHECKS
-    if robustness == "light":
+    if robustness in {"light", "tiny"}:
         return ()
     return _CORE_CRITIQUE_CHECKS
 

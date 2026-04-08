@@ -96,33 +96,39 @@ _HERMES_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 
 
 def create_claude_prompt(
-    step: str, state: PlanState, plan_dir: Path, root: Path | None = None
+    step: str, state: PlanState, plan_dir: Path, root: Path | None = None, **prompt_kwargs: object
 ) -> str:
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
+    if step == "review":
+        return builder(state, plan_dir, **prompt_kwargs)
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
 
 def create_codex_prompt(
-    step: str, state: PlanState, plan_dir: Path, root: Path | None = None
+    step: str, state: PlanState, plan_dir: Path, root: Path | None = None, **prompt_kwargs: object
 ) -> str:
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
+    if step == "review":
+        return builder(state, plan_dir, **prompt_kwargs)
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
 
 def create_hermes_prompt(
-    step: str, state: PlanState, plan_dir: Path, root: Path | None = None
+    step: str, state: PlanState, plan_dir: Path, root: Path | None = None, **prompt_kwargs: object
 ) -> str:
     builder = _HERMES_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Hermes step '{step}'")
+    if step == "review":
+        return builder(state, plan_dir, **prompt_kwargs)
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)

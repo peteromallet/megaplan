@@ -83,12 +83,14 @@ _ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
         ],
         STATE_EXECUTED: [],
     },
+    "tiny": {},
 }
 
 _ROBUSTNESS_WORKFLOW_LEVELS: dict[str, tuple[str, ...]] = {
     "heavy": ("heavy",),
     "standard": ("standard",),
     "light": ("standard", "light"),
+    "tiny": ("standard", "light", "tiny"),
 }
 
 _STEP_CONTEXT_STATES = {

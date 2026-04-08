@@ -354,6 +354,59 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "review_verdict": {"type": "string", "enum": ["approved", "needs_rework"]},
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "guidance": {"type": "string"},
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "detail": {"type": "string"},
+                                    "flagged": {"type": "boolean"},
+                                    "status": {"type": "string"},
+                                    "evidence_file": {"type": "string"},
+                                },
+                                "required": ["detail", "flagged"],
+                            },
+                        },
+                        "prior_findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "detail": {"type": "string"},
+                                    "flagged": {"type": "boolean"},
+                                    "status": {"type": "string"},
+                                },
+                                "required": ["detail", "flagged", "status"],
+                            },
+                        },
+                    },
+                    "required": ["id", "question", "findings"],
+                },
+            },
+            "pre_check_flags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "check": {"type": "string"},
+                        "detail": {"type": "string"},
+                        "severity": {"type": "string"},
+                        "evidence_file": {"type": "string"},
+                    },
+                    "required": ["id", "check", "detail", "severity"],
+                },
+            },
+            "verified_flag_ids": {"type": "array", "items": {"type": "string"}},
+            "disputed_flag_ids": {"type": "array", "items": {"type": "string"}},
             "criteria": {
                 "type": "array",
                 "items": {
@@ -378,6 +431,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "expected": {"type": "string"},
                         "actual": {"type": "string"},
                         "evidence_file": {"type": "string"},
+                        "flag_id": {"type": "string"},
+                        "source": {"type": "string"},
                     },
                     "required": ["task_id", "issue", "expected", "actual", "evidence_file"],
                 },

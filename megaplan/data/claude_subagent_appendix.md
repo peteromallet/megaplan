@@ -11,8 +11,11 @@ This appendix is Claude-specific. It adds a subagent path; subagent mode is the 
 ### Launch
 When subagent mode is active, the outer skill becomes a launcher plus breakpoint relay. Start a Claude Code Agent with:
 - `description`: `Run megaplan autonomously for {PROJECT_DIR}`
-- `prompt`: fill the template below with `{IDEA}`, `{PROJECT_DIR}`, `{AUTO_APPROVE}`, `{AUTO_APPROVE_FLAG}`, and `{ROBUSTNESS}`
+- `prompt`: fill the template below with `{IDEA}`, `{PROJECT_DIR}`, `{AUTO_APPROVE}`, `{AUTO_APPROVE_FLAG}`, `{ROBUSTNESS}`, and `{ROBUSTNESS_FLAG}`
 - `run_in_background: true` when `{AUTO_APPROVE}` is true; otherwise foreground is fine
+- Expand `{AUTO_APPROVE_FLAG}` to an empty string when `raw_config.execution.auto_approve` is explicitly set; otherwise expand it to `--auto-approve` for auto-approve runs and an empty string for review runs.
+- Expand `{ROBUSTNESS_FLAG}` to an empty string when `raw_config.execution.robustness` is explicitly set; otherwise expand it to `--robustness {ROBUSTNESS}`.
+- After editing this source file, rerun `megaplan setup --force` so installed `SKILL.md` files pick up the refreshed appendix.
 
 ### Outer Skill Handling
 - Decide inline vs subagent before starting the workflow.
@@ -55,11 +58,12 @@ Never do these things:
 
 ## 2. Startup
 Start the run like this:
-1. Run `megaplan init --project-dir "{PROJECT_DIR}" {AUTO_APPROVE_FLAG} --robustness {ROBUSTNESS} "{IDEA}"`.
-2. Capture the returned plan name.
-3. Output `PLAN_NAME: <name>` on its own line immediately after init and before any `BREAKPOINT:` or `COMPLETE:`.
-4. Run `megaplan status --plan <name>`.
-5. From then on, use that plan name for every command.
+1. Use empty-string expansion for `{AUTO_APPROVE_FLAG}` and `{ROBUSTNESS_FLAG}` whenever the corresponding `raw_config.execution` key is explicitly set.
+2. Run `megaplan init --project-dir "{PROJECT_DIR}" {AUTO_APPROVE_FLAG} {ROBUSTNESS_FLAG} "{IDEA}"`.
+3. Capture the returned plan name.
+4. Output `PLAN_NAME: <name>` on its own line immediately after init and before any `BREAKPOINT:` or `COMPLETE:`.
+5. Run `megaplan status --plan <name>`.
+6. From then on, use that plan name for every command.
 
 At startup and after every later resume:
 - Read `state`, `next_step`, and `valid_next`.

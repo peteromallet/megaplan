@@ -359,6 +359,66 @@ def collect_git_diff_summary(project_dir: Path) -> str:
     return process.stdout.strip() or "No git changes detected."
 
 
+def collect_git_diff_patch(project_dir: Path) -> str:
+    if not (project_dir / ".git").exists():
+        return "Project directory is not a git repository."
+
+    def _run_git(
+        args: list[str],
+        *,
+        allow_returncodes: tuple[int, ...] = (0,),
+    ) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:
+        try:
+            process = subprocess.run(
+                ["git", *args],
+                cwd=str(project_dir),
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            return None, "git not found on PATH."
+        except subprocess.TimeoutExpired:
+            return None, "git diff timed out."
+        if process.returncode not in allow_returncodes:
+            detail = process.stderr.strip() or process.stdout.strip()
+            return None, f"Unable to read git diff: {detail}"
+        return process, None
+
+    tracked_process, error = _run_git(["diff", "--binary", "--no-ext-diff", "HEAD"])
+    if error:
+        return error
+
+    untracked_process, error = _run_git(["ls-files", "--others", "--exclude-standard"])
+    if error:
+        return error
+
+    patches: list[str] = []
+    tracked_patch = (tracked_process.stdout if tracked_process is not None else "").rstrip()
+    if tracked_patch:
+        patches.append(tracked_patch)
+
+    untracked_paths = [
+        line.strip()
+        for line in (untracked_process.stdout if untracked_process is not None else "").splitlines()
+        if line.strip()
+    ]
+    for rel_path in untracked_paths:
+        if not (project_dir / rel_path).exists():
+            continue
+        patch_process, error = _run_git(
+            ["diff", "--no-index", "--binary", "--no-ext-diff", "/dev/null", rel_path],
+            allow_returncodes=(0, 1),
+        )
+        if error:
+            return error
+        patch = (patch_process.stdout if patch_process is not None else "").rstrip()
+        if patch:
+            patches.append(patch)
+
+    return "\n".join(patches).strip() or "No git changes detected."
+
+
 def find_command(name: str) -> str | None:
     import megaplan._core as _core_pkg
     return _core_pkg.shutil.which(name)

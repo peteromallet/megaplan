@@ -117,7 +117,7 @@ def test_run_parallel_critique_merges_in_original_order(monkeypatch: pytest.Monk
 
     assert [check["id"] for check in result.payload["checks"]] == [check["id"] for check in checks]
     assert result.payload["flags"] == []
-    assert result.payload["verified_flag_ids"] == ["FLAG-001", "FLAG-002", "FLAG-003", "FLAG-004"]
+    assert result.payload["verified_flag_ids"] == [f"FLAG-{index:03d}" for index in range(1, len(checks) + 1)]
     assert result.payload["disputed_flag_ids"] == []
 
 

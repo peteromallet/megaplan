@@ -3,6 +3,7 @@ from __future__ import annotations
 from megaplan.checks import (
     build_empty_template,
     checks_for_robustness,
+    get_check_by_id,
     validate_critique_checks,
 )
 
@@ -29,15 +30,21 @@ def test_checks_for_robustness_returns_expected_check_sets() -> None:
     heavy_checks = checks_for_robustness("heavy")
     standard_checks = checks_for_robustness("standard")
     light_checks = checks_for_robustness("light")
+    tiny_checks = checks_for_robustness("tiny")
 
     assert len(heavy_checks) == 8
     assert [check["id"] for check in standard_checks] == [
         "issue_hints",
         "correctness",
         "scope",
-        "verification",
+        "all_locations",
+        "callers",
     ]
+    assert get_check_by_id("verification")["tier"] == "extended"
+    assert get_check_by_id("conventions")["tier"] == "extended"
+    assert get_check_by_id("criteria_quality")["tier"] == "extended"
     assert light_checks == ()
+    assert tiny_checks == ()
 
 
 def test_build_empty_template_uses_filtered_checks() -> None:
@@ -47,7 +54,8 @@ def test_build_empty_template_uses_filtered_checks() -> None:
         "issue_hints",
         "correctness",
         "scope",
-        "verification",
+        "all_locations",
+        "callers",
     ]
     assert all(entry["findings"] == [] for entry in template)
 

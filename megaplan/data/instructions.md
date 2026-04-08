@@ -9,7 +9,7 @@ Pick the right level based on the task:
 
 Default to standard unless the task is clearly simple enough for light. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
 ## Start
-Ask execution mode (auto-approve or review) before `init`. Pick robustness yourself per the triage guidance above.
+Run `megaplan config show` before `init`. If `raw_config.execution.auto_approve` is explicitly present, do not ask the execution-mode question and honor that configured override, including configured `false`. If that raw key is absent, ask execution mode (auto-approve or review) before `init`. In the same config check, respect `execution.robustness` as a settable override when it is configured; otherwise pick robustness yourself per the triage guidance above.
 ```bash
 megaplan init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|standard|heavy] "$IDEA"
 ```
@@ -91,6 +91,7 @@ Each edit writes a new same-iteration plan artifact, preserves the latest plan m
 ## Configuration
 View current defaults with `megaplan config show`. Override with `megaplan config set <key> <value>`. Reset with `megaplan config reset`.
 When routing or behavior depends on config, check `megaplan config show` and respect user overrides instead of assuming defaults.
+Settable execution keys: `execution.auto_approve`, `execution.robustness`.
 ## Commands
 ```bash
 megaplan status --plan <name>

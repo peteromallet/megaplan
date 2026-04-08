@@ -762,7 +762,9 @@ def mock_worker_output(
     plan_dir: Path,
     *,
     prompt_override: str | None = None,
+    prompt_kwargs: dict[str, Any] | None = None,
 ) -> WorkerResult:
+    del prompt_kwargs
     handler = _MOCK_DISPATCH.get(step)
     if handler is None:
         raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
@@ -820,9 +822,10 @@ def run_claude_step(
     root: Path,
     fresh: bool,
     prompt_override: str | None = None,
+    prompt_kwargs: dict[str, Any] | None = None,
 ) -> WorkerResult:
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override)
+        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override, prompt_kwargs=prompt_kwargs)
     project_dir = Path(state["config"]["project_dir"])
     schema_name = STEP_SCHEMA_FILENAMES[step]
     schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
@@ -837,7 +840,13 @@ def run_claude_step(
     else:
         session_id = str(uuid.uuid4())
         command.extend(["--session-id", session_id])
-    prompt = prompt_override if prompt_override is not None else create_claude_prompt(step, state, plan_dir, root=root)
+    prompt = prompt_override if prompt_override is not None else create_claude_prompt(
+        step,
+        state,
+        plan_dir,
+        root=root,
+        **(prompt_kwargs or {}),
+    )
     try:
         result = run_command(command, cwd=project_dir, stdin_text=prompt)
     except CliError as error:
@@ -869,9 +878,10 @@ def run_codex_step(
     fresh: bool = False,
     json_trace: bool = False,
     prompt_override: str | None = None,
+    prompt_kwargs: dict[str, Any] | None = None,
 ) -> WorkerResult:
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override)
+        return mock_worker_output(step, state, plan_dir, prompt_override=prompt_override, prompt_kwargs=prompt_kwargs)
     project_dir = Path(state["config"]["project_dir"])
     schema_file = schemas_root(root) / STEP_SCHEMA_FILENAMES[step]
     session_key = session_key_for(step, "codex")
@@ -879,7 +889,13 @@ def run_codex_step(
     out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)
     out_handle.close()
     output_path = Path(out_handle.name)
-    prompt = prompt_override if prompt_override is not None else create_codex_prompt(step, state, plan_dir, root=root)
+    prompt = prompt_override if prompt_override is not None else create_codex_prompt(
+        step,
+        state,
+        plan_dir,
+        root=root,
+        **(prompt_kwargs or {}),
+    )
 
     if persistent and session.get("id") and not fresh:
         # codex exec resume does not support --output-schema; we rely on
@@ -1090,6 +1106,7 @@ def run_step_with_worker(
     root: Path,
     resolved: tuple[str, str, bool, str | None] | None = None,
     prompt_override: str | None = None,
+    prompt_kwargs: dict[str, Any] | None = None,
 ) -> tuple[WorkerResult, str, str, bool]:
     agent, mode, refreshed, model = resolved or resolve_agent_mode(step, args)
     if agent == "hermes":
@@ -1105,7 +1122,15 @@ def run_step_with_worker(
             prompt_override=prompt_override,
         )
     elif agent == "claude":
-        worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed, prompt_override=prompt_override)
+        worker = run_claude_step(
+            step,
+            state,
+            plan_dir,
+            root=root,
+            fresh=refreshed,
+            prompt_override=prompt_override,
+            prompt_kwargs=prompt_kwargs,
+        )
     else:
         worker = run_codex_step(
             step,
@@ -1116,5 +1141,6 @@ def run_step_with_worker(
             fresh=refreshed,
             json_trace=(step == "execute"),
             prompt_override=prompt_override,
+            prompt_kwargs=prompt_kwargs,
         )
     return worker, agent, mode, refreshed

@@ -15,6 +15,7 @@ import megaplan.evaluation
 import megaplan.handlers
 import megaplan.cli
 import megaplan._core
+import megaplan._core.io as io_module
 import megaplan.workers
 from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
 from megaplan._core import WORKFLOW, _ROBUSTNESS_OVERRIDES, ensure_runtime_layout, load_plan, workflow_next
@@ -51,8 +52,8 @@ def make_args_factory(project_dir: Path) -> Callable[..., Namespace]:
             "idea": "test idea",
             "name": "test-plan",
             "project_dir": str(project_dir),
-            "auto_approve": False,
-            "robustness": "standard",
+            "auto_approve": None,
+            "robustness": None,
             "agent": None,
             "ephemeral": False,
             "fresh": False,
@@ -88,9 +89,14 @@ def _make_plan_fixture_with_robustness(
 ) -> PlanFixture:
     root = tmp_path / "root"
     project_dir = tmp_path / "project"
+    config_path = tmp_path / "config"
     root.mkdir()
     project_dir.mkdir()
     (project_dir / ".git").mkdir()
+
+    def _config_dir(home: Path | None = None) -> Path:
+        del home
+        return config_path
 
     monkeypatch.setenv(megaplan.MOCK_ENV_VAR, "1")
     monkeypatch.setattr(
@@ -98,6 +104,8 @@ def _make_plan_fixture_with_robustness(
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
+    monkeypatch.setattr(io_module, "config_dir", _config_dir)
+    monkeypatch.setattr(megaplan.cli, "config_dir", _config_dir)
 
     make_args = make_args_factory(project_dir)
     response = megaplan.handle_init(root, make_args(robustness=robustness))
@@ -340,7 +348,7 @@ def test_workflow_walk_matches_documented_light_flow() -> None:
 
 def test_all_robustness_levels_route_planned_to_critique() -> None:
     """All robustness levels go directly from planned to critique."""
-    for level in ("light", "standard", "heavy"):
+    for level in ("tiny", "light", "standard", "heavy"):
         state = {"current_state": megaplan.STATE_PLANNED, "last_gate": {}, "config": {"robustness": level}}
         next_steps = workflow_next(state)
         assert "critique" in next_steps, f"{level} should offer critique"
@@ -486,10 +494,13 @@ def test_workflow_light_robustness_single_pass(
         make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
     )
     state = load_state(plan_fixture.plan_dir)
+    stored_review = read_json(plan_fixture.plan_dir / "review.json")
 
     assert finalize["state"] == megaplan.STATE_FINALIZED
     assert execute["state"] == megaplan.STATE_DONE
     assert execute["next_step"] is None
+    assert "review.json" in execute["artifacts"]
+    assert stored_review["review_verdict"] == "approved"
     assert recorded_steps == ["plan", "critique", "revise", "finalize", "execute"]
     assert [entry["step"] for entry in state["history"]] == [
         "init",
@@ -4182,10 +4193,13 @@ def test_light_batch_1_on_single_batch_plan_transitions_to_done(
         plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
     )
     state = load_state(plan_fixture.plan_dir)
+    stored_review = read_json(plan_fixture.plan_dir / "review.json")
 
     assert response["state"] == megaplan.STATE_DONE
     assert response["next_step"] is None
     assert state["current_state"] == megaplan.STATE_DONE
+    assert "review.json" in response["artifacts"]
+    assert stored_review["review_verdict"] == "approved"
     assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
     assert (plan_fixture.plan_dir / "execution.json").exists()
 

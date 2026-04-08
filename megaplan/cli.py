@@ -14,6 +14,8 @@ from megaplan.types import (
     KNOWN_AGENTS,
     ROBUSTNESS_LEVELS,
     StepResponse,
+    _SETTABLE_BOOL,
+    _SETTABLE_ENUM,
     _SETTABLE_NUMERIC,
 )
 from megaplan._core import (
@@ -421,13 +423,20 @@ def handle_config(args: argparse.Namespace) -> StepResponse:
         key, value = args.key, args.value
         parts = key.split(".", 1)
         config = load_config()
-        valid_keys = [*(f"agents.{step}" for step in DEFAULT_AGENT_ROUTING), "orchestration.mode", *sorted(_SETTABLE_NUMERIC)]
+        valid_keys = [
+            *(f"agents.{step}" for step in DEFAULT_AGENT_ROUTING),
+            "orchestration.mode",
+            *sorted(_SETTABLE_BOOL),
+            *sorted(_SETTABLE_ENUM),
+            *sorted(_SETTABLE_NUMERIC),
+        ]
         if len(parts) != 2:
             raise CliError(
                 "invalid_args",
                 f"Unknown config key '{key}'. Valid keys: {', '.join(valid_keys)}",
             )
         section, setting = parts
+        normalized_value = value.strip().lower()
         if section == "agents":
             if setting not in DEFAULT_AGENT_ROUTING:
                 raise CliError("invalid_args", f"Unknown step '{setting}'. Valid steps: {', '.join(DEFAULT_AGENT_ROUTING)}")
@@ -438,6 +447,25 @@ def handle_config(args: argparse.Namespace) -> StepResponse:
             if value not in {"inline", "subagent"}:
                 raise CliError("invalid_args", "orchestration.mode must be 'inline' or 'subagent'")
             config.setdefault("orchestration", {})["mode"] = value
+        elif key in _SETTABLE_BOOL:
+            if normalized_value in {"true", "1", "yes", "on"}:
+                parsed_value = True
+            elif normalized_value in {"false", "0", "no", "off"}:
+                parsed_value = False
+            else:
+                raise CliError(
+                    "invalid_args",
+                    f"{key} must be one of: true, false, 1, 0, yes, no, on, off",
+                )
+            config.setdefault(section, {})[setting] = parsed_value
+        elif key in _SETTABLE_ENUM:
+            allowed_values = _SETTABLE_ENUM[key]
+            if value not in allowed_values:
+                raise CliError(
+                    "invalid_args",
+                    f"{key} must be one of: {', '.join(allowed_values)}",
+                )
+            config.setdefault(section, {})[setting] = value
         elif key in _SETTABLE_NUMERIC:
             try:
                 parsed_value = int(value)
@@ -475,8 +503,8 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("--project-dir", required=True)
     init_parser.add_argument("--name")
-    init_parser.add_argument("--auto-approve", action="store_true")
-    init_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default="standard")
+    init_parser.add_argument("--auto-approve", action="store_true", default=None)
+    init_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default=None)
     init_parser.add_argument("--hermes", nargs="?", const="", default=None,
                              help="Use Hermes agent for all phases. Optional: specify default model")
     init_parser.add_argument("--phase-model", action="append", default=[],

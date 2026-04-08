@@ -2,7 +2,28 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from jsonschema import Draft7Validator
+
 from megaplan.schemas import SCHEMAS, strict_schema
+
+
+def _review_disk_schema() -> dict[str, object]:
+    return json.loads((Path(__file__).resolve().parents[1] / ".megaplan" / "schemas" / "review.json").read_text(encoding="utf-8"))
+
+
+def _minimal_review_payload() -> dict[str, object]:
+    return {
+        "review_verdict": "approved",
+        "criteria": [],
+        "issues": [],
+        "rework_items": [],
+        "summary": "Approved.",
+        "task_verdicts": [],
+        "sense_check_verdicts": [],
+    }
 
 
 def test_schema_registry_matches_5_step_workflow() -> None:
@@ -181,6 +202,102 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     assert "actual" in rework_item["properties"]
     assert "evidence_file" in rework_item["properties"]
     assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual", "evidence_file"}
+
+
+def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
+    payload = {
+        "review_verdict": "needs_rework",
+        "criteria": [{"name": "criterion", "priority": "must", "pass": "fail", "evidence": "Missing coverage."}],
+        "issues": ["Coverage review found a blocking issue."],
+        "rework_items": [
+            {
+                "task_id": "REVIEW",
+                "issue": "Coverage gap remains.",
+                "expected": "All issue examples are covered.",
+                "actual": "One issue example remains uncovered.",
+                "evidence_file": "pkg/module.py",
+                "source": "review_coverage",
+            }
+        ],
+        "summary": "Heavy review found a blocking issue.",
+        "task_verdicts": [
+            {
+                "task_id": "T1",
+                "reviewer_verdict": "Needs follow-up.",
+                "evidence_files": ["pkg/module.py"],
+            }
+        ],
+        "sense_check_verdicts": [{"sense_check_id": "SC1", "verdict": "Needs follow-up."}],
+        "checks": [
+            {
+                "id": "coverage",
+                "question": "Does the diff cover the issue?",
+                "findings": [
+                    {
+                        "detail": "Coverage review found one concrete issue example that the diff still does not handle.",
+                        "flagged": True,
+                        "status": "blocking",
+                        "evidence_file": "pkg/module.py",
+                    }
+                ],
+            }
+        ],
+        "pre_check_flags": [
+            {
+                "id": "PRECHECK-SOURCE_TOUCH",
+                "check": "source_touch",
+                "detail": "The diff touches a package source file.",
+                "severity": "minor",
+                "evidence_file": "pkg/module.py",
+            }
+        ],
+        "verified_flag_ids": ["REVIEW-COVERAGE-001"],
+        "disputed_flag_ids": ["REVIEW-PARITY-001"],
+    }
+    disk_schema = _review_disk_schema()
+
+    assert list(Draft7Validator(SCHEMAS["review.json"]).iter_errors(payload)) == []
+    assert list(Draft7Validator(disk_schema).iter_errors(payload)) == []
+
+
+def test_review_schema_accepts_optional_rework_item_flag_id() -> None:
+    payload = _minimal_review_payload()
+    payload["review_verdict"] = "needs_rework"
+    payload["issues"] = ["Critique flag remains unresolved."]
+    payload["rework_items"] = [
+        {
+            "task_id": "REVIEW",
+            "issue": "Critique flag remains unresolved.",
+            "expected": "The final diff addresses the flagged concern directly.",
+            "actual": "The diff leaves the flagged behavior unchanged.",
+            "evidence_file": "megaplan/prompts/review.py",
+            "flag_id": "FLAG-001",
+            "source": "review_flag_reverify",
+        }
+    ]
+    disk_schema = _review_disk_schema()
+
+    assert list(Draft7Validator(SCHEMAS["review.json"]).iter_errors(payload)) == []
+    assert list(Draft7Validator(disk_schema).iter_errors(payload)) == []
+
+
+def test_review_schema_still_accepts_rework_items_without_flag_id() -> None:
+    payload = _minimal_review_payload()
+    payload["review_verdict"] = "needs_rework"
+    payload["issues"] = ["Executor still needs to finish the review follow-up."]
+    payload["rework_items"] = [
+        {
+            "task_id": "REVIEW",
+            "issue": "Executor still needs to finish the review follow-up.",
+            "expected": "All required review follow-up work is complete.",
+            "actual": "One required review follow-up item is still missing.",
+            "evidence_file": "megaplan/handlers.py",
+        }
+    ]
+    disk_schema = _review_disk_schema()
+
+    assert list(Draft7Validator(SCHEMAS["review.json"]).iter_errors(payload)) == []
+    assert list(Draft7Validator(disk_schema).iter_errors(payload)) == []
 
 
 # ---------------------------------------------------------------------------
