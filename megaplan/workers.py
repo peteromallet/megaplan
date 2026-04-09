@@ -142,6 +142,9 @@ _CODEX_ERROR_PATTERNS: list[tuple[str, str, str]] = [
     ("timeout", "worker_timeout", "Codex request timed out"),
     ("connection error", "connection_error", "Codex could not connect to the API"),
     ("connection refused", "connection_error", "Codex could not connect to the API"),
+    ("invalid_json_schema", "schema_error", "Codex request rejected: invalid JSON schema"),
+    ("invalid_request_error", "schema_error", "Codex request rejected: invalid request"),
+    ("400", "schema_error", "Codex API rejected request (HTTP 400)"),
     ("internal server error", "api_error", "Codex API returned an internal error"),
     ("500", "api_error", "Codex API returned an internal error (HTTP 500)"),
     ("502", "api_error", "Codex API returned a gateway error (HTTP 502)"),
@@ -498,6 +501,8 @@ def _default_mock_gate_payload(state: PlanState, plan_dir: Path) -> dict[str, An
         ),
         "warnings": [],
         "settled_decisions": [],
+        "flag_resolutions": [],
+        "accepted_tradeoffs": [],
     }
 
 
@@ -640,6 +645,10 @@ def _default_mock_review_payload(state: PlanState, plan_dir: Path) -> dict[str, 
         criteria.append({"name": name, "priority": priority, "pass": "pass", "evidence": "Mock execution and artifacts satisfy the criterion."})
     return {
         "review_verdict": "approved",
+        "checks": [],
+        "pre_check_flags": [],
+        "verified_flag_ids": [],
+        "disputed_flag_ids": [],
         "criteria": criteria,
         "issues": [],
         "rework_items": [],

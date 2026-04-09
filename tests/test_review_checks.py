@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from megaplan.review_checks import REVIEW_CHECKS, checks_for_robustness, validate_review_checks
+from megaplan.review_checks import REVIEW_CHECKS, checks_for_robustness, get_check_by_id, validate_review_checks
 
 
 def _finding(detail: str, *, flagged: bool) -> dict[str, object]:
@@ -72,3 +72,12 @@ def test_validate_review_checks_rejects_duplicate_ids() -> None:
     }
 
     assert validate_review_checks(payload, expected_ids=("coverage",)) == ["coverage"]
+
+
+def test_coverage_guidance_mentions_verification_test_structural_constraint() -> None:
+    coverage = get_check_by_id("coverage")
+
+    assert coverage is not None
+    guidance = coverage.guidance.lower()
+    assert "verification test" in guidance
+    assert "structural" in guidance

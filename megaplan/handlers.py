@@ -1100,6 +1100,10 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         # Preserve the data-parity invariant even when review is skipped by robustness.
         stub_review = {
             "review_verdict": "approved",
+            "checks": [],
+            "pre_check_flags": [],
+            "verified_flag_ids": [],
+            "disputed_flag_ids": [],
             "criteria": [],
             "issues": [],
             "rework_items": [],
@@ -1214,6 +1218,14 @@ def _resolve_review_outcome(
     return "success", STATE_DONE, None
 
 
+_EXPECTED_BY_CHECK_ID = {
+    "coverage": "Extend the fix so every concrete failing example, symptom, or 'X should Y' statement in the issue is addressed by at least one diff line.",
+    "placement": "Move the fix upstream to where the bad state is first introduced, or extend it to cover any alternate entry points identified in the finding.",
+    "adjacent_calls": "Apply the same fix to each additional call site, sibling class, or downstream consumer identified in the finding.",
+    "simplicity": "Remove unjustified changes, or justify each extra line against a concrete issue requirement.",
+}
+
+
 def _synthesize_review_rework_items(checks: list[dict[str, Any]]) -> list[dict[str, str]]:
     rework_items: list[dict[str, str]] = []
     for check in checks:
@@ -1230,19 +1242,36 @@ def _synthesize_review_rework_items(checks: list[dict[str, Any]]) -> list[dict[s
         for finding in findings:
             if not isinstance(finding, dict) or not finding.get("flagged"):
                 continue
-            if str(finding.get("status", "") or "").strip() != "blocking":
+            status = str(finding.get("status", "") or "").strip().lower()
+            # megaplan/prompts/review.py:243-249 constrains status to {blocking, significant, minor, n/a};
+            # significant is the explicit non-blocking downgrade for gate-settled concerns, while missing or
+            # empty status means the model failed to classify, so we keep the check's default_severity gate as
+            # the blocking fallback. That is the safe default for the sympy-21930 / sphinx-9711 regressions.
+            if status and status != "blocking":
                 continue
             detail = str(finding.get("detail", "") or "").strip()
             evidence_file = finding.get("evidence_file", "")
             if not isinstance(evidence_file, str):
                 evidence_file = ""
             issue = detail or question or f"Heavy review found a blocking {check_id} issue."
+            # Prefer a per-check actionable expected string; fall back to the
+            # check's self-question; ultimately fall back to a generic message.
+            expected = (
+                _EXPECTED_BY_CHECK_ID.get(check_id)
+                or question
+                or f"Review check '{check_id}' should pass without blocking findings."
+            )
+            # `actual` should NOT duplicate `issue` — use a templated
+            # acknowledgment of the finding instead so the executor sees
+            # a clear "you didn't resolve it" signal without a copy of
+            # the detail text.
+            actual = f"The diff did not resolve the flagged {check_id} concern above."
             rework_items.append(
                 {
-                    "task_id": "REVIEW",
+                    "task_id": f"REVIEW-{check_id}",
                     "issue": issue,
-                    "expected": question or f"Review check '{check_id}' should pass without blocking findings.",
-                    "actual": detail or f"Review check '{check_id}' raised a blocking concern.",
+                    "expected": expected,
+                    "actual": actual,
                     "evidence_file": evidence_file,
                     "source": f"review_{check_id}",
                 }

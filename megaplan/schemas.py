@@ -52,7 +52,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "why": {"type": "string"},
                         "functions": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["file_path", "why"],
+                    "required": ["file_path", "why", "functions"],
                 },
             },
             "test_expectations": {
@@ -100,7 +100,14 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "questions": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["plan", "changes_summary", "flags_addressed"],
+        "required": [
+            "plan",
+            "changes_summary",
+            "flags_addressed",
+            "assumptions",
+            "success_criteria",
+            "questions",
+        ],
     },
     "gate.json": {
         "type": "object",
@@ -121,7 +128,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "decision": {"type": "string"},
                         "rationale": {"type": "string"},
                     },
-                    "required": ["id", "decision"],
+                    "required": ["id", "decision", "rationale"],
                 },
             },
             "flag_resolutions": {
@@ -134,7 +141,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "evidence": {"type": "string"},
                         "rationale": {"type": "string"},
                     },
-                    "required": ["flag_id", "action"],
+                    "required": ["flag_id", "action", "evidence", "rationale"],
                 },
             },
             "accepted_tradeoffs": {
@@ -147,11 +154,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "subsystem": {"type": "string"},
                         "rationale": {"type": "string"},
                     },
-                    "required": ["flag_id", "concern"],
+                    "required": ["flag_id", "concern", "subsystem", "rationale"],
                 },
             },
         },
-        "required": ["recommendation", "rationale", "signals_assessment", "warnings", "settled_decisions"],
+        "required": [
+            "recommendation",
+            "rationale",
+            "signals_assessment",
+            "warnings",
+            "settled_decisions",
+            "flag_resolutions",
+            "accepted_tradeoffs",
+        ],
     },
     "critique.json": {
         "type": "object",
@@ -372,7 +387,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                                     "status": {"type": "string"},
                                     "evidence_file": {"type": "string"},
                                 },
-                                "required": ["detail", "flagged"],
+                                "required": ["detail", "flagged", "status", "evidence_file"],
                             },
                         },
                         "prior_findings": {
@@ -388,7 +403,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                             },
                         },
                     },
-                    "required": ["id", "question", "findings"],
+                    "required": ["id", "question", "guidance", "findings", "prior_findings"],
                 },
             },
             "pre_check_flags": {
@@ -402,7 +417,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "severity": {"type": "string"},
                         "evidence_file": {"type": "string"},
                     },
-                    "required": ["id", "check", "detail", "severity"],
+                    "required": ["id", "check", "detail", "severity", "evidence_file"],
                 },
             },
             "verified_flag_ids": {"type": "array", "items": {"type": "string"}},
@@ -462,19 +477,36 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
         },
-        "required": ["review_verdict", "criteria", "issues", "rework_items", "summary", "task_verdicts", "sense_check_verdicts"],
+        "required": [
+            "review_verdict",
+            "checks",
+            "pre_check_flags",
+            "verified_flag_ids",
+            "disputed_flag_ids",
+            "criteria",
+            "issues",
+            "rework_items",
+            "summary",
+            "task_verdicts",
+            "sense_check_verdicts",
+        ],
     },
 }
 
 
-def strict_schema(schema: Any) -> Any:
+def _preserve_explicit_required(path: tuple[str, ...]) -> bool:
+    # `review.rework_items[].flag_id` and `source` intentionally stay optional.
+    return path[-3:] == ("properties", "rework_items", "items")
+
+
+def strict_schema(schema: Any, _path: tuple[str, ...] = ()) -> Any:
     if isinstance(schema, dict):
-        updated = {key: strict_schema(value) for key, value in schema.items()}
+        updated = {key: strict_schema(value, _path + (key,)) for key, value in schema.items()}
         if updated.get("type") == "object":
             updated.setdefault("additionalProperties", False)
-            if "properties" in updated and "required" not in updated:
+            if "properties" in updated and not _preserve_explicit_required(_path):
                 updated["required"] = list(updated["properties"].keys())
         return updated
     if isinstance(schema, list):
-        return [strict_schema(item) for item in schema]
+        return [strict_schema(item, _path) for item in schema]
     return schema

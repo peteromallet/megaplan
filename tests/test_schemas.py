@@ -17,6 +17,10 @@ def _review_disk_schema() -> dict[str, object]:
 def _minimal_review_payload() -> dict[str, object]:
     return {
         "review_verdict": "approved",
+        "checks": [],
+        "pre_check_flags": [],
+        "verified_flag_ids": [],
+        "disputed_flag_ids": [],
         "criteria": [],
         "issues": [],
         "rework_items": [],
@@ -49,6 +53,34 @@ def test_strict_schema_preserves_existing_additional_properties() -> None:
 def test_strict_schema_sets_required_from_properties() -> None:
     result = strict_schema({"type": "object", "properties": {"x": {"type": "string"}, "y": {"type": "number"}}})
     assert set(result["required"]) == {"x", "y"}
+
+
+def test_strict_schema_overwrites_partial_required_arrays_recursively() -> None:
+    schema = {
+        "type": "object",
+        "required": ["stale_root"],
+        "properties": {
+            "inner": {
+                "type": "object",
+                "required": ["stale_inner"],
+                "properties": {"child": {"type": "string"}},
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["stale_item"],
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
+        },
+    }
+
+    result = strict_schema(schema)
+
+    assert result["required"] == ["inner", "items"]
+    assert result["properties"]["inner"]["required"] == ["child"]
+    assert result["properties"]["items"]["items"]["required"] == ["name"]
 
 
 def test_strict_schema_nested_objects_get_additional_properties() -> None:
@@ -207,6 +239,33 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
 def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
     payload = {
         "review_verdict": "needs_rework",
+        "checks": [
+            {
+                "id": "coverage",
+                "question": "Does the diff cover the issue?",
+                "guidance": "Inspect the changed module for missing review follow-up.",
+                "findings": [
+                    {
+                        "detail": "Coverage review found one concrete issue example that the diff still does not handle.",
+                        "flagged": True,
+                        "status": "blocking",
+                        "evidence_file": "pkg/module.py",
+                    }
+                ],
+                "prior_findings": [],
+            }
+        ],
+        "pre_check_flags": [
+            {
+                "id": "PRECHECK-SOURCE_TOUCH",
+                "check": "source_touch",
+                "detail": "The diff touches a package source file.",
+                "severity": "minor",
+                "evidence_file": "pkg/module.py",
+            }
+        ],
+        "verified_flag_ids": ["REVIEW-COVERAGE-001"],
+        "disputed_flag_ids": ["REVIEW-PARITY-001"],
         "criteria": [{"name": "criterion", "priority": "must", "pass": "fail", "evidence": "Missing coverage."}],
         "issues": ["Coverage review found a blocking issue."],
         "rework_items": [
@@ -228,31 +287,6 @@ def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
             }
         ],
         "sense_check_verdicts": [{"sense_check_id": "SC1", "verdict": "Needs follow-up."}],
-        "checks": [
-            {
-                "id": "coverage",
-                "question": "Does the diff cover the issue?",
-                "findings": [
-                    {
-                        "detail": "Coverage review found one concrete issue example that the diff still does not handle.",
-                        "flagged": True,
-                        "status": "blocking",
-                        "evidence_file": "pkg/module.py",
-                    }
-                ],
-            }
-        ],
-        "pre_check_flags": [
-            {
-                "id": "PRECHECK-SOURCE_TOUCH",
-                "check": "source_touch",
-                "detail": "The diff touches a package source file.",
-                "severity": "minor",
-                "evidence_file": "pkg/module.py",
-            }
-        ],
-        "verified_flag_ids": ["REVIEW-COVERAGE-001"],
-        "disputed_flag_ids": ["REVIEW-PARITY-001"],
     }
     disk_schema = _review_disk_schema()
 
@@ -314,6 +348,8 @@ def test_gate_schema_is_strict_and_requires_all_fields() -> None:
         "signals_assessment",
         "warnings",
         "settled_decisions",
+        "flag_resolutions",
+        "accepted_tradeoffs",
     ]
     assert schema["properties"]["recommendation"]["enum"] == ["PROCEED", "ITERATE", "ESCALATE"]
 
@@ -341,7 +377,7 @@ def test_prep_schema_exists_and_has_expected_structure() -> None:
     test_expectation_schema = schema["properties"]["test_expectations"]["items"]
     assert set(evidence_schema["required"]) == {"point", "source", "relevance"}
     assert evidence_schema["properties"]["relevance"]["enum"] == ["high", "medium", "low"]
-    assert set(relevant_code_schema["required"]) == {"file_path", "why"}
+    assert set(relevant_code_schema["required"]) == {"file_path", "why", "functions"}
     assert relevant_code_schema["properties"]["functions"]["items"]["type"] == "string"
     assert set(test_expectation_schema["required"]) == {"test_id", "what_it_checks", "status"}
     assert test_expectation_schema["properties"]["status"]["enum"] == ["fail_to_pass", "pass_to_pass"]
@@ -350,8 +386,51 @@ def test_prep_schema_exists_and_has_expected_structure() -> None:
 def test_gate_schema_includes_settled_decisions_structure() -> None:
     schema = strict_schema(SCHEMAS["gate.json"])
     item_schema = schema["properties"]["settled_decisions"]["items"]
-    assert set(item_schema["required"]) == {"id", "decision"}
+    assert set(item_schema["required"]) == {"id", "decision", "rationale"}
     assert "rationale" in item_schema["properties"]
+
+
+def test_schema_registry_covers_the_six_strict_mode_required_fixes() -> None:
+    revise = SCHEMAS["revise.json"]
+    gate = SCHEMAS["gate.json"]
+    review = SCHEMAS["review.json"]
+    review_check = review["properties"]["checks"]["items"]
+    review_finding = review_check["properties"]["findings"]["items"]
+    pre_check_flag = review["properties"]["pre_check_flags"]["items"]
+
+    assert set(revise["required"]) == {
+        "plan",
+        "changes_summary",
+        "flags_addressed",
+        "assumptions",
+        "success_criteria",
+        "questions",
+    }
+    assert set(gate["required"]) == {
+        "recommendation",
+        "rationale",
+        "signals_assessment",
+        "warnings",
+        "settled_decisions",
+        "flag_resolutions",
+        "accepted_tradeoffs",
+    }
+    assert set(review["required"]) == {
+        "review_verdict",
+        "checks",
+        "pre_check_flags",
+        "verified_flag_ids",
+        "disputed_flag_ids",
+        "criteria",
+        "issues",
+        "rework_items",
+        "summary",
+        "task_verdicts",
+        "sense_check_verdicts",
+    }
+    assert set(review_check["required"]) == {"id", "question", "guidance", "findings", "prior_findings"}
+    assert set(review_finding["required"]) == {"detail", "flagged", "status", "evidence_file"}
+    assert set(pre_check_flag["required"]) == {"id", "check", "detail", "severity", "evidence_file"}
 
 
 def test_strict_schema_new_tracking_objects_are_strict() -> None:

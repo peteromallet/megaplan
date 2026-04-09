@@ -106,6 +106,28 @@ def _load_executed_plan(fixture: PlanFixture) -> tuple[Path, dict[str, object]]:
     return plan_dir, state
 
 
+def _adjacent_calls_review_checks(*, include_status: bool = True, status: str = "blocking") -> list[dict[str, object]]:
+    adjacent_calls = megaplan.review_checks.get_check_by_id("adjacent_calls")
+    assert adjacent_calls is not None
+    finding: dict[str, object] = {
+        "detail": (
+            "Adjacent caller coverage still misses a sibling entry point, so the original bug remains reproducible "
+            "through an alternate path."
+        ),
+        "flagged": True,
+        "evidence_file": "pkg/module.py",
+    }
+    if include_status:
+        finding["status"] = status
+    return [
+        {
+            "id": adjacent_calls.id,
+            "question": adjacent_calls.question,
+            "findings": [finding],
+        }
+    ]
+
+
 def test_handle_review_standard_branch_attaches_prechecks_and_updates_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -221,7 +243,7 @@ def test_handle_review_light_branch_skips_prechecks_and_keeps_payload_byte_ident
     megaplan.handle_review(fixture.root, fixture.make_args(plan=fixture.plan_name))
     stored_review = read_json(fixture.plan_dir / "review.json")
 
-    assert "pre_check_flags" not in stored_review
+    assert stored_review.get("pre_check_flags") == []
     assert update_call_count == 0
     assert (fixture.plan_dir / "review.json").read_bytes() == golden_path.read_bytes()
 
@@ -339,8 +361,110 @@ def test_handle_review_heavy_path_merges_parallel_review_and_creates_review_rewo
     assert stored_review["pre_check_flags"] == pre_check_flags
     assert stored_review["verified_flag_ids"] == ["REVIEW-OLD-001"]
     assert stored_review["disputed_flag_ids"] == ["REVIEW-OLD-002"]
-    assert any(item["task_id"] == "REVIEW" and item["source"] == "review_coverage" for item in stored_review["rework_items"])
+    assert any(item["task_id"] == "REVIEW-coverage" and item["source"] == "review_coverage" for item in stored_review["rework_items"])
     assert any(flag["id"] == "REVIEW-COVERAGE-001" for flag in faults["flags"])
+
+
+def test_rework_item_synthesized_for_flagged_finding_with_empty_status() -> None:
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(status="")
+    )
+
+    assert any(item["source"] == "review_adjacent_calls" for item in rework_items)
+
+
+def test_rework_item_synthesized_for_flagged_finding_with_missing_status_key() -> None:
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(include_status=False)
+    )
+
+    assert any(item["source"] == "review_adjacent_calls" for item in rework_items)
+
+
+def test_rework_item_not_synthesized_for_significant_status() -> None:
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(status="significant")
+    )
+
+    assert rework_items == []
+
+
+def test_rework_item_not_synthesized_for_minor_status() -> None:
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(status="minor")
+    )
+
+    assert rework_items == []
+
+
+def test_rework_item_actual_does_not_duplicate_issue() -> None:
+    """The rework item's `actual` field must not be a copy of `issue`.
+
+    Historically both fields were populated from the finding's `detail`,
+    which duplicated the sentence in the executor's rework prompt. The
+    polish pass replaces `actual` with a templated acknowledgment.
+    """
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(status="blocking")
+    )
+    assert rework_items, "Expected at least one rework item for a blocking finding"
+    for item in rework_items:
+        assert item["issue"] != item["actual"], (
+            f"issue and actual must differ, got both={item['issue']!r}"
+        )
+        assert "did not resolve" in item["actual"]
+
+
+def test_rework_item_expected_is_actionable_per_check() -> None:
+    """`expected` should be a per-check actionable directive, not the check's self-question.
+
+    Exercises each of the 4 review checks by synthesizing a flagged finding
+    via the helper and asserting `expected` carries the per-check template
+    from `_EXPECTED_BY_CHECK_ID`.
+    """
+    per_check_markers = {
+        "coverage": "every concrete failing example",
+        "placement": "upstream",
+        "adjacent_calls": "additional call site",
+        "simplicity": "unjustified",
+    }
+    for check_id, marker in per_check_markers.items():
+        checks = [
+            {
+                "id": check_id,
+                "question": "Generic placeholder question for the test.",
+                "findings": [
+                    {
+                        "flagged": True,
+                        "status": "blocking",
+                        "detail": f"A real concern from {check_id} that must be surfaced to the executor.",
+                    }
+                ],
+            }
+        ]
+        rework_items = megaplan.handlers._synthesize_review_rework_items(checks)
+        assert rework_items, f"Expected rework item for check {check_id}"
+        expected = rework_items[0]["expected"]
+        assert marker in expected, (
+            f"Expected per-check marker {marker!r} for {check_id}, got {expected!r}"
+        )
+        assert "Generic placeholder question" not in expected, (
+            f"Expected should not fall back to the check question when a template exists, got {expected!r}"
+        )
+
+
+def test_rework_item_task_id_is_scoped_by_check_id() -> None:
+    """`task_id` should be `REVIEW-<check_id>`, not the bare `REVIEW` sentinel."""
+    rework_items = megaplan.handlers._synthesize_review_rework_items(
+        _adjacent_calls_review_checks(status="blocking")
+    )
+    assert rework_items
+    for item in rework_items:
+        assert item["task_id"] == "REVIEW-adjacent_calls", (
+            f"Expected REVIEW-adjacent_calls, got {item['task_id']!r}"
+        )
+        # Lock down the regression — the plain sentinel must not return.
+        assert item["task_id"] != "REVIEW"
 
 
 def test_handle_review_heavy_iteration_two_marks_verified_review_flags(

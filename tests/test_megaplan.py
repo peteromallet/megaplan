@@ -1859,6 +1859,33 @@ def test_strict_schema_sets_required_from_properties() -> None:
     assert result["required"] == ["x", "y"]
 
 
+def test_strict_schema_overwrites_partial_required_arrays_recursively() -> None:
+    from megaplan.schemas import strict_schema
+    schema = {
+        "type": "object",
+        "required": ["stale_root"],
+        "properties": {
+            "inner": {
+                "type": "object",
+                "required": ["stale_inner"],
+                "properties": {"child": {"type": "string"}},
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["stale_item"],
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
+        },
+    }
+    result = strict_schema(schema)
+    assert result["required"] == ["inner", "items"]
+    assert result["properties"]["inner"]["required"] == ["child"]
+    assert result["properties"]["items"]["items"]["required"] == ["name"]
+
+
 def test_strict_schema_nested_objects() -> None:
     from megaplan.schemas import strict_schema
     schema = {
@@ -1872,6 +1899,7 @@ def test_strict_schema_nested_objects() -> None:
     }
     result = strict_schema(schema)
     assert result["properties"]["inner"]["additionalProperties"] is False
+    assert result["properties"]["inner"]["required"] == ["a"]
 
 
 def test_strict_schema_array_items() -> None:
@@ -1890,6 +1918,7 @@ def test_strict_schema_array_items() -> None:
     }
     result = strict_schema(schema)
     assert result["properties"]["items"]["items"]["additionalProperties"] is False
+    assert result["properties"]["items"]["items"]["required"] == ["name"]
 
 
 def test_strict_schema_non_object_untouched() -> None:
@@ -1897,6 +1926,7 @@ def test_strict_schema_non_object_untouched() -> None:
     assert strict_schema({"type": "string"}) == {"type": "string"}
     assert strict_schema(42) == 42
     assert strict_schema("hello") == "hello"
+    assert strict_schema([1, 2]) == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -2348,7 +2378,7 @@ def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
 
 
 def test_validate_merge_inputs_filters_malformed_entries() -> None:
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {
                 "task_id": "T1",
@@ -2366,7 +2396,7 @@ def test_validate_merge_inputs_filters_malformed_entries() -> None:
         array_fields=("files_changed", "commands_run"),
         label="task_updates",
     )
-    empty = megaplan.handlers._validate_merge_inputs(
+    empty = megaplan.merge._validate_merge_inputs(
         [],
         required_fields=("task_id", "reviewer_verdict"),
         label="task_verdicts",
@@ -2386,7 +2416,7 @@ def test_validate_merge_inputs_filters_malformed_entries() -> None:
 
 def test_validate_merge_inputs_rejects_empty_required_content() -> None:
     deviations: list[str] = []
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {"task_id": "T1", "status": "done", "executor_notes": "  "},
             {"task_id": "T2", "status": "done", "executor_notes": "\t"},
@@ -2408,7 +2438,7 @@ def test_validate_merge_inputs_rejects_empty_required_content() -> None:
 
 def test_validate_merge_inputs_accepts_array_fields() -> None:
     deviations: list[str] = []
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {
                 "task_id": "T1",
@@ -2449,7 +2479,7 @@ def test_validate_merge_inputs_accepts_array_fields() -> None:
 
 def test_validate_merge_inputs_rejects_empty_reviewer_verdict() -> None:
     deviations: list[str] = []
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {"task_id": "T1", "reviewer_verdict": ""},
             {"task_id": "T2", "reviewer_verdict": "   "},
@@ -2470,7 +2500,7 @@ def test_validate_merge_inputs_rejects_empty_reviewer_verdict() -> None:
 
 def test_validate_merge_inputs_rejects_empty_sense_check_verdict() -> None:
     deviations: list[str] = []
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {"sense_check_id": "SC1", "verdict": ""},
             {"sense_check_id": "SC2", "verdict": "Confirmed."},
@@ -2490,7 +2520,7 @@ def test_validate_merge_inputs_rejects_empty_sense_check_verdict() -> None:
 def test_duplicate_sense_check_verdict_dedup() -> None:
     """Two verdicts for SC1, zero for SC2 — should count 1 unique, not 2."""
     deviations: list[str] = []
-    valid = megaplan.handlers._validate_merge_inputs(
+    valid = megaplan.merge._validate_merge_inputs(
         [
             {"sense_check_id": "SC1", "verdict": "First pass."},
             {"sense_check_id": "SC1", "verdict": "Second pass."},
@@ -2770,7 +2800,7 @@ def test_review_flags_incomplete_verdicts(plan_fixture: PlanFixture) -> None:
 def test_validate_merge_inputs_tracks_deviations() -> None:
     """Verify that _validate_merge_inputs populates the deviations list for malformed input."""
     deviations: list[str] = []
-    megaplan.handlers._validate_merge_inputs(
+    megaplan.merge._validate_merge_inputs(
         [
             "not-a-dict",
             {"task_id": "T1"},  # missing required fields
@@ -2789,12 +2819,12 @@ def test_validate_merge_inputs_tracks_deviations() -> None:
 
 def test_validate_merge_inputs_non_list_returns_empty() -> None:
     """Non-list input returns empty with no crash."""
-    assert megaplan.handlers._validate_merge_inputs(
+    assert megaplan.merge._validate_merge_inputs(
         "not-a-list",
         required_fields=("task_id",),
         label="test",
     ) == []
-    assert megaplan.handlers._validate_merge_inputs(
+    assert megaplan.merge._validate_merge_inputs(
         None,
         required_fields=("task_id",),
         label="test",

@@ -65,7 +65,17 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                 "suggested_approach": "Use the brief as primary context.",
             },
         ),
-        ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
+        (
+            "revise",
+            {
+                "plan": "x",
+                "changes_summary": "y",
+                "flags_addressed": [],
+                "assumptions": [],
+                "success_criteria": [],
+                "questions": [],
+            },
+        ),
         (
             "gate",
             {
@@ -74,6 +84,8 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                 "signals_assessment": "ok",
                 "warnings": [],
                 "settled_decisions": [],
+                "flag_resolutions": [],
+                "accepted_tradeoffs": [],
             },
         ),
         (
@@ -136,6 +148,10 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
             "review",
             {
                 "review_verdict": "approved",
+                "checks": [],
+                "pre_check_flags": [],
+                "verified_flag_ids": [],
+                "disputed_flag_ids": [],
                 "criteria": [],
                 "issues": [],
                 "rework_items": [],
@@ -158,7 +174,17 @@ def test_validate_payload_accepts_current_worker_steps(step: str, payload: dict[
 
 def test_validate_payload_rejects_missing_gate_key() -> None:
     with pytest.raises(CliError, match="signals_assessment"):
-        validate_payload("gate", {"recommendation": "PROCEED", "rationale": "x", "warnings": []})
+        validate_payload(
+            "gate",
+            {
+                "recommendation": "PROCEED",
+                "rationale": "x",
+                "warnings": [],
+                "settled_decisions": [],
+                "flag_resolutions": [],
+                "accepted_tradeoffs": [],
+            },
+        )
 
 
 def test_session_key_for_matches_new_roles() -> None:
@@ -397,6 +423,9 @@ def test_mock_revise_returns_valid_payload(tmp_path: Path) -> None:
     assert "plan" in result.payload
     assert "changes_summary" in result.payload
     assert "flags_addressed" in result.payload
+    assert "assumptions" in result.payload
+    assert "success_criteria" in result.payload
+    assert "questions" in result.payload
     assert validate_plan_structure(result.payload["plan"]) == []
 
 
@@ -410,6 +439,8 @@ def test_mock_gate_returns_valid_payload(tmp_path: Path) -> None:
     assert "signals_assessment" in result.payload
     assert "warnings" in result.payload
     assert "settled_decisions" in result.payload
+    assert "flag_resolutions" in result.payload
+    assert "accepted_tradeoffs" in result.payload
 
 
 def test_mock_finalize_returns_valid_payload(tmp_path: Path) -> None:
@@ -450,6 +481,10 @@ def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
     plan_dir, state = _mock_state(tmp_path)
     result = mock_worker_output("review", state, plan_dir)
     assert result.payload["review_verdict"] == "approved"
+    assert "checks" in result.payload
+    assert "pre_check_flags" in result.payload
+    assert "verified_flag_ids" in result.payload
+    assert "disputed_flag_ids" in result.payload
     assert "criteria" in result.payload
     assert "issues" in result.payload
     assert "rework_items" in result.payload
@@ -592,7 +627,21 @@ def test_validate_payload_execute_requires_output() -> None:
 
 def test_validate_payload_review_requires_criteria() -> None:
     with pytest.raises(CliError, match="criteria"):
-        validate_payload("review", {"issues": []})
+        validate_payload(
+            "review",
+            {
+                "review_verdict": "approved",
+                "checks": [],
+                "pre_check_flags": [],
+                "verified_flag_ids": [],
+                "disputed_flag_ids": [],
+                "issues": [],
+                "rework_items": [],
+                "summary": "ok",
+                "task_verdicts": [],
+                "sense_check_verdicts": [],
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

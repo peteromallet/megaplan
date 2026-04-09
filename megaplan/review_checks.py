@@ -25,12 +25,15 @@ REVIEW_CHECKS: Final[tuple[ReviewCheckSpec, ...]] = (
         id="coverage",
         question="Does the diff cover every concrete failing example, symptom, or 'X should Y' statement in the original issue?",
         guidance=(
-            "Enumerate every concrete failing example, symptom, or behavioral requirement in the issue. "
-            "For each one, point to the specific diff line that addresses it and flag anything still uncovered. "
-            "Also watch for these patterns: "
-            "(a) Opt-in vs default — if the issue asks for a new default behavior but the diff adds a config flag, flag it. "
-            "(b) Accepted-change violations — if the issue explicitly accepts a behavior change ('known breaking change', 'I'll document this', 'this is acceptable'), flag any code in the diff that preserves the old behavior anyway. "
-            "(c) Secondary sentences — the issue may state additional expectations beyond the headline symptom in throwaway phrases ('also,', 'I believe', 'the help message'). Treat each as a requirement and verify the diff addresses it."
+            "List each concrete failing example, symptom, or behavioral requirement in the issue. "
+            "For each one, cite the diff line that addresses it and flag anything still uncovered. "
+            "Also watch for: "
+            "(a) Opt-in vs default: if the issue wants new default behavior but the diff adds a flag, flag it. "
+            "(b) Accepted-change violations: if the issue accepts a behavior change, flag code that preserves the old behavior anyway. "
+            "(c) Secondary sentences: treat extra expectations in side phrases as real requirements. "
+            "Do NOT flag a verification test referenced by the plan that doesn't exist in the repo as a coverage gap. "
+            "Test files are a task-level no-modify structural constraint already accepted by the gate; if it still matters, downgrade to status: significant. "
+            "Focus blocking coverage findings on source changes that miss concrete issue symptoms."
         ),
         category="completeness",
         default_severity="likely-significant",
