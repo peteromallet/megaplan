@@ -42,7 +42,7 @@ Get an OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys). Any m
 plan → critique → gate → [revise → critique → gate]* → finalize → execute → review
 ```
 
-Each phase can use a different model. The critique phase uses an independent model to review the plan and raise flags. The gate decides whether to proceed or iterate. This prevents models from rubber-stamping their own work. Heavy robustness adds a prep phase before planning to gather codebase context.
+Each phase can use a different model. The critique phase uses an independent model to review the plan and raise flags. The gate decides whether to proceed or iterate. This prevents models from rubber-stamping their own work. Planning now goes through a visible `prep` phase so repository investigation is observable instead of hidden inside `plan`.
 
 ## Running manually
 
@@ -81,17 +81,19 @@ GEMINI_API_KEY=...         # for google: prefix
 
 ## Robustness levels
 
-- **light** — no structured critique, fast
-- **standard** — 4 critique checks (default)
-- **heavy** — 8 critique checks + prep phase
+- **light** — visible `prep` + one critique/revise pass, no gate or review
+- **standard** — visible `prep` + 4 critique checks (default)
+- **heavy** — visible `prep` + 8 critique checks
 
 ## Observability
 
 ```bash
+megaplan status --plan <name>
 megaplan watch --plan <name>
 ```
 
-Shows current state, last completed phase, pending notes, and execution progress.
+`status` exposes additive lifecycle fields such as `active_step`, `last_step`, notes, cost, and session summaries.
+`watch` adds the current execution-progress snapshot in the same machine-readable response.
 
 ## Subagent mode (Claude Code)
 

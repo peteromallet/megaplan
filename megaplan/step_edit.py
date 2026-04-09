@@ -11,7 +11,7 @@ from megaplan._core import (
     infer_next_steps,
     latest_plan_meta_path,
     latest_plan_path,
-    load_plan,
+    load_plan_locked,
     make_history_entry,
     now_utc,
     read_json,
@@ -272,9 +272,9 @@ _STEP_ACTIONS = {
 
 
 def handle_step(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "step", STEP_EDIT_ALLOWED_STATES)
-    handler = _STEP_ACTIONS.get(args.step_action)
-    if handler is None:
-        raise CliError("invalid_args", f"Unknown step action: {args.step_action}")
-    return handler(plan_dir, state, args)
+    with load_plan_locked(root, args.plan, step=f"step {args.step_action}") as (plan_dir, state):
+        require_state(state, "step", STEP_EDIT_ALLOWED_STATES)
+        handler = _STEP_ACTIONS.get(args.step_action)
+        if handler is None:
+            raise CliError("invalid_args", f"Unknown step action: {args.step_action}")
+        return handler(plan_dir, state, args)

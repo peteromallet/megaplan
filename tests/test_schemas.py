@@ -55,7 +55,7 @@ def test_strict_schema_sets_required_from_properties() -> None:
     assert set(result["required"]) == {"x", "y"}
 
 
-def test_strict_schema_overwrites_partial_required_arrays_recursively() -> None:
+def test_strict_schema_normalizes_partial_required_arrays_recursively() -> None:
     schema = {
         "type": "object",
         "required": ["stale_root"],
@@ -233,7 +233,11 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     assert "expected" in rework_item["properties"]
     assert "actual" in rework_item["properties"]
     assert "evidence_file" in rework_item["properties"]
-    assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual", "evidence_file"}
+    assert "flag_id" in rework_item["properties"]
+    assert "source" in rework_item["properties"]
+    assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual", "evidence_file", "flag_id", "source"}
+    assert rework_item["properties"]["flag_id"]["type"] == ["string", "null"]
+    assert rework_item["properties"]["source"]["type"] == ["string", "null"]
 
 
 def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
@@ -275,6 +279,7 @@ def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
                 "expected": "All issue examples are covered.",
                 "actual": "One issue example remains uncovered.",
                 "evidence_file": "pkg/module.py",
+                "flag_id": None,
                 "source": "review_coverage",
             }
         ],
@@ -326,6 +331,8 @@ def test_review_schema_still_accepts_rework_items_without_flag_id() -> None:
             "expected": "All required review follow-up work is complete.",
             "actual": "One required review follow-up item is still missing.",
             "evidence_file": "megaplan/handlers.py",
+            "flag_id": None,
+            "source": None,
         }
     ]
     disk_schema = _review_disk_schema()
@@ -339,7 +346,7 @@ def test_review_schema_still_accepts_rework_items_without_flag_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate_schema_is_strict_and_requires_all_fields() -> None:
+def test_gate_schema_is_strict_and_requires_core_fields() -> None:
     schema = strict_schema(SCHEMAS["gate.json"])
     assert schema["additionalProperties"] is False
     assert schema["required"] == [
@@ -387,6 +394,17 @@ def test_gate_schema_includes_settled_decisions_structure() -> None:
     schema = strict_schema(SCHEMAS["gate.json"])
     item_schema = schema["properties"]["settled_decisions"]["items"]
     assert set(item_schema["required"]) == {"id", "decision", "rationale"}
+    assert "rationale" in item_schema["properties"]
+
+
+def test_gate_schema_flag_resolutions_stay_codex_compatible() -> None:
+    schema = strict_schema(SCHEMAS["gate.json"])
+    item_schema = schema["properties"]["flag_resolutions"]["items"]
+
+    assert set(item_schema["required"]) == {"flag_id", "action", "evidence", "rationale"}
+    assert "oneOf" not in item_schema
+    assert set(item_schema["properties"]["action"]["enum"]) == {"dispute", "accept_tradeoff"}
+    assert "evidence" in item_schema["properties"]
     assert "rationale" in item_schema["properties"]
 
 

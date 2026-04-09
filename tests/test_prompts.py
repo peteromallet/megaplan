@@ -362,10 +362,33 @@ def _baseline_codex_review_prompt_snapshot(state: PlanState, plan_dir: Path) -> 
           - `expected`: what correct behavior looks like
           - `actual`: what was observed
           - `evidence_file` (optional): file path supporting the finding
+          - `flag_id`: critique/review flag ID when applicable, otherwise `null`
+          - `source`: short machine-readable source tag when applicable, otherwise `null`
         - `issues` must still be populated as a flat one-line-per-item summary derived from `rework_items` (for backward compatibility). When approved, both `issues` and `rework_items` should be empty arrays.
         - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; make `issues`, `rework_items`, `summary`, and task verdicts specific enough for the executor to act on directly.
         """
     ).strip()
+
+
+def test_codex_plan_prompt_includes_nested_harness_guard(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+
+    prompt = create_codex_prompt("plan", state, plan_dir)
+
+    assert "already running inside the megaplan harness" in prompt
+    assert "Do NOT invoke the `megaplan` CLI" in prompt
+    assert "`megaplan` skill" in prompt
+    assert "Avoid `.megaplan/`, prior plan artifacts" in prompt
+    assert "Stay focused on the requested idea" in prompt
+
+
+def test_claude_prep_prompt_includes_nested_harness_guard(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+
+    prompt = create_claude_prompt("prep", state, plan_dir, root=tmp_path)
+
+    assert "already running inside the megaplan harness" in prompt
+    assert "Do NOT invoke the `megaplan` CLI" in prompt
 
 
 def _write_debt_registry(tmp_path: Path, entries: list[dict[str, object]]) -> None:

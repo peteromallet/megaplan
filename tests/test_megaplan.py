@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import time
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +21,15 @@ import megaplan._core
 import megaplan._core.io as io_module
 import megaplan.workers
 from megaplan.evaluation import PLAN_STRUCTURE_REQUIRED_STEP_ISSUE, validate_plan_structure
-from megaplan._core import WORKFLOW, _ROBUSTNESS_OVERRIDES, ensure_runtime_layout, load_plan, workflow_next
+from megaplan._core import (
+    WORKFLOW,
+    _ROBUSTNESS_OVERRIDES,
+    clear_active_step,
+    ensure_runtime_layout,
+    load_plan,
+    set_active_step,
+    workflow_next,
+)
 from megaplan.prompts import create_claude_prompt
 from megaplan.types import STATE_PREPPED
 from megaplan.workers import WorkerResult, _build_mock_payload
@@ -166,13 +177,13 @@ def test_init_response_points_to_next_step_by_robustness(tmp_path: Path, monkeyp
     standard = megaplan.handle_init(root, make_args(name="standard-plan", robustness="standard"))
     light = megaplan.handle_init(root, make_args(name="light-plan", robustness="light"))
     heavy = megaplan.handle_init(root, make_args(name="heavy-plan", robustness="heavy"))
-    assert standard["next_step"] == "plan"
-    assert light["next_step"] == "plan"
+    assert standard["next_step"] == "prep"
+    assert light["next_step"] == "prep"
     assert heavy["next_step"] == "prep"
 
 
 _LEGACY_STATE_MACHINE_CASES = [
-    ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, ["plan"]),
+    ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, ["prep"]),
     ({"current_state": STATE_PREPPED, "last_gate": {}}, ["plan"]),
     ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, ["critique", "plan", "step"]),
     ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, ["gate", "step"]),
@@ -245,7 +256,8 @@ def test_workflow_definition_is_complete_for_standard_flow() -> None:
 
 def test_workflow_walk_matches_documented_standard_flow() -> None:
     walk = [
-        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, "plan"),
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, "prep"),
+        ({"current_state": STATE_PREPPED, "last_gate": {}}, "plan"),
         ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, "critique"),
         ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, "gate"),
         (
@@ -271,6 +283,7 @@ def test_workflow_walk_matches_documented_standard_flow() -> None:
         actual_steps.append(expected_step)
 
     assert actual_steps == [
+        "prep",
         "plan",
         "critique",
         "gate",
@@ -330,7 +343,8 @@ def test_workflow_walk_matches_documented_robust_flow() -> None:
 def test_workflow_walk_matches_documented_light_flow() -> None:
     light_config = {"config": {"robustness": "light"}}
     walk = [
-        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **light_config}, "plan"),
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **light_config}, "prep"),
+        ({"current_state": STATE_PREPPED, "last_gate": {}, **light_config}, "plan"),
         ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}, **light_config}, "critique"),
         ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, **light_config}, "revise"),
         ({"current_state": megaplan.STATE_GATED, "last_gate": {}, **light_config}, "finalize"),
@@ -343,7 +357,7 @@ def test_workflow_walk_matches_documented_light_flow() -> None:
         actual_steps.append(expected_step)
 
     assert workflow_next({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, **light_config}) == []
-    assert actual_steps == ["plan", "critique", "revise", "finalize", "execute"]
+    assert actual_steps == ["prep", "plan", "critique", "revise", "finalize", "execute"]
 
 
 def test_all_robustness_levels_route_planned_to_critique() -> None:
@@ -353,6 +367,139 @@ def test_all_robustness_levels_route_planned_to_critique() -> None:
         next_steps = workflow_next(state)
         assert "critique" in next_steps, f"{level} should offer critique"
         assert "research" not in next_steps, f"{level} should not offer research"
+
+
+def test_handle_plan_sets_and_clears_active_step(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run_step_with_worker(step: str, state: dict, plan_dir: Path, args: Namespace, **kwargs: object):
+        del state, args, kwargs
+        persisted = read_json(plan_dir / "state.json")
+        observed.update(persisted["active_step"])
+        return (
+            WorkerResult(
+                payload=_build_mock_payload(step, load_state(plan_dir), plan_dir),
+                raw_output="{}",
+                duration_ms=1,
+                cost_usd=0.0,
+                session_id="session-1",
+            ),
+            "codex",
+            "persistent",
+            False,
+        )
+
+    monkeypatch.setattr(megaplan.handlers.worker_module, "run_step_with_worker", fake_run_step_with_worker)
+
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    assert observed["step"] == "plan"
+    assert "started_at" in observed
+    assert "active_step" not in state
+
+
+def test_handle_plan_failure_clears_active_step(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run_step_with_worker(step: str, state: dict, plan_dir: Path, args: Namespace, **kwargs: object):
+        del step, state, args, kwargs
+        persisted = read_json(plan_dir / "state.json")
+        observed.update(persisted["active_step"])
+        raise megaplan.CliError("worker_error", "boom", extra={"raw_output": "boom"})
+
+    monkeypatch.setattr(megaplan.handlers.worker_module, "run_step_with_worker", fake_run_step_with_worker)
+
+    with pytest.raises(megaplan.CliError, match="boom"):
+        megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    assert observed["step"] == "plan"
+    assert "active_step" not in state
+
+
+def test_clear_active_step_ignores_mismatched_run_id() -> None:
+    state = {"sessions": {}}
+    first_run_id = set_active_step(state, step="plan", agent="codex", mode="persistent")
+    second_run_id = set_active_step(state, step="critique", agent="claude", mode="persistent")
+
+    clear_active_step(state, run_id=first_run_id)
+
+    assert state["active_step"]["step"] == "critique"
+    assert state["active_step"]["run_id"] == second_run_id
+
+
+def test_tiny_critique_stub_does_not_leak_active_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="tiny")
+    megaplan.handle_plan(fixture.root, fixture.make_args(plan=fixture.plan_name))
+
+    response = megaplan.handle_critique(fixture.root, fixture.make_args(plan=fixture.plan_name))
+    state = load_state(fixture.plan_dir)
+
+    assert response["state"] == megaplan.STATE_GATED
+    assert "active_step" not in state
+
+
+def test_handle_status_reports_observability_fields(plan_fixture: PlanFixture) -> None:
+    state = load_state(plan_fixture.plan_dir)
+    state["meta"]["notes"] = [{"timestamp": "2026-04-09T00:00:00Z", "note": "Newest note."}]
+    state["active_step"] = {
+        "step": "critique",
+        "agent": "claude",
+        "mode": "persistent",
+        "started_at": "2026-04-09T00:00:00Z",
+        "session_id": "critique-session",
+    }
+    state["sessions"] = {
+        "claude_critic": {
+            "id": "critique-session",
+            "mode": "persistent",
+            "created_at": "2026-04-09T00:00:00Z",
+            "last_used_at": "2026-04-09T00:05:00Z",
+            "refreshed": False,
+        }
+    }
+    state["history"].append(
+        {
+            "step": "plan",
+            "timestamp": "2026-04-09T00:01:00Z",
+            "duration_ms": 1,
+            "cost_usd": 0.0,
+            "result": "success",
+            "output_file": "plan_v1.md",
+        }
+    )
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["notes_count"] == 1
+    assert response["notes"][0]["note"] == "Newest note."
+    assert response["last_step"]["step"] == "plan"
+    assert response["active_step"]["step"] == "critique"
+    assert response["active_step"]["session_id"] == "critique-session"
+    assert "stale" in response["active_step"]
+    assert response["session_summaries"][0]["key"] == "claude_critic"
+
+
+def test_handle_watch_combines_status_and_progress(plan_fixture: PlanFixture) -> None:
+    _drive_to_finalized(plan_fixture)
+
+    response = megaplan.cli.handle_watch(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["step"] == "watch"
+    assert response["progress"]["tasks_total"] == response["tasks_total"]
+    assert response["progress"]["tasks_pending"] == response["tasks_pending"]
+    assert "Execution progress:" in response["summary"]
 
 
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
@@ -933,6 +1080,8 @@ def test_gate_proceed_with_accepted_tradeoffs_creates_debt(
             "rationale": "Known tradeoff accepted.",
             "signals_assessment": "Proceeding with one accepted limitation.",
             "warnings": [],
+            "settled_decisions": [],
+            "flag_resolutions": [],
             "accepted_tradeoffs": [
                 {
                     "flag_id": flag["id"],
@@ -973,6 +1122,8 @@ def test_gate_iterate_with_empty_accepted_tradeoffs_creates_no_debt(
             "rationale": "Still needs plan work.",
             "signals_assessment": "Revisions are still needed.",
             "warnings": [],
+            "settled_decisions": [],
+            "flag_resolutions": [],
             "accepted_tradeoffs": [],
         },
         raw_output="{}",
@@ -1005,6 +1156,9 @@ def test_gate_proceed_without_accepted_tradeoffs_registers_fallback_debt(
             "rationale": "Proceed despite the remaining planning-level debt.",
             "signals_assessment": "Proceeding with unresolved flags recorded as debt.",
             "warnings": [],
+            "settled_decisions": [],
+            "flag_resolutions": [],
+            "accepted_tradeoffs": [],
         },
         raw_output="{}",
         duration_ms=1,
@@ -1187,6 +1341,61 @@ def test_step_preserves_meta(plan_fixture: PlanFixture) -> None:
     assert new_meta["assumptions"] == ["The existing plan file is valid."]
 
 
+def test_step_edit_rejects_concurrent_plan_lock(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    ready_path = plan_fixture.root / "step-lock.ready"
+    script = """
+import fcntl
+import sys
+import time
+from pathlib import Path
+
+plan_dir = Path(sys.argv[1])
+ready_path = Path(sys.argv[2])
+lock_path = plan_dir / ".plan.lock"
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+handle = lock_path.open("a+", encoding="utf-8")
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+ready_path.write_text("ready", encoding="utf-8")
+time.sleep(30)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(plan_fixture.plan_dir), str(ready_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=1)
+                pytest.fail(f"lock helper exited early: stdout={stdout!r} stderr={stderr!r}")
+            if time.monotonic() >= deadline:
+                pytest.fail("lock helper did not acquire the plan lock in time")
+            time.sleep(0.05)
+
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.handle_step(
+                plan_fixture.root,
+                plan_fixture.make_args(
+                    plan=plan_fixture.plan_name,
+                    step_action="add",
+                    after="S1",
+                    description="Blocked by lock",
+                ),
+            )
+
+        assert exc_info.value.code == "plan_locked"
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_gate_retry_does_not_duplicate_weighted_scores(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
@@ -1200,6 +1409,9 @@ def test_gate_retry_does_not_duplicate_weighted_scores(plan_fixture: PlanFixture
                         "rationale": "stuck",
                         "signals_assessment": "scores are flat",
                         "warnings": [],
+                        "settled_decisions": [],
+                        "flag_resolutions": [],
+                        "accepted_tradeoffs": [],
                     },
                     raw_output="{}",
                     duration_ms=1,
@@ -1217,6 +1429,9 @@ def test_gate_retry_does_not_duplicate_weighted_scores(plan_fixture: PlanFixture
                         "rationale": "user note clarified the issue",
                         "signals_assessment": "same score, but judgment changed",
                         "warnings": [],
+                        "settled_decisions": [],
+                        "flag_resolutions": [],
+                        "accepted_tradeoffs": [],
                     },
                     raw_output="{}",
                     duration_ms=1,

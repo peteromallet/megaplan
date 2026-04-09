@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -60,6 +61,9 @@ from megaplan.loop.handlers import (
 from megaplan.step_edit import handle_step
 
 
+_ACTIVE_STEP_STALE_SECONDS = 300
+
+
 
 def render_response(response: StepResponse, *, exit_code: int = 0) -> int:
     print(json_dump(response), end="")
@@ -79,41 +83,19 @@ def error_response(error: CliError) -> int:
     return render_response(payload, exit_code=error.exit_code)
 
 
-def handle_status(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    next_steps = infer_next_steps(state)
-    return {
-        "success": True,
-        "step": "status",
-        "plan": state["name"],
-        "state": state["current_state"],
-        "iteration": state["iteration"],
-        "summary": f"Plan '{state['name']}' is currently in state '{state['current_state']}'.",
-        "next_step": next_steps[0] if next_steps else None,
-        "valid_next": next_steps,
-        "artifacts": sorted(path.name for path in plan_dir.iterdir() if path.is_file()),
-    }
+def _parse_utc_timestamp(timestamp: str | None) -> datetime | None:
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-def handle_audit(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    return {
-        "success": True,
-        "step": "audit",
-        "plan": state["name"],
-        "plan_dir": str(plan_dir),
-        "state": state,
-    }
-
-
-def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
+def _build_progress_payload(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     finalize_path = plan_dir / "finalize.json"
     if not finalize_path.exists():
         return {
-            "success": True,
-            "step": "progress",
-            "plan": state["name"],
             "summary": "No finalize.json yet — plan has not been finalized.",
             "tasks_total": 0,
             "tasks_done": 0,
@@ -134,7 +116,6 @@ def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
     tasks_skipped = sum(1 for t in tasks if t.get("status") == "skipped")
     tasks_pending = sum(1 for t in tasks if t.get("status") == "pending")
     tasks_total = len(tasks)
-    # A batch is complete when ALL its task IDs have status done or skipped.
     completed_ids = {
         t["id"] for t in tasks if t.get("status") in {"done", "skipped"} and isinstance(t.get("id"), str)
     }
@@ -152,9 +133,6 @@ def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
         for t in tasks
     ]
     return {
-        "success": True,
-        "step": "progress",
-        "plan": state["name"],
         "summary": (
             f"Execution progress: {tasks_done + tasks_skipped}/{tasks_total} tasks tracked, "
             f"{batches_completed}/{len(global_batches)} batches completed. "
@@ -167,6 +145,109 @@ def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
         "batches_total": len(global_batches),
         "batches_completed": batches_completed,
         "tasks": task_status_list,
+    }
+
+
+def _build_last_step(state: dict[str, Any]) -> dict[str, Any] | None:
+    history = state.get("history", [])
+    if not isinstance(history, list) or not history:
+        return None
+    last = history[-1]
+    if not isinstance(last, dict):
+        return None
+    return {
+        "step": last.get("step"),
+        "result": last.get("result"),
+        "timestamp": last.get("timestamp"),
+        "agent": last.get("agent"),
+        "output_file": last.get("output_file"),
+    }
+
+
+def _build_active_step(active_step: Any) -> dict[str, Any] | None:
+    if not isinstance(active_step, dict):
+        return None
+    details = dict(active_step)
+    started_at = _parse_utc_timestamp(details.get("started_at"))
+    if started_at is not None:
+        age_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+        details["age_seconds"] = age_seconds
+        details["stale"] = age_seconds >= _ACTIVE_STEP_STALE_SECONDS
+    return details
+
+
+def _build_status_payload(plan_dir: Path, state: dict[str, Any]) -> StepResponse:
+    next_steps = infer_next_steps(state)
+    notes = state.get("meta", {}).get("notes", [])
+    active_step = _build_active_step(state.get("active_step"))
+    last_step = _build_last_step(state)
+    summary = f"Plan '{state['name']}' is currently in state '{state['current_state']}'."
+    if active_step:
+        summary = (
+            summary
+            + f" Active step: {active_step.get('step')} via {active_step.get('agent')}."
+        )
+    return {
+        "success": True,
+        "step": "status",
+        "plan": state["name"],
+        "state": state["current_state"],
+        "iteration": state["iteration"],
+        "summary": summary,
+        "next_step": next_steps[0] if next_steps else None,
+        "valid_next": next_steps,
+        "artifacts": sorted(path.name for path in plan_dir.iterdir() if path.is_file()),
+        "active_step": active_step,
+        "last_step": last_step,
+        "total_cost_usd": state.get("meta", {}).get("total_cost_usd", 0.0),
+        "notes_count": len(notes) if isinstance(notes, list) else 0,
+        "notes": notes if isinstance(notes, list) else [],
+        "session_summaries": [
+            {"key": key, **value}
+            for key, value in sorted(state.get("sessions", {}).items())
+            if isinstance(value, dict)
+        ],
+    }
+
+
+def handle_status(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    return _build_status_payload(plan_dir, state)
+
+
+def handle_audit(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    return {
+        "success": True,
+        "step": "audit",
+        "plan": state["name"],
+        "plan_dir": str(plan_dir),
+        "state": state,
+    }
+
+
+def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    progress = _build_progress_payload(plan_dir, state)
+    return {
+        "success": True,
+        "step": "progress",
+        "plan": state["name"],
+        **progress,
+    }
+
+
+def handle_watch(root: Path, args: argparse.Namespace) -> StepResponse:
+    plan_dir, state = load_plan(root, args.plan)
+    status = _build_status_payload(plan_dir, state)
+    progress = _build_progress_payload(plan_dir, state)
+    progress_fields = {key: value for key, value in progress.items() if key != "summary"}
+    return {
+        **status,
+        **progress_fields,
+        "step": "watch",
+        "summary": status["summary"] + " " + progress["summary"],
+        "progress": progress,
     }
 
 
@@ -513,7 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list")
 
-    for name in ["status", "audit", "progress"]:
+    for name in ["status", "audit", "progress", "watch"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
@@ -640,6 +721,7 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "status": handle_status,
     "audit": handle_audit,
     "progress": handle_progress,
+    "watch": handle_watch,
     "list": handle_list,
     "loop-init": handle_loop_init,
     "loop-run": handle_loop_run,

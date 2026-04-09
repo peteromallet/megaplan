@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,8 @@ from megaplan.evaluation import validate_plan_structure
 from megaplan.types import CliError
 from megaplan.workers import (
     _build_mock_payload,
+    _codex_timeout_for_step,
+    _merge_partial_output,
     extract_session_id,
     parse_claude_envelope,
     parse_json_file,
@@ -890,3 +893,281 @@ def test_run_codex_step_extracts_session_id_from_timeout_output(tmp_path: Path) 
             run_codex_step("execute", state, plan_dir, root=tmp_path, persistent=True, fresh=True, json_trace=True)
 
     assert exc_info.value.extra["session_id"] == "codex-timeout-session"
+
+
+def test_run_command_decodes_timeout_byte_streams(tmp_path: Path) -> None:
+    from megaplan.workers import run_command
+
+    timeout_error = subprocess.TimeoutExpired(
+        cmd=["codex", "exec", "-"],
+        timeout=300,
+        output=b'prefix\n```json\n{"checks":[],"flags":[],"verified_flag_ids":[],"disputed_flag_ids":[]}\n```',
+        stderr=b"\nextra stderr",
+    )
+
+    with patch("megaplan.workers.subprocess.run", side_effect=timeout_error):
+        with pytest.raises(CliError) as exc_info:
+            run_command(["codex", "exec", "-"], cwd=tmp_path, stdin_text="prompt", timeout=300)
+
+    raw_output = exc_info.value.extra["raw_output"]
+    assert isinstance(raw_output, str)
+    assert "```json" in raw_output
+    assert raw_output.startswith("prefix")
+    assert "extra stderr" in raw_output
+
+
+def test_run_codex_step_recovers_critique_payload_from_timeout_raw_output(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    critique_payload = {
+        "checks": [
+            {
+                "id": "correctness",
+                "question": "Is the plan correct?",
+                "guidance": "Check the real code.",
+                "findings": [
+                    {
+                        "detail": "Checked the repository path and found missing propagation for shot metadata.",
+                        "flagged": True,
+                    }
+                ],
+            }
+        ],
+        "flags": [],
+        "verified_flag_ids": [],
+        "disputed_flag_ids": [],
+    }
+    timeout_error = CliError(
+        "worker_timeout",
+        "Codex timed out",
+        extra={
+            "raw_output": (
+                "OpenAI Codex v0.118.0\n"
+                '{"type":"thread.started","thread_id":"codex-timeout-session"}\n'
+                f"```json\n{json.dumps(critique_payload)}\n```"
+            ),
+        },
+    )
+
+    with patch("megaplan.workers.run_command", side_effect=timeout_error):
+        result = run_codex_step("critique", state, plan_dir, root=tmp_path, persistent=False, fresh=True)
+
+    assert result.payload == critique_payload
+    assert result.duration_ms == 0
+    assert result.cost_usd == 0.0
+
+
+def test_run_codex_step_recovers_gate_payload_from_mixed_raw_output(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    state["sessions"]["codex_gatekeeper"] = {
+        "id": "gate-session-1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "last_used_at": "2026-01-01T00:00:00Z",
+        "mode": "persistent",
+        "refreshed": False,
+    }
+    gate_payload = {
+        "recommendation": "PROCEED",
+        "rationale": "The revised plan is ready.",
+        "signals_assessment": "Score dropped and preflight remains healthy.",
+        "warnings": [],
+        "settled_decisions": [],
+        "flag_resolutions": [
+            {
+                "flag_id": "FLAG-001",
+                "action": "dispute",
+                "evidence": "Verified in workers.py: resolve_agent_mode is already the single routing source of truth.",
+                "rationale": "",
+            }
+        ],
+        "accepted_tradeoffs": [],
+    }
+    raw_output = (
+        json.dumps(gate_payload)
+        + "\nOpenAI Codex v0.118.0 (research preview)\n--------\n"
+        + "user\nExtra transcript text with braces later: {not-json}\n"
+    )
+
+    def fake_run_command(command: list[str], **kwargs: object) -> CommandResult:
+        return CommandResult(
+            command=command,
+            cwd=tmp_path,
+            returncode=0,
+            stdout=raw_output,
+            stderr="",
+            duration_ms=25,
+        )
+
+    with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+        result = run_codex_step(
+            "gate",
+            state,
+            plan_dir,
+            root=tmp_path,
+            persistent=True,
+            fresh=False,
+            prompt_override="gate prompt",
+        )
+
+    assert result.payload == gate_payload
+    assert result.session_id == "gate-session-1"
+    assert result.duration_ms == 25
+
+
+def test_diagnose_codex_failure_prefers_connection_errors_over_thread_id_numbers() -> None:
+    from megaplan.workers import _diagnose_codex_failure
+
+    raw = (
+        "thread 'reqwest-internal-sync-runtime' (42967821) panicked\n"
+        "failed to connect to websocket: IO error: failed to lookup address information: "
+        "nodename nor servname provided, or not known\n"
+        "stream disconnected before completion: error sending request for url "
+        "(https://chatgpt.com/backend-api/codex/responses)\n"
+    )
+
+    code, message = _diagnose_codex_failure(raw, 1)
+
+    assert code == "connection_error"
+    assert "connect" in message.lower() or "resolve" in message.lower()
+
+
+def test_diagnose_codex_failure_detects_real_http_429() -> None:
+    from megaplan.workers import _diagnose_codex_failure
+
+    code, message = _diagnose_codex_failure("request failed with HTTP 429 rate limit exceeded", 1)
+
+    assert code == "rate_limit"
+    assert "rate limit" in message.lower()
+
+
+def test_codex_timeout_for_step_caps_non_execute_steps() -> None:
+    assert _codex_timeout_for_step("plan") == 300
+
+
+def test_codex_timeout_for_step_preserves_execute_timeout() -> None:
+    assert _codex_timeout_for_step("execute") == 7200
+
+
+def test_codex_child_env_strips_parent_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    from megaplan.workers import _codex_child_env
+
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-thread")
+    monkeypatch.setenv("CODEX_CI", "1")
+    monkeypatch.setenv("CODEX_MANAGED_BY_NPM", "1")
+
+    env = _codex_child_env()
+
+    assert "CODEX_THREAD_ID" not in env
+    assert "CODEX_CI" not in env
+    assert env["CODEX_MANAGED_BY_NPM"] == "1"
+
+
+def test_merge_partial_output_appends_output_file_contents(tmp_path: Path) -> None:
+    output_path = tmp_path / "partial.json"
+    output_path.write_text('{"partial": true}', encoding="utf-8")
+
+    merged = _merge_partial_output("stderr text", output_path)
+
+    assert "stderr text" in merged
+    assert "[partial_output_file]" in merged
+    assert '{"partial": true}' in merged
+
+
+def test_run_codex_step_uses_step_timeout_for_plan(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    plan_payload = {
+        "plan": "# Plan\nDo it.",
+        "questions": [],
+        "success_criteria": [{"criterion": "criterion", "priority": "must"}],
+        "assumptions": [],
+    }
+
+    def fake_run_command(command: list[str], **kwargs: object) -> CommandResult:
+        assert kwargs["timeout"] == 300
+        output_idx = command.index("-o") + 1
+        output_path = Path(command[output_idx])
+        output_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+        return CommandResult(
+            command=command,
+            cwd=tmp_path,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_ms=1,
+        )
+
+    with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+        result = run_codex_step("plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True)
+
+    assert result.payload == plan_payload
+
+
+def test_run_codex_step_reclassifies_timeout_connection_errors(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    timeout_error = CliError(
+        "worker_timeout",
+        "Codex timed out",
+        extra={"raw_output": "failed to connect to websocket: failed to lookup address information"},
+    )
+
+    with patch("megaplan.workers.run_command", side_effect=timeout_error):
+        with pytest.raises(CliError) as exc_info:
+            run_codex_step("plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True)
+
+    assert exc_info.value.code == "connection_error"
+    assert "connect" in exc_info.value.message.lower() or "resolve" in exc_info.value.message.lower()
+
+
+def test_run_codex_step_sanitizes_codex_child_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    plan_payload = {
+        "plan": "# Plan\nDo it.",
+        "questions": [],
+        "success_criteria": [{"criterion": "criterion", "priority": "must"}],
+        "assumptions": [],
+    }
+    monkeypatch.setenv("CODEX_THREAD_ID", "outer-thread")
+    monkeypatch.setenv("CODEX_CI", "1")
+    monkeypatch.setenv("CODEX_MANAGED_BY_NPM", "1")
+
+    def fake_run_command(command: list[str], **kwargs: object) -> CommandResult:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert "CODEX_THREAD_ID" not in env
+        assert "CODEX_CI" not in env
+        assert env["CODEX_MANAGED_BY_NPM"] == "1"
+        output_idx = command.index("-o") + 1
+        output_path = Path(command[output_idx])
+        output_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+        return CommandResult(
+            command=command,
+            cwd=tmp_path,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_ms=1,
+        )
+
+    with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+        result = run_codex_step("plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True)
+
+    assert result.payload == plan_payload

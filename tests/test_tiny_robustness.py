@@ -16,6 +16,7 @@ def _artifact_names(plan_dir: Path) -> set[str]:
 
 def _advance_tiny_to_executed(fixture: PlanFixture) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
     args = fixture.make_args(plan=fixture.plan_name)
+    megaplan.handlers.handle_prep(fixture.root, args)
     megaplan.handle_plan(fixture.root, args)
     critique = megaplan.handle_critique(fixture.root, args)
     _plan_dir, post_critique_state = load_plan(fixture.root, fixture.plan_name)
@@ -37,7 +38,7 @@ def test_tiny_robustness_matches_light_artifacts_and_stub_payloads(
     standard_fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="standard")
 
     _plan_dir, tiny_initial_state = load_plan(tiny_fixture.root, tiny_fixture.plan_name)
-    assert "plan" in megaplan.infer_next_steps(tiny_initial_state)
+    assert "prep" in megaplan.infer_next_steps(tiny_initial_state)
 
     tiny_critique, tiny_post_critique_state, tiny_result = _advance_tiny_to_executed(tiny_fixture)
     _advance_to_executed(light_fixture)

@@ -105,11 +105,13 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         If there are blocking flags and you want to PROCEED, you may provide `flag_resolutions` — one entry per flag you are explicitly resolving. Two actions are allowed:
         - **dispute**: The critique was factually wrong. You MUST cite specific evidence (file path, line, API doc, etc.) proving the concern is invalid.
         - **accept_tradeoff**: The concern is real but intentionally accepted as a known limitation. Always allowed; the flag is recorded as tech debt.
+        - Schema requirement: every `flag_resolutions` entry must include both `evidence` and `rationale`. Use `""` for the field that does not apply to that action.
 
         You may resolve at most 3 flags explicitly per gate call. Any remaining blocking flags are implicitly accepted as tradeoffs if you recommend PROCEED.
         If a flag is structurally unresolvable (e.g., references infrastructure outside the repo), you should still PROCEED — do not loop indefinitely on flags that cannot be addressed.
 
-        If there are no blocking flags, `flag_resolutions` can be omitted.
+        If there are no blocking flags, return `flag_resolutions: []`.
+        Always return `accepted_tradeoffs`; use `[]` when none apply.
 
         Populate `settled_decisions` with design choices that should carry into review without re-litigation. Return `[]` when there are none.
 
@@ -121,9 +123,10 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
           "signals_assessment": "Score stable at 2.5, preflight passed, no recurring critiques.",
           "warnings": ["Verify edge case with composite moduli during execution."],
           "flag_resolutions": [
-            {{"flag_id": "correctness-1", "action": "dispute", "evidence": "allow_migrate and allow_migrate_model produce identical behavior for this use case (verified at django/db/utils.py:286)."}},
-            {{"flag_id": "conventions-1", "action": "accept_tradeoff", "rationale": "Minor naming inconsistency; tracked as debt for later cleanup."}}
+            {{"flag_id": "correctness-1", "action": "dispute", "evidence": "allow_migrate and allow_migrate_model produce identical behavior for this use case (verified at django/db/utils.py:286).", "rationale": ""}},
+            {{"flag_id": "conventions-1", "action": "accept_tradeoff", "evidence": "", "rationale": "Minor naming inconsistency; tracked as debt for later cleanup."}}
           ],
+          "accepted_tradeoffs": [],
           "settled_decisions": []
         }}
         ```

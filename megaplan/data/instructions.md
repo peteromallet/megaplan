@@ -3,9 +3,9 @@ Route every step through the `megaplan` CLI. Never call agents directly.
 ## Triage
 Pick the right level based on the task:
 - **Skip megaplan**: single-file fixes, bug fixes with clear cause, simple refactors, config changes, adding tests for existing code. Just do it.
-- **Light**: multi-file changes with clear scope, well-understood features, straightforward additions. One critique pass, no iteration loop.
+- **Light**: multi-file changes with clear scope, well-understood features, straightforward additions. One critique pass, no gate, no review.
 - **Standard** (default for megaplan): cross-cutting changes touching many subsystems, unfamiliar codebase areas, ambiguous requirements, changes with high breakage risk, or anything where the plan itself needs debate.
-- **Heavy**: high-stakes changes where getting it wrong is expensive — security-critical code, data migrations, public API changes. Adds a prep phase that deeply investigates the codebase before planning, and uses 8 critique checks instead of 4.
+- **Heavy**: high-stakes changes where getting it wrong is expensive — security-critical code, data migrations, public API changes. Uses the same visible `prep` phase but with 8 critique checks instead of 4.
 
 Default to standard unless the task is clearly simple enough for light. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
 ## Start
@@ -16,18 +16,21 @@ megaplan init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|
 Report the plan name, execution mode, robustness, current state, and next step.
 ## Workflow
 Run the loop in this order:
-1. `plan`
-2. `critique`
-3. `gate`
-4. `revise` when gate recommends iteration
-5. `finalize`
-6. `execute`
-7. `review`
+1. `prep`
+2. `plan`
+3. `critique`
+4. `gate`
+5. `revise` when gate recommends iteration
+6. `finalize`
+7. `execute`
+8. `review`
 Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
-At `--robustness light`, the loop is: `plan` → `critique` → `revise` → `finalize` → `execute`. No gate, no iteration, no review. One pass of external critique, one revision to incorporate it, then execute and done.
-At `--robustness heavy`, the loop adds a `prep` phase before planning: `prep` → `plan` → `critique` → `gate` → ... Uses 8 critique checks instead of 4.
+At `--robustness light`, the loop is: `prep` → `plan` → `critique` → `revise` → `finalize` → `execute`. `prep` can still return `skip: true` for trivial work, so this adds visibility without forcing a long investigation. There is no gate and no review.
+At `--robustness standard`, the loop is: `prep` → `plan` → `critique` → `gate` → ...
+At `--robustness heavy`, the loop is also `prep` → `plan` → `critique` → `gate` → ... but uses 8 critique checks instead of 4.
 ## Step Rules
 - `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`. Each criterion is `{"criterion": "...", "priority": "must|should|info"}`. `must` = hard gate (reviewer blocks), `should` = quality target (reviewer flags but doesn't block), `info` = human reference (reviewer skips).
+- `prep`: make repository investigation explicit before planning. Respect `skip: true` when the task is already concrete enough.
 - `critique`: surface concrete flags with concern, evidence, category, and severity; reuse open flag IDs; call out scope creep. Also validate that success criteria priorities are well-calibrated — `must` criteria should be verifiable yes/no, subjective goals should be `should`.
 - `gate`: read the response, warnings, and `orchestrator_guidance`. (Skipped at light robustness.)
 - `revise`: show the delta, flags addressed, and flags remaining. At light robustness, routes to `finalize`; otherwise loops back through `critique` and `gate`.
@@ -96,6 +99,7 @@ Settable execution keys: `execution.auto_approve`, `execution.robustness`.
 ```bash
 megaplan status --plan <name>
 megaplan progress --plan <name>
+megaplan watch --plan <name>
 megaplan audit --plan <name>
 megaplan list
 megaplan prep --plan <name>
@@ -113,7 +117,6 @@ megaplan override add-note --plan <name> --note "..."
 megaplan override force-proceed --plan <name> --reason "..."
 megaplan override replan --plan <name> --reason "..." [--note "..."]
 megaplan override abort --plan <name> --reason "..."
-megaplan watch --plan <name>
 megaplan config show
 megaplan config set <key> <value>
 megaplan config reset

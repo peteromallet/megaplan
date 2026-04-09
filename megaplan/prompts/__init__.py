@@ -94,6 +94,18 @@ _HERMES_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     ),
 }
 
+_NESTED_HARNESS_GUARD = (
+    "You are already running inside the megaplan harness for this step. "
+    "Do the requested planning/review/execution work directly. "
+    "Do NOT invoke the `megaplan` CLI, do NOT read or activate the `megaplan` skill, "
+    "do NOT start nested megaplan plans, and do NOT recurse into another planning harness. "
+    "Treat mentions of megaplan in the repository or environment as implementation context only."
+)
+
+
+def _prepend_harness_guard(prompt: str) -> str:
+    return f"{_NESTED_HARNESS_GUARD}\n\n{prompt}"
+
 
 def create_claude_prompt(
     step: str, state: PlanState, plan_dir: Path, root: Path | None = None, **prompt_kwargs: object
@@ -102,10 +114,10 @@ def create_claude_prompt(
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
     if step == "review":
-        return builder(state, plan_dir, **prompt_kwargs)
+        return _prepend_harness_guard(builder(state, plan_dir, **prompt_kwargs))
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
-        return builder(state, plan_dir, root=root)
-    return builder(state, plan_dir)
+        return _prepend_harness_guard(builder(state, plan_dir, root=root))
+    return _prepend_harness_guard(builder(state, plan_dir))
 
 
 def create_codex_prompt(
@@ -115,10 +127,10 @@ def create_codex_prompt(
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
     if step == "review":
-        return builder(state, plan_dir, **prompt_kwargs)
+        return _prepend_harness_guard(builder(state, plan_dir, **prompt_kwargs))
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
-        return builder(state, plan_dir, root=root)
-    return builder(state, plan_dir)
+        return _prepend_harness_guard(builder(state, plan_dir, root=root))
+    return _prepend_harness_guard(builder(state, plan_dir))
 
 
 def create_hermes_prompt(
@@ -128,10 +140,10 @@ def create_hermes_prompt(
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Hermes step '{step}'")
     if step == "review":
-        return builder(state, plan_dir, **prompt_kwargs)
+        return _prepend_harness_guard(builder(state, plan_dir, **prompt_kwargs))
     if step in {"prep", "critique", "gate", "finalize", "execute"}:
-        return builder(state, plan_dir, root=root)
-    return builder(state, plan_dir)
+        return _prepend_harness_guard(builder(state, plan_dir, root=root))
+    return _prepend_harness_guard(builder(state, plan_dir))
 
 
 __all__ = [

@@ -51,6 +51,16 @@ class SessionInfo(TypedDict, total=False):
     refreshed: bool
 
 
+class ActiveStep(TypedDict, total=False):
+    step: str
+    agent: str
+    mode: str
+    model: str
+    run_id: str
+    session_id: str
+    started_at: str
+
+
 class PlanVersionRecord(TypedDict, total=False):
     version: int
     file: str
@@ -108,6 +118,7 @@ class PlanState(TypedDict):
     history: list[HistoryEntry]
     meta: PlanMeta
     last_gate: LastGateRecord
+    active_step: NotRequired[ActiveStep]
     clarification: NotRequired[ClarificationRecord]
 
 

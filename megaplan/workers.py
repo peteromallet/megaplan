@@ -43,6 +43,7 @@ from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 WORKER_TIMEOUT_SECONDS = 7200
 _EXECUTE_STEPS = {"execute", "loop_execute"}
+_CODEX_NON_EXECUTE_TIMEOUT_SECONDS = 300
 
 # Shared mapping from step name to schema filename, used by both
 # run_claude_step and run_codex_step.
@@ -94,6 +95,7 @@ def run_command(
     *,
     cwd: Path,
     stdin_text: str | None = None,
+    env: dict[str, str] | None = None,
     timeout: int | None = None,
 ) -> CommandResult:
     started = time.monotonic()
@@ -105,6 +107,7 @@ def run_command(
             input=stdin_text,
             text=True,
             capture_output=True,
+            env=env,
             timeout=timeout,
         )
     except FileNotFoundError as exc:
@@ -113,10 +116,17 @@ def run_command(
             f"Command not found: {command[0]}",
         ) from exc
     except subprocess.TimeoutExpired as exc:
+        def _coerce_timeout_output(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return str(value)
+
         raise CliError(
             "worker_timeout",
             f"Command timed out after {timeout}s: {' '.join(command[:3])}...",
-            extra={"raw_output": str(exc.stdout or "") + str(exc.stderr or "")},
+            extra={"raw_output": _coerce_timeout_output(exc.stdout) + _coerce_timeout_output(exc.stderr)},
         ) from exc
     return CommandResult(
         command=command,
@@ -130,9 +140,17 @@ def run_command(
 
 _CODEX_ERROR_PATTERNS: list[tuple[str, str, str]] = [
     # (pattern_substring, error_code, human_message)
+    # Keep transport failures ahead of generic HTTP/status matches so
+    # thread IDs or unrelated numbers do not get misclassified as 429s.
+    ("failed to lookup address information", "connection_error", "Codex could not resolve the backend host"),
+    ("failed to connect to websocket", "connection_error", "Codex could not connect to the realtime backend"),
+    ("stream disconnected before completion", "connection_error", "Codex connection dropped before completion"),
+    ("error sending request for url", "connection_error", "Codex could not send the backend request"),
+    ("nodename nor servname provided", "connection_error", "Codex could not resolve the backend host"),
+    ("connection error", "connection_error", "Codex could not connect to the API"),
+    ("connection refused", "connection_error", "Codex could not connect to the API"),
     ("rate limit", "rate_limit", "Codex hit a rate limit"),
     ("rate_limit", "rate_limit", "Codex hit a rate limit"),
-    ("429", "rate_limit", "Codex hit a rate limit (HTTP 429)"),
     ("quota", "quota_exceeded", "Codex quota exceeded"),
     ("context length", "context_overflow", "Prompt exceeded Codex context length"),
     ("context_length", "context_overflow", "Prompt exceeded Codex context length"),
@@ -140,15 +158,9 @@ _CODEX_ERROR_PATTERNS: list[tuple[str, str, str]] = [
     ("too many tokens", "context_overflow", "Prompt exceeded Codex context length"),
     ("timed out", "worker_timeout", "Codex request timed out"),
     ("timeout", "worker_timeout", "Codex request timed out"),
-    ("connection error", "connection_error", "Codex could not connect to the API"),
-    ("connection refused", "connection_error", "Codex could not connect to the API"),
     ("invalid_json_schema", "schema_error", "Codex request rejected: invalid JSON schema"),
     ("invalid_request_error", "schema_error", "Codex request rejected: invalid request"),
-    ("400", "schema_error", "Codex API rejected request (HTTP 400)"),
     ("internal server error", "api_error", "Codex API returned an internal error"),
-    ("500", "api_error", "Codex API returned an internal error (HTTP 500)"),
-    ("502", "api_error", "Codex API returned a gateway error (HTTP 502)"),
-    ("503", "api_error", "Codex API service unavailable (HTTP 503)"),
     ("model not found", "model_error", "Codex model not found or unavailable"),
     ("permission denied", "permission_error", "Codex permission denied"),
     ("authentication", "auth_error", "Codex authentication failed"),
@@ -162,10 +174,60 @@ def _diagnose_codex_failure(raw: str, returncode: int) -> tuple[str, str]:
     for pattern, code, message in _CODEX_ERROR_PATTERNS:
         if pattern in lower:
             return code, f"{message}. Try --agent claude to use a different backend."
+    if re.search(r"\bhttp\s*429\b", lower) or re.search(r"\b429\b", lower):
+        return "rate_limit", "Codex hit a rate limit (HTTP 429). Try --agent claude to use a different backend."
+    if re.search(r"\bhttp\s*400\b", lower) or re.search(r"\b400\b", lower):
+        return "schema_error", "Codex API rejected request (HTTP 400). Try --agent claude to use a different backend."
+    if re.search(r"\bhttp\s*500\b", lower) or re.search(r"\b500\b", lower):
+        return "api_error", "Codex API returned an internal error (HTTP 500). Try --agent claude to use a different backend."
+    if re.search(r"\bhttp\s*502\b", lower) or re.search(r"\b502\b", lower):
+        return "api_error", "Codex API returned a gateway error (HTTP 502). Try --agent claude to use a different backend."
+    if re.search(r"\bhttp\s*503\b", lower) or re.search(r"\b503\b", lower):
+        return "api_error", "Codex API service unavailable (HTTP 503). Try --agent claude to use a different backend."
     return "worker_error", (
         f"Codex step failed with exit code {returncode} (no recognized error pattern in output). "
         "Try --agent claude to use a different backend."
     )
+
+
+def _codex_timeout_for_step(step: str) -> int:
+    configured_timeout = int(get_effective("execution", "worker_timeout_seconds"))
+    if step in _EXECUTE_STEPS:
+        return configured_timeout
+    return min(configured_timeout, _CODEX_NON_EXECUTE_TIMEOUT_SECONDS)
+
+
+def _codex_child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    # Nested Codex workers should not inherit the parent Codex session state.
+    # Those variables can cause the child to attach to the outer thread/CI
+    # context instead of behaving like an isolated worker invocation.
+    env.pop("CODEX_THREAD_ID", None)
+    env.pop("CODEX_CI", None)
+    return env
+
+
+def _merge_partial_output(raw_output: str, output_path: Path) -> str:
+    merged = raw_output or ""
+    try:
+        partial = output_path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        partial = ""
+    if partial and partial not in merged:
+        if merged and not merged.endswith("\n"):
+            merged += "\n"
+        merged += "[partial_output_file]\n" + partial
+    return merged
+
+
+def _critique_payload_has_content(payload: dict[str, Any]) -> bool:
+    checks = payload.get("checks", [])
+    findings = 0
+    if isinstance(checks, list):
+        findings = sum(len(check.get("findings", [])) for check in checks if isinstance(check, dict))
+    if findings > 0:
+        return True
+    return any(bool(payload.get(key)) for key in ("flags", "verified_flag_ids", "disputed_flag_ids"))
 
 
 def extract_session_id(raw: str) -> str | None:
@@ -228,18 +290,22 @@ def _extract_json_from_raw(raw: str) -> dict[str, Any] | None:
                 return obj
         except json.JSONDecodeError:
             continue
-    # Strategy 2: find the largest { ... } substring that parses as JSON
-    # (greedy match from first { to last })
-    brace_start = raw.find("{")
-    brace_end = raw.rfind("}")
-    if brace_start >= 0 and brace_end > brace_start:
-        candidate = raw[brace_start : brace_end + 1]
+    # Strategy 2: scan for the first decodable JSON object, even when
+    # additional logs/traces are appended after it.
+    decoder = json.JSONDecoder()
+    search_start = 0
+    while True:
+        brace_start = raw.find("{", search_start)
+        if brace_start < 0:
+            break
         try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                return obj
+            obj, _end = decoder.raw_decode(raw[brace_start:])
         except json.JSONDecodeError:
-            pass
+            search_start = brace_start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        search_start = brace_start + 1
     return None
 
 
@@ -252,6 +318,50 @@ def parse_json_file(path: Path) -> dict[str, Any]:
         raise CliError("parse_error", f"Output file {path.name} was not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise CliError("parse_error", f"Output file {path.name} did not contain a JSON object")
+    return payload
+
+
+def _recover_codex_payload(
+    step: str,
+    *,
+    plan_dir: Path,
+    output_path: Path,
+    raw: str,
+) -> dict[str, Any] | None:
+    payload = None
+    try:
+        payload = parse_json_file(output_path)
+    except CliError:
+        pass
+    if payload is None:
+        fallback_names = {
+            "critique": "critique_output.json",
+        }
+        fallback_name = fallback_names.get(step, f"{step}_output.json")
+        fallback_path = plan_dir / fallback_name
+        if fallback_path != output_path and fallback_path.exists():
+            try:
+                payload = parse_json_file(fallback_path)
+            except CliError:
+                pass
+    raw_payload = _extract_json_from_raw(raw)
+    if payload is None:
+        payload = raw_payload
+    if payload is not None and step == "critique" and raw_payload is not None:
+        raw_checks = raw_payload.get("checks", [])
+        file_checks = payload.get("checks", [])
+        raw_findings = sum(len(check.get("findings", [])) for check in raw_checks if isinstance(check, dict))
+        file_findings = sum(len(check.get("findings", [])) for check in file_checks if isinstance(check, dict))
+        if raw_findings > file_findings:
+            payload = raw_payload
+    if payload is None:
+        return None
+    try:
+        validate_payload(step, payload)
+    except CliError:
+        return None
+    if step == "critique" and not _critique_payload_has_content(payload):
+        return None
     return payload
 
 
@@ -905,6 +1015,7 @@ def run_codex_step(
         root=root,
         **(prompt_kwargs or {}),
     )
+    timeout_seconds = _codex_timeout_for_step(step)
 
     if persistent and session.get("id") and not fresh:
         # codex exec resume does not support --output-schema; we rely on
@@ -930,63 +1041,77 @@ def run_codex_step(
         command.extend(["--output-schema", str(schema_file), "-"])
 
     try:
-        result = run_command(command, cwd=Path.cwd(), stdin_text=prompt)
+        result = run_command(
+            command,
+            cwd=Path.cwd(),
+            stdin_text=prompt,
+            env=_codex_child_env(),
+            timeout=timeout_seconds,
+        )
     except CliError as error:
+        error.extra["raw_output"] = _merge_partial_output(
+            str(error.extra.get("raw_output", "")),
+            output_path,
+        )
         if error.code == "worker_timeout":
+            recovered_payload = _recover_codex_payload(
+                step,
+                plan_dir=plan_dir,
+                output_path=output_path,
+                raw=str(error.extra.get("raw_output", "")),
+            )
+            if recovered_payload is not None:
+                timeout_session_id = session.get("id") if persistent else None
+                if timeout_session_id is None:
+                    timeout_session_id = extract_session_id(str(error.extra.get("raw_output", "")))
+                return WorkerResult(
+                    payload=recovered_payload,
+                    raw_output=str(error.extra.get("raw_output", "")),
+                    duration_ms=0,
+                    cost_usd=0.0,
+                    session_id=timeout_session_id,
+                    trace_output=str(error.extra.get("raw_output", "")) if json_trace else None,
+                )
             timeout_session_id = session.get("id") if persistent else None
             if timeout_session_id is None:
                 timeout_session_id = extract_session_id(error.extra.get("raw_output", ""))
             if timeout_session_id is not None:
                 error.extra["session_id"] = timeout_session_id
+            diagnosed_code, diagnosed_message = _diagnose_codex_failure(
+                str(error.extra.get("raw_output", "")),
+                124,
+            )
+            if diagnosed_code == "connection_error":
+                raise CliError(
+                    diagnosed_code,
+                    diagnosed_message,
+                    extra=error.extra,
+                    valid_next=error.valid_next,
+                    exit_code=error.exit_code,
+                ) from error
+            raise CliError(
+                "worker_timeout",
+                (
+                    f"Codex {step} step timed out after {timeout_seconds}s before producing structured output. "
+                    "Try re-running later or using --agent claude."
+                ),
+                extra=error.extra,
+                valid_next=error.valid_next,
+                exit_code=error.exit_code,
+            ) from error
         raise
     raw = result.stdout + result.stderr
     if result.returncode != 0 and (not output_path.exists() or not output_path.read_text(encoding="utf-8").strip()):
         error_code, error_message = _diagnose_codex_failure(raw, result.returncode)
         raise CliError(error_code, error_message, extra={"raw_output": raw})
-    payload = None
-    try:
-        payload = parse_json_file(output_path)
-    except CliError:
-        pass
-    # Fallback 1: when resuming a persistent session, --output-schema is not
-    # supported so Codex may write to the plan-dir output file instead of
-    # the temp file.  Try the known output path before giving up.
-    if payload is None:
-        fallback_names = {
-            "critique": "critique_output.json",
-        }
-        fallback_name = fallback_names.get(step, f"{step}_output.json")
-        fallback_path = plan_dir / fallback_name
-        if fallback_path != output_path and fallback_path.exists():
-            try:
-                payload = parse_json_file(fallback_path)
-            except CliError:
-                pass
-    # Fallback 2: sandbox may block file writes.  The agent dumps JSON
-    # into stdout/stderr wrapped in error text (e.g. "Read-only sandbox
-    # prevented writing ... ```json\n{...}\n```").  Extract it.
-    if payload is None:
-        payload = _extract_json_from_raw(raw)
+    payload = _recover_codex_payload(
+        step,
+        plan_dir=plan_dir,
+        output_path=output_path,
+        raw=raw,
+    )
     if payload is None:
         raise CliError("parse_error", f"Output file {output_path.name} was not valid JSON and no fallback found", extra={"raw_output": raw})
-    # Fallback 3: the output file may have been written successfully but contain
-    # a wrapper/error payload instead of the actual structured output.  If the
-    # raw output contains a better payload (e.g. with populated findings),
-    # prefer it.
-    raw_payload = _extract_json_from_raw(raw)
-    if raw_payload is not None and step == "critique":
-        # Check if the raw version has more content (e.g. populated findings
-        # vs empty template that the file-based parse returned).
-        raw_checks = raw_payload.get("checks", [])
-        file_checks = payload.get("checks", [])
-        raw_findings = sum(len(c.get("findings", [])) for c in raw_checks if isinstance(c, dict))
-        file_findings = sum(len(c.get("findings", [])) for c in file_checks if isinstance(c, dict))
-        if raw_findings > file_findings:
-            payload = raw_payload
-    try:
-        validate_payload(step, payload)
-    except CliError as error:
-        raise CliError(error.code, error.message, extra={"raw_output": raw}) from error
     session_id = session.get("id") if persistent else None
     if persistent and not session_id:
         session_id = extract_session_id(raw)

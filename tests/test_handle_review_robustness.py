@@ -84,8 +84,7 @@ def _make_plan_fixture(
 
 def _advance_to_executed(fixture: PlanFixture) -> None:
     args = fixture.make_args(plan=fixture.plan_name)
-    if fixture.robustness == "heavy":
-        megaplan.handlers.handle_prep(fixture.root, args)
+    megaplan.handlers.handle_prep(fixture.root, args)
     megaplan.handle_plan(fixture.root, args)
     megaplan.handle_critique(fixture.root, args)
     megaplan.handle_override(

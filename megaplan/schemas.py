@@ -446,10 +446,10 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "expected": {"type": "string"},
                         "actual": {"type": "string"},
                         "evidence_file": {"type": "string"},
-                        "flag_id": {"type": "string"},
-                        "source": {"type": "string"},
+                        "flag_id": {"type": ["string", "null"]},
+                        "source": {"type": ["string", "null"]},
                     },
-                    "required": ["task_id", "issue", "expected", "actual", "evidence_file"],
+                    "required": ["task_id", "issue", "expected", "actual", "evidence_file", "flag_id", "source"],
                 },
             },
             "summary": {"type": "string"},
@@ -495,7 +495,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 def _preserve_explicit_required(path: tuple[str, ...]) -> bool:
-    # `review.rework_items[].flag_id` and `source` intentionally stay optional.
+    # `review.rework_items[]` uses explicit required fields because OpenAI
+    # structured outputs require every property key to appear in `required`.
     return path[-3:] == ("properties", "rework_items", "items")
 
 

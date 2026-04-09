@@ -72,11 +72,7 @@ WORKFLOW: dict[str, list[Transition]] = {
 # routing documented explicitly, and light adds gate/review skips.
 _ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
     "heavy": {},
-    "standard": {
-        STATE_INITIALIZED: [
-            Transition("plan", STATE_PLANNED),
-        ],
-    },
+    "standard": {},
     "light": {
         STATE_CRITIQUED: [
             Transition("revise", STATE_GATED),

@@ -113,6 +113,9 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         Requirements:
         - If the engineering brief suggests an approach, use it as your starting hypothesis — but before committing, consider if there's a simpler or more fundamental fix. The brief is well-researched input, not a final answer.
         - If the brief is absent, incomplete, or says "skip", inspect the repository yourself before planning.
+        - Stay focused on the requested idea. If repo exploration surfaces unrelated issues or docs, ignore them and return to the task.
+        - Prefer source code, tests, and directly relevant config files. Avoid `.megaplan/`, prior plan artifacts, and unrelated `docs/` or ops/deployment material unless the task explicitly depends on them.
+        - Stop exploring once you have enough evidence to name the concrete touch points and validation path. Do not keep browsing after you can write the plan.
         - Produce a concrete implementation plan in markdown.
         - Define observable success criteria as objects with `criterion` (string) and `priority` (`must`, `should`, or `info`):
           - `must` — hard gate. The reviewer will block on failure. Use for correctness, functional requirements, and verifiable outcomes (e.g., "all existing tests pass", "API returns 200 for valid input"). Every `must` criterion must have a clear yes/no answer.
@@ -186,5 +189,4 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
 
         """
     ).strip()
-
 

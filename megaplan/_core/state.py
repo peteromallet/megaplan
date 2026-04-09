@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
+
+import fcntl
 
 from megaplan.types import (
+    ActiveStep,
     CliError,
     HistoryEntry,
     PlanState,
@@ -68,6 +74,10 @@ def resolve_plan_dir(root: Path, requested_name: str | None) -> Path:
 
 def load_plan(root: Path, requested_name: str | None) -> tuple[Path, PlanState]:
     plan_dir = resolve_plan_dir(root, requested_name)
+    return load_plan_from_dir(plan_dir)
+
+
+def load_plan_from_dir(plan_dir: Path) -> tuple[Path, PlanState]:
     state = read_json(plan_dir / "state.json")
     migrated = False
     if state.get("current_state") == "clarified":
@@ -86,6 +96,70 @@ def load_plan(root: Path, requested_name: str | None) -> tuple[Path, PlanState]:
     if migrated:
         atomic_write_json(plan_dir / "state.json", state)
     return plan_dir, state
+
+
+def _parse_utc_timestamp(timestamp: str | None) -> datetime | None:
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def active_step_is_stale(active_step: ActiveStep | None, *, stale_seconds: int = 300) -> bool:
+    if not isinstance(active_step, dict):
+        return False
+    started_at = _parse_utc_timestamp(active_step.get("started_at"))
+    if started_at is None:
+        return False
+    age_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+    return age_seconds >= stale_seconds
+
+
+def plan_lock_path(plan_dir: Path) -> Path:
+    return plan_dir / ".plan.lock"
+
+
+@contextmanager
+def plan_lock(plan_dir: Path, *, step: str) -> Iterator[None]:
+    lock_path = plan_lock_path(plan_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            state_path = plan_dir / "state.json"
+            details: dict[str, object] = {"plan": plan_dir.name, "step": step}
+            if state_path.exists():
+                try:
+                    state = read_json(state_path)
+                except Exception:
+                    state = None
+                if isinstance(state, dict):
+                    active_step = state.get("active_step")
+                    if isinstance(active_step, dict):
+                        details["active_step"] = active_step
+            active_step = details.get("active_step")
+            if isinstance(active_step, dict):
+                message = (
+                    f"Cannot run '{step}' because plan '{plan_dir.name}' already has an active "
+                    f"'{active_step.get('step')}' step via {active_step.get('agent')}."
+                )
+            else:
+                message = f"Cannot run '{step}' because plan '{plan_dir.name}' is locked by another process."
+            raise CliError("plan_locked", message, extra=details) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def load_plan_locked(root: Path, requested_name: str | None, *, step: str) -> Iterator[tuple[Path, PlanState]]:
+    plan_dir = resolve_plan_dir(root, requested_name)
+    with plan_lock(plan_dir, step=step):
+        yield load_plan_from_dir(plan_dir)
 
 
 def save_state(plan_dir: Path, state: PlanState) -> None:
@@ -114,6 +188,43 @@ def apply_session_update(
     if result is not None:
         key, entry = result
         state["sessions"][key] = entry
+
+
+def set_active_step(
+    state: PlanState,
+    *,
+    step: str,
+    agent: str,
+    mode: str,
+    model: str | None = None,
+    run_id: str | None = None,
+) -> str:
+    resolved_run_id = run_id or str(uuid.uuid4())
+    active_step: ActiveStep = {
+        "step": step,
+        "agent": agent,
+        "mode": mode,
+        "run_id": resolved_run_id,
+        "started_at": now_utc(),
+    }
+    if model:
+        active_step["model"] = model
+    if mode == "persistent":
+        from megaplan.workers import session_key_for
+
+        session = state.get("sessions", {}).get(session_key_for(step, agent, model), {})
+        session_id = session.get("id")
+        if isinstance(session_id, str) and session_id:
+            active_step["session_id"] = session_id
+    state["active_step"] = active_step
+    return resolved_run_id
+
+
+def clear_active_step(state: PlanState, *, run_id: str | None = None) -> None:
+    active_step = state.get("active_step")
+    if run_id is not None and isinstance(active_step, dict) and active_step.get("run_id") != run_id:
+        return
+    state.pop("active_step", None)
 
 
 # ---------------------------------------------------------------------------

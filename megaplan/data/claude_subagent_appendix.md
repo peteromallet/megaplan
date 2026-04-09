@@ -69,20 +69,23 @@ At startup and after every later resume:
 - Read `state`, `next_step`, and `valid_next`.
 - If `notes_count > 0`, read the full `notes` array before acting. Do not track note cursors or indexes; always read the full array.
 - Treat all notes as context. If the newest note changes direction, treat that note as the new intent and decide whether to continue, revise, replan, or break out.
+- If `active_step` is present, treat it as an in-flight phase marker rather than a completed step. Use `last_step` for the most recent completed phase.
 
 ## 3. Phase Routing by Robustness
 Use the workflow below exactly.
 
 Light robustness:
-- `init -> plan -> critique -> revise -> finalize -> execute -> done`
+- `init -> prep -> plan -> critique -> revise -> finalize -> execute -> done`
 - There is no `gate`.
 - There is no `review`.
+- `prep` may return `skip: true`; that still counts as the visible prep phase.
 - After the light `revise`, the CLI moves to `gated`, so the next command is `finalize`.
 - After `execute`, the CLI will end the run.
 
 Standard robustness:
-- `init -> plan -> critique -> gate`
+- `init -> prep -> plan -> critique -> gate`
 - Then follow the gate decision tree below.
+- `prep` may return `skip: true`; do not skip the command yourself.
 - When you reach `gated`, run `finalize`.
 - Then run `execute`.
 - Then run `review`.
@@ -90,6 +93,7 @@ Standard robustness:
 
 Heavy robustness:
 - `init -> prep -> plan -> critique -> gate`
+- `prep` may still return `skip: true`, but the phase remains visible in the CLI state/history.
 - After that, heavy follows the same gate, finalize, execute, and review behavior as standard.
 
 Gate decision tree for standard and heavy:
