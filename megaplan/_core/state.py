@@ -18,6 +18,7 @@ from megaplan.types import (
     PlanVersionRecord,
     TERMINAL_STATES,
 )
+from .phase_runtime import DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS, phase_stale_seconds
 
 from .io import (
     atomic_write_json,
@@ -30,6 +31,9 @@ from .io import (
 
 if TYPE_CHECKING:
     from megaplan.workers import WorkerResult
+
+
+DEFAULT_ACTIVE_STEP_STALE_SECONDS = DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +111,61 @@ def _parse_utc_timestamp(timestamp: str | None) -> datetime | None:
         return None
 
 
-def active_step_is_stale(active_step: ActiveStep | None, *, stale_seconds: int = 300) -> bool:
+def active_step_is_stale(
+    active_step: ActiveStep | None,
+    *,
+    configured_timeout_seconds: int = DEFAULT_ACTIVE_STEP_STALE_SECONDS,
+) -> bool:
     if not isinstance(active_step, dict):
+        return False
+    step = active_step.get("step")
+    if not isinstance(step, str) or not step:
         return False
     started_at = _parse_utc_timestamp(active_step.get("started_at"))
     if started_at is None:
         return False
     age_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
-    return age_seconds >= stale_seconds
+    return age_seconds >= phase_stale_seconds(
+        step,
+        configured_timeout_seconds=configured_timeout_seconds,
+    )
 
 
 def plan_lock_path(plan_dir: Path) -> Path:
     return plan_dir / ".plan.lock"
+
+
+def plan_lock_is_held(plan_dir: Path) -> bool:
+    lock_path = plan_lock_path(plan_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    return False
+
+
+def _build_plan_locked_details(plan_dir: Path, *, step: str) -> dict[str, object]:
+    state_path = plan_dir / "state.json"
+    details: dict[str, object] = {"plan": plan_dir.name, "step": step}
+    if not state_path.exists():
+        return details
+    try:
+        state = read_json(state_path)
+    except Exception:
+        return details
+    if not isinstance(state, dict):
+        return details
+    active_step = state.get("active_step")
+    if isinstance(active_step, dict):
+        details["active_step"] = dict(active_step)
+    return details
 
 
 @contextmanager
@@ -129,17 +176,7 @@ def plan_lock(plan_dir: Path, *, step: str) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            state_path = plan_dir / "state.json"
-            details: dict[str, object] = {"plan": plan_dir.name, "step": step}
-            if state_path.exists():
-                try:
-                    state = read_json(state_path)
-                except Exception:
-                    state = None
-                if isinstance(state, dict):
-                    active_step = state.get("active_step")
-                    if isinstance(active_step, dict):
-                        details["active_step"] = active_step
+            details = _build_plan_locked_details(plan_dir, step=step)
             active_step = details.get("active_step")
             if isinstance(active_step, dict):
                 message = (

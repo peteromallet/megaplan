@@ -91,12 +91,16 @@ Standard robustness:
 - Then run `review`.
 - If `review` returns `needs_rework`, the workflow becomes `finalized -> execute -> review` again until review passes or the CLI reaches its cap.
 
-Heavy robustness:
+Robust robustness:
 - `init -> prep -> plan -> critique -> gate`
 - `prep` may still return `skip: true`, but the phase remains visible in the CLI state/history.
-- After that, heavy follows the same gate, finalize, execute, and review behavior as standard.
+- Uses 8 critique checks (vs 4 for standard) and enables parallel critique.
+- After that, robust follows the same gate, finalize, execute, and review behavior as standard.
 
-Gate decision tree for standard and heavy:
+Superrobust robustness:
+- Same as robust, but also enables parallel review (review checks split across concurrent subagents).
+
+Gate decision tree for standard, robust, and superrobust:
 - Condition 1: `gate_unset`
   Trigger: state is `critiqued` and `valid_next` includes `gate`.
   Action: run `megaplan gate --plan <name>`.
@@ -113,7 +117,7 @@ Gate decision tree for standard and heavy:
   Trigger: the latest gate recommendation is `PROCEED` and preflight passed, so state becomes `gated`.
   Action: run `megaplan finalize --plan <name>`.
 
-Review routing for standard and heavy:
+Review routing for standard, robust, and superrobust:
 - If `review` succeeds, the run is done.
 - If `review` returns `needs_rework`, the CLI moves back to `finalized` with `next_step` set to `execute`.
 - When that happens, run `execute` again, then `review` again.

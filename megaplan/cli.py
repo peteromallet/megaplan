@@ -23,6 +23,8 @@ from megaplan._core import (
     active_plan_dirs,
     add_or_increment_debt,
     atomic_write_text,
+    build_next_step_runtime,
+    build_phase_observability,
     compute_global_batches,
     config_dir,
     detect_available_agents,
@@ -34,12 +36,16 @@ from megaplan._core import (
     load_config,
     load_debt_registry,
     load_plan,
+    plan_lock_is_held,
     read_json,
     resolve_debt,
+    resolve_plan_dir,
     save_debt_registry,
     save_config,
     subsystem_occurrence_total,
+    humanize_seconds,
 )
+from megaplan.execution import build_monitor_hint
 from megaplan.handlers import (
     handle_critique,
     handle_execute,
@@ -61,16 +67,52 @@ from megaplan.loop.handlers import (
 from megaplan.step_edit import handle_step
 
 
-_ACTIVE_STEP_STALE_SECONDS = 300
-
-
-
 def render_response(response: StepResponse, *, exit_code: int = 0) -> int:
     print(json_dump(response), end="")
     return exit_code
 
 
-def error_response(error: CliError) -> int:
+def _resolve_error_plan_dir(root: Path | None, error: CliError) -> Path | None:
+    if root is None or error.code != "plan_locked" or not isinstance(error.extra, dict):
+        return None
+    plan_name = error.extra.get("plan")
+    if not isinstance(plan_name, str) or not plan_name:
+        return None
+    try:
+        return resolve_plan_dir(root, plan_name)
+    except CliError:
+        return None
+
+
+def _augment_plan_locked_error(
+    payload: StepResponse,
+    error: CliError,
+    *,
+    root: Path | None,
+) -> None:
+    plan_dir = _resolve_error_plan_dir(root, error)
+    details = payload.get("details")
+    if not isinstance(details, dict):
+        details = None
+    plan_name = (details or {}).get("plan")
+    if isinstance(plan_name, str) and plan_name:
+        monitor_hint = build_monitor_hint(plan_dir or Path(plan_name))
+        payload["monitor_hint"] = monitor_hint
+        if details is not None:
+            details["monitor_hint"] = monitor_hint
+    raw_active_step = (details or {}).get("active_step")
+    if isinstance(raw_active_step, dict):
+        active_step = (
+            _build_active_step(raw_active_step, plan_dir=plan_dir)
+            if plan_dir is not None
+            else dict(raw_active_step)
+        )
+        payload["active_step"] = active_step
+        if details is not None:
+            details["active_step"] = active_step
+
+
+def error_response(error: CliError, *, root: Path | None = None) -> int:
     payload: StepResponse = {
         "success": False,
         "error": error.code,
@@ -79,7 +121,9 @@ def error_response(error: CliError) -> int:
     if error.valid_next:
         payload["valid_next"] = error.valid_next
     if error.extra:
-        payload["details"] = error.extra
+        payload["details"] = dict(error.extra)
+    if error.code == "plan_locked":
+        _augment_plan_locked_error(payload, error, root=root)
     return render_response(payload, exit_code=error.exit_code)
 
 
@@ -164,22 +208,82 @@ def _build_last_step(state: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _build_active_step(active_step: Any) -> dict[str, Any] | None:
+def _build_active_step(active_step: Any, *, plan_dir: Path) -> dict[str, Any] | None:
     if not isinstance(active_step, dict):
         return None
     details = dict(active_step)
+    step = details.get("step")
+    if not isinstance(step, str) or not step:
+        return details
+    configured_timeout_seconds = int(get_effective("execution", "worker_timeout_seconds"))
+    lock_held = plan_lock_is_held(plan_dir)
     started_at = _parse_utc_timestamp(details.get("started_at"))
     if started_at is not None:
         age_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
-        details["age_seconds"] = age_seconds
-        details["stale"] = age_seconds >= _ACTIVE_STEP_STALE_SECONDS
+        details.update(
+            build_phase_observability(
+                step,
+                configured_timeout_seconds=configured_timeout_seconds,
+                age_seconds=age_seconds,
+                lock_held=lock_held,
+            )
+        )
+        if details.get("stale"):
+            orphaned = not lock_held
+            details["orphaned"] = orphaned
+            if orphaned:
+                if step == "execute":
+                    details["recovery_hint"] = (
+                        "The active step is stale and no process holds the plan lock. "
+                        "Safe next action: rerun the same execute command on Codex without --fresh."
+                    )
+                else:
+                    details["recovery_hint"] = (
+                        "The active step is stale and no process holds the plan lock. "
+                        "Safe next action: rerun the same step on the same agent before escalating."
+                    )
+        max_seconds = int(details.get("expected_duration_seconds", {}).get("max", 0) or 0)
+        elapsed_label = humanize_seconds(age_seconds)
+        if details.get("stale"):
+            details["phase_progress_summary"] = (
+                f"{step} stale ({elapsed_label} elapsed, expected max {humanize_seconds(max_seconds)}) "
+                "see recovery_hint."
+            )
+        elif step in {"execute", "loop_execute"}:
+            details["phase_progress_summary"] = (
+                f"{step} running ({elapsed_label} elapsed, use progress for batch-level detail)."
+            )
+        else:
+            details["phase_progress_summary"] = (
+                f"{step} running ({elapsed_label} elapsed, typically completes within "
+                f"{humanize_seconds(max_seconds)})."
+            )
+            if max_seconds > 0:
+                details["progress_pct"] = min(95, int((age_seconds / max_seconds) * 100))
+    else:
+        details.update(
+            build_phase_observability(
+                step,
+                configured_timeout_seconds=configured_timeout_seconds,
+                lock_held=lock_held,
+            )
+        )
+        if step in {"execute", "loop_execute"}:
+            details["phase_progress_summary"] = (
+                f"{step} active (start time unknown, use progress for batch-level detail)."
+            )
+        else:
+            details["phase_progress_summary"] = f"{step} active (start time unknown)."
     return details
 
 
 def _build_status_payload(plan_dir: Path, state: dict[str, Any]) -> StepResponse:
     next_steps = infer_next_steps(state)
     notes = state.get("meta", {}).get("notes", [])
-    active_step = _build_active_step(state.get("active_step"))
+    lock_path = plan_dir / ".plan.lock"
+    lock_file_present = lock_path.exists()
+    lock_held = plan_lock_is_held(plan_dir)
+    active_step = _build_active_step(state.get("active_step"), plan_dir=plan_dir)
     last_step = _build_last_step(state)
     summary = f"Plan '{state['name']}' is currently in state '{state['current_state']}'."
     if active_step:
@@ -187,7 +291,12 @@ def _build_status_payload(plan_dir: Path, state: dict[str, Any]) -> StepResponse
             summary
             + f" Active step: {active_step.get('step')} via {active_step.get('agent')}."
         )
-    return {
+    elif lock_file_present and not lock_held:
+        summary = (
+            summary
+            + " No active step. The `.plan.lock` file may remain on disk even when no process holds the lock."
+        )
+    response: StepResponse = {
         "success": True,
         "step": "status",
         "plan": state["name"],
@@ -196,7 +305,13 @@ def _build_status_payload(plan_dir: Path, state: dict[str, Any]) -> StepResponse
         "summary": summary,
         "next_step": next_steps[0] if next_steps else None,
         "valid_next": next_steps,
-        "artifacts": sorted(path.name for path in plan_dir.iterdir() if path.is_file()),
+        "artifacts": sorted(
+            path.name
+            for path in plan_dir.iterdir()
+            if path.is_file() and path.name != ".plan.lock"
+        ),
+        "lock_file_present": lock_file_present,
+        "lock_held": lock_held,
         "active_step": active_step,
         "last_step": last_step,
         "total_cost_usd": state.get("meta", {}).get("total_cost_usd", 0.0),
@@ -208,6 +323,17 @@ def _build_status_payload(plan_dir: Path, state: dict[str, Any]) -> StepResponse
             if isinstance(value, dict)
         ],
     }
+    runtime = build_next_step_runtime(
+        response.get("next_step"),
+        configured_timeout_seconds=int(get_effective("execution", "worker_timeout_seconds")),
+    )
+    if runtime is not None:
+        response["next_step_runtime"] = runtime
+    progress = _build_progress_payload(plan_dir, state) if (plan_dir / "finalize.json").exists() else None
+    if progress is not None:
+        response["progress"] = progress
+        response["summary"] = response["summary"] + " " + progress["summary"]
+    return response
 
 
 def handle_status(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -238,17 +364,9 @@ def handle_progress(root: Path, args: argparse.Namespace) -> StepResponse:
 
 
 def handle_watch(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    status = _build_status_payload(plan_dir, state)
-    progress = _build_progress_payload(plan_dir, state)
-    progress_fields = {key: value for key, value in progress.items() if key != "summary"}
-    return {
-        **status,
-        **progress_fields,
-        "step": "watch",
-        "summary": status["summary"] + " " + progress["summary"],
-        "progress": progress,
-    }
+    response = handle_status(root, args)
+    response["step"] = "watch"
+    return response
 
 
 def handle_list(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -380,8 +498,8 @@ def bundled_agents_md() -> str:
     return _canonical_instructions()
 
 
-def _claude_subagent_appendix() -> str:
-    content = resources.files("megaplan").joinpath("data", "claude_subagent_appendix.md").read_text(encoding="utf-8")
+def _subagent_appendix(filename: str) -> str:
+    content = resources.files("megaplan").joinpath("data", filename).read_text(encoding="utf-8")
     content = content.replace(
         "{max_execute_no_progress}",
         str(get_effective("execution", "max_execute_no_progress")),
@@ -393,10 +511,20 @@ def _claude_subagent_appendix() -> str:
     return content
 
 
+def _claude_subagent_appendix() -> str:
+    return _subagent_appendix("claude_subagent_appendix.md")
+
+
+def _codex_subagent_appendix() -> str:
+    return _subagent_appendix("codex_subagent_appendix.md")
+
+
 def bundled_global_file(name: str) -> str:
     content = _canonical_instructions()
     if name == "claude_skill.md":
         return _SKILL_HEADER + content + "\n\n" + _claude_subagent_appendix()
+    if name == "codex_skill.md":
+        return _SKILL_HEADER + content + "\n\n" + _codex_subagent_appendix()
     if name == "skill.md":
         return _SKILL_HEADER + content
     if name == "cursor_rule.mdc":
@@ -406,7 +534,7 @@ def bundled_global_file(name: str) -> str:
 
 _GLOBAL_TARGETS = [
     {"agent": "claude", "detect": ".claude", "path": ".claude/skills/megaplan/SKILL.md", "data": "claude_skill.md"},
-    {"agent": "codex", "detect": ".codex", "path": ".codex/skills/megaplan/SKILL.md", "data": "skill.md"},
+    {"agent": "codex", "detect": ".codex", "path": ".codex/skills/megaplan/SKILL.md", "data": "codex_skill.md"},
     {"agent": "cursor", "detect": ".cursor", "path": ".cursor/rules/megaplan.mdc", "data": "cursor_rule.mdc"},
 ]
 
@@ -642,10 +770,11 @@ def build_parser() -> argparse.ArgumentParser:
     step_move_parser.add_argument("--after", required=True)
 
     override_parser = subparsers.add_parser("override")
-    override_parser.add_argument("override_action", choices=["abort", "force-proceed", "add-note", "replan"])
+    override_parser.add_argument("override_action", choices=["abort", "force-proceed", "add-note", "replan", "set-robustness"])
     override_parser.add_argument("--plan")
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")
+    override_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default=None)
 
     debt_parser = subparsers.add_parser("debt", help="Inspect or manage persistent tech debt entries")
     debt_subparsers = debt_parser.add_subparsers(dest="debt_action", required=True)
@@ -762,9 +891,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"unrecognized arguments: {' '.join(remaining)}")
         if args.command == "override" and args.override_action == "add-note" and not args.note:
             raise CliError("invalid_args", "override add-note requires a note")
+        if args.command == "override" and args.override_action == "set-robustness" and not args.robustness:
+            raise CliError("invalid_args", f"override set-robustness requires --robustness {'|'.join(ROBUSTNESS_LEVELS)}")
         return render_response(handler(root, args))
     except CliError as error:
-        return error_response(error)
+        return error_response(error, root=root)
 
 
 if __name__ == "__main__":

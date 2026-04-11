@@ -80,7 +80,7 @@ _EXECUTE_REQUIREMENTS_TEMPLATE = textwrap.dedent(
     - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
     - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
     - When verifying changes, run the entire test file or module (e.g., `pytest tests/test_foo.py`), not individual test functions. Individual tests miss regressions in the same module.
-    - If a test fails and you determine the failure is pre-existing (fails without your changes too), you MUST still re-run the FULL test suite with your changes applied. Pre-existing failures do not excuse you from verifying all other tests still pass. Never narrow to individual test functions and stop.
+    - finalize.json includes baseline_test_failures — a list of test IDs that were already failing before your changes. If a test fails and its ID appears in baseline_test_failures, it is pre-existing — do not scope-creep into fixing it. If baseline_test_failures is null, the baseline could not be captured; use your judgment but err on the side of assuming failures are regressions. You MUST still re-run the FULL test suite with your changes applied — pre-existing failures do not excuse skipping verification. Never narrow to individual test functions and stop.
     - Before declaring the work complete, write a short script (not a full test) that reproduces the exact bug or incorrect behavior described in the task. Run it to confirm the fix resolves the issue. Then delete the script so it does not appear in the final diff. If the task description is too vague to write a concrete reproduction, note this explicitly in executor_notes.
     - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
     - Use the tasks in `finalize.json` as the execution boundary.
@@ -89,6 +89,8 @@ _EXECUTE_REQUIREMENTS_TEMPLATE = textwrap.dedent(
     - Always use full read-modify-write updates for `{checkpoint_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
     - Structured output remains the authoritative final summary for this step. Disk writes are progress checkpoints for timeout recovery only.
     - Return `task_updates` with one object per completed or skipped task.
+    - `task_updates[].status` must be either `done` or `skipped`. Never return `pending` in execute output.
+    - If a task is blocked by environment limits, missing devices, or manual-only validation that cannot happen in this session, return `status: "skipped"` and explain the remaining manual follow-up in `executor_notes` and `deviations`.
     - Return `sense_check_acknowledgments` with one object per sense check.
     - Keep `executor_notes` verification-focused: explain why your changes are correct. The diff already shows what changed; notes should cover edge cases caught, expected behaviors confirmed, or design choices made.
     - Follow this JSON shape exactly:
@@ -378,7 +380,7 @@ def _execute_batch_prompt(
         - Keep `executor_notes` verification-focused.
         - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, checkpoint task and sense-check updates there (not `finalize.json`). The harness owns `finalize.json`.
         - When verifying changes, run the entire test file or module, not individual test functions. Individual tests miss regressions.
-        - If a test fails and you determine the failure is pre-existing (fails without your changes too), you MUST still re-run the FULL test suite with your changes applied. Pre-existing failures do not excuse you from verifying all other tests still pass. Never narrow to individual test functions and stop.
+        - finalize.json includes baseline_test_failures — a list of test IDs that were already failing before your changes. If a test fails and its ID appears in baseline_test_failures, it is pre-existing — do not scope-creep into fixing it. If baseline_test_failures is null, the baseline could not be captured; use your judgment but err on the side of assuming failures are regressions. You MUST still re-run the FULL test suite with your changes applied — pre-existing failures do not excuse skipping verification. Never narrow to individual test functions and stop.
         - If this batch includes the final verification task, write a short script that reproduces the exact bug described in the task, run it to confirm the fix resolves it, then delete the script.
         """
     ).strip()

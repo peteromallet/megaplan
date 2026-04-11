@@ -277,7 +277,7 @@ DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "review": "codex",
 }
 KNOWN_AGENTS = ["claude", "codex", "hermes"]
-ROBUSTNESS_LEVELS = ("tiny", "light", "standard", "heavy")
+ROBUSTNESS_LEVELS = ("tiny", "light", "standard", "robust", "superrobust")
 def parse_agent_spec(spec: str) -> tuple[str, str | None]:
     """Parse 'hermes:model/name' → ('hermes', 'model/name') or 'claude' → ('claude', None)."""
     if ":" in spec:
@@ -300,7 +300,7 @@ DEFAULTS = {
     "execution.robustness": "standard",
     "execution.worker_timeout_seconds": 7200,
     "execution.max_review_rework_cycles": 3,
-    "execution.max_heavy_review_rework_cycles": 2,
+    "execution.max_robust_review_rework_cycles": 2,
     "execution.max_execute_no_progress": 3,
     "orchestration.max_critique_concurrency": 2,
     "orchestration.mode": "subagent",
@@ -317,7 +317,7 @@ _SETTABLE_ENUM = {
 _SETTABLE_NUMERIC = {
     "execution.worker_timeout_seconds",
     "execution.max_review_rework_cycles",
-    "execution.max_heavy_review_rework_cycles",
+    "execution.max_robust_review_rework_cycles",
     "execution.max_execute_no_progress",
     "orchestration.max_critique_concurrency",
 }

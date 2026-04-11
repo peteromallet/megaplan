@@ -4,6 +4,8 @@ import argparse
 import inspect
 import logging
 import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ import megaplan.workers as worker_module
 from megaplan.checks import checks_for_robustness, validate_critique_checks
 from megaplan.execution import (
     _check_done_task_evidence,
+    build_monitor_hint,
     handle_execute_auto_loop as dispatch_execute_auto_loop,
     handle_execute_one_batch as dispatch_execute_one_batch,
 )
@@ -52,6 +55,7 @@ from megaplan._core import (
     apply_session_update,
     atomic_write_json,
     atomic_write_text,
+    build_next_step_runtime,
     clear_active_step,
     configured_robustness,
     ensure_runtime_layout,
@@ -81,6 +85,11 @@ from megaplan._core import (
     workflow_transition,
     workflow_next,
 )
+from megaplan._core.phase_runtime import (
+    DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS,
+    PHASE_RUNTIME_POLICY,
+    format_duration_hint,
+)
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
     build_gate_artifact,
@@ -106,6 +115,16 @@ def _append_to_meta(state: PlanState, field: str, value: Any) -> None:
 def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> None:
     if hasattr(args, "_agent_fallback"):
         response["agent_fallback"] = args._agent_fallback
+
+
+def _attach_next_step_runtime(response: StepResponse) -> None:
+    runtime = build_next_step_runtime(
+        response.get("next_step"),
+        configured_timeout_seconds=int(get_effective("execution", "worker_timeout_seconds")),
+    )
+    if runtime is not None:
+        response["next_step_runtime"] = runtime
+
 
 def _build_review_blocked_message(
     *,
@@ -135,6 +154,16 @@ def _is_substantive_reviewer_verdict(text: str) -> bool:
 _AUTO_NEXT_STEP = object()
 
 
+def _emit_phase_notice(step: str) -> None:
+    if step not in PHASE_RUNTIME_POLICY:
+        return
+    duration_hint = format_duration_hint(
+        step,
+        configured_timeout_seconds=DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS,
+    )
+    print(f"[megaplan] Starting {step}... {duration_hint}", file=sys.stderr)
+
+
 def _run_worker(
     step: str,
     state: PlanState,
@@ -150,6 +179,7 @@ def _run_worker(
     failure_iteration = state["iteration"] if iteration is None else iteration
     agent, mode, refreshed, model = resolved or resolve_agent_mode(step, args)
     run_id = set_active_step(state, step=step, agent=agent, mode=mode, model=model)
+    _emit_phase_notice(step)
     save_state(plan_dir, state)
     try:
         run_step_kwargs: dict[str, Any] = {
@@ -249,11 +279,13 @@ def _finish_step(
         "step": step,
         "summary": summary,
         "artifacts": artifacts,
+        "monitor_hint": build_monitor_hint(plan_dir),
         "next_step": resolved_next,
         "state": state["current_state"],
     }
     if response_fields:
         response.update(response_fields)
+    _attach_next_step_runtime(response)
     attach_agent_fallback(response, args)
     return response
 
@@ -316,6 +348,8 @@ def _write_plan_version(
 
 
 def _write_finalize_artifacts(plan_dir: Path, payload: dict[str, Any], state: PlanState) -> str:
+    baseline = _capture_test_baseline(Path(state["config"]["project_dir"]), state.get("config", {}))
+    payload.update(baseline)
     _ensure_verification_task(payload, state)
     _reconcile_validation_after_mutation(payload)
     atomic_write_json(plan_dir / "finalize.json", payload)
@@ -680,7 +714,7 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
     )
     save_state(plan_dir, state)
     next_steps = workflow_next(state)
-    return {
+    response: StepResponse = {
         "success": True,
         "step": "init",
         "plan": plan_name,
@@ -691,6 +725,8 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
         "auto_approve": auto_approve,
         "robustness": robustness,
     }
+    _attach_next_step_runtime(response)
+    return response
 
 
 def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -1015,55 +1051,128 @@ def _ensure_verification_task(payload: dict, state: dict) -> None:
     # Check if last task is already a verification task
     last_desc = (tasks[-1].get("description") or "").lower()
     test_keywords = ("run test", "run the test", "verify", "verification", "pytest", "test suite", "run existing test")
-    if any(kw in last_desc for kw in test_keywords):
-        return
+    has_verification_task = any(kw in last_desc for kw in test_keywords)
 
-    # Build the verification task
-    all_ids = [t["id"] for t in tasks]
-    next_num = max((int(t["id"].lstrip("T")) for t in tasks if t["id"].startswith("T")), default=0) + 1
-    task_id = f"T{next_num}"
+    if not has_verification_task:
+        # Build the verification task
+        all_ids = [t["id"] for t in tasks]
+        next_num = max((int(t["id"].lstrip("T")) for t in tasks if t["id"].startswith("T")), default=0) + 1
+        task_id = f"T{next_num}"
 
-    # Pull specific test IDs from the original prompt if available
-    idea = state.get("idea", "") or ""
-    notes = "\n".join(state.get("notes", []) or [])
-    source_text = idea + "\n" + notes
+        # Pull specific test IDs from the original prompt if available
+        idea = state.get("idea", "") or ""
+        notes = "\n".join(state.get("notes", []) or [])
+        source_text = idea + "\n" + notes
 
-    if "FAIL_TO_PASS" in source_text or "test must pass" in source_text.lower() or "verification" in source_text.lower():
-        desc = (
-            "Run the tests specified in the task description to verify the fix — run the full test file/module, not just individual functions. "
-            "Run the project's existing test suite — do NOT create new test files. "
-            "If any test fails, read the error, fix the code, and re-run until all tests pass."
+        if "FAIL_TO_PASS" in source_text or "test must pass" in source_text.lower() or "verification" in source_text.lower():
+            desc = (
+                "Run the tests specified in the task description to verify the fix — run the full test file/module, not just individual functions. "
+                "Run the project's existing test suite — do NOT create new test files. "
+                "If any test fails, read the error, fix the code, and re-run until all tests pass."
+            )
+        else:
+            desc = (
+                "Run tests relevant to the changed files to verify correctness and check for regressions — run the full test file/module, not just individual functions. "
+                "Find and run the project's existing test suite — do NOT create new test files. "
+                "If any test fails, read the error, fix the code, and re-run until all tests pass."
+            )
+
+        verification_task = {
+            "id": task_id,
+            "description": desc,
+            "depends_on": [all_ids[-1]],
+            "status": "pending",
+            "executor_notes": "",
+            "files_changed": [],
+            "commands_run": [],
+            "evidence_files": [],
+            "reviewer_verdict": "",
+        }
+        tasks.append(verification_task)
+
+        # Add a sense check for it
+        sense_checks = payload.get("sense_checks", [])
+        sc_num = max((int(sc["id"].lstrip("SC")) for sc in sense_checks if sc["id"].startswith("SC")), default=0) + 1
+        sense_checks.append({
+            "id": f"SC{sc_num}",
+            "task_id": task_id,
+            "question": "Did the verification tests pass? Were any regressions found and fixed?",
+            "executor_note": "",
+            "verdict": "",
+        })
+
+    failures = payload.get("baseline_test_failures")
+    if isinstance(failures, list) and failures:
+        tasks[-1]["description"] += (
+            f" Note: {len(failures)} tests were already failing before your changes "
+            "(see baseline_test_failures in finalize.json) — do not scope-creep into fixing these."
         )
-    else:
-        desc = (
-            "Run tests relevant to the changed files to verify correctness and check for regressions — run the full test file/module, not just individual functions. "
-            "Find and run the project's existing test suite — do NOT create new test files. "
-            "If any test fails, read the error, fix the code, and re-run until all tests pass."
-        )
 
-    verification_task = {
-        "id": task_id,
-        "description": desc,
-        "depends_on": [all_ids[-1]],
-        "status": "pending",
-        "executor_notes": "",
-        "files_changed": [],
-        "commands_run": [],
-        "evidence_files": [],
-        "reviewer_verdict": "",
+
+def _capture_test_baseline(project_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    if os.getenv(MOCK_ENV_VAR) == "1":
+        return {
+            "baseline_test_failures": [],
+            "baseline_test_command": "pytest --tb=no -q --no-header",
+        }
+
+    configured_command = config.get("test_command")
+    cmd_string: str | None = None
+
+    if isinstance(configured_command, str) and configured_command.strip():
+        cmd_string = configured_command.strip()
+        if cmd_string.startswith("pytest"):
+            cmd_string = f"{cmd_string} --tb=no -q --no-header"
+    elif shutil.which("pytest"):
+        cmd_string = "pytest --tb=no -q --no-header"
+
+    if cmd_string is None:
+        return {
+            "baseline_test_failures": None,
+            "baseline_test_command": None,
+            "baseline_test_note": (
+                "No supported test runner detected on PATH (looked for: pytest). "
+                "Configure test_command in state config to specify one."
+            ),
+        }
+
+    try:
+        result = subprocess.run(
+            cmd_string,
+            shell=True,
+            cwd=project_dir,
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "baseline_test_failures": None,
+            "baseline_test_command": cmd_string,
+            "baseline_test_note": (
+                f"Baseline test capture timed out after 120 seconds while running: {cmd_string}"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "baseline_test_failures": None,
+            "baseline_test_command": None,
+            "baseline_test_note": f"Baseline capture crashed: {exc}",
+        }
+
+    failures: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line.endswith(" FAILED"):
+            continue
+        test_id = line[: -len(" FAILED")].strip()
+        if test_id:
+            failures.append(test_id)
+
+    return {
+        "baseline_test_failures": failures,
+        "baseline_test_command": cmd_string,
     }
-    tasks.append(verification_task)
-
-    # Add a sense check for it
-    sense_checks = payload.get("sense_checks", [])
-    sc_num = max((int(sc["id"].lstrip("SC")) for sc in sense_checks if sc["id"].startswith("SC")), default=0) + 1
-    sense_checks.append({
-        "id": f"SC{sc_num}",
-        "task_id": task_id,
-        "question": "Did the verification tests pass? Were any regressions found and fixed?",
-        "executor_note": "",
-        "verdict": "",
-    })
 
 
 def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -1114,6 +1223,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         if not refreshed and _is_rework_reexecution(state):
             refreshed = True
         run_id = set_active_step(state, step="execute", agent=agent, mode=mode, model=model)
+        _emit_phase_notice("execute")
         save_state(plan_dir, state)
         try:
             if getattr(args, "batch", None) is not None:
@@ -1171,6 +1281,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             save_state(plan_dir, state)
             response["state"] = STATE_DONE
             response["next_step"] = None
+            response.pop("next_step_runtime", None)
         else:
             save_state(plan_dir, state)
         attach_agent_fallback(response, args)
@@ -1251,8 +1362,8 @@ def _resolve_review_outcome(
     rework_requested = review_verdict == "needs_rework"
     if rework_requested:
         cap_key = (
-            "max_heavy_review_rework_cycles"
-            if robustness == "heavy"
+            "max_robust_review_rework_cycles"
+            if robustness in {"robust", "superrobust"}
             else "max_review_rework_cycles"
         )
         max_review_rework_cycles = get_effective("execution", cap_key)
@@ -1337,13 +1448,13 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         require_state(state, "review", {STATE_EXECUTED})
         robustness = configured_robustness(state)
         pre_check_flags: list[dict[str, Any]] = []
-        if robustness in {"standard", "heavy"}:
+        if robustness in {"standard", "robust", "superrobust"}:
             pre_check_flags = run_pre_checks(plan_dir, state, Path(state["config"]["project_dir"]))
-        if robustness in {"standard", "light"}:
+        if robustness in {"standard", "light", "robust"}:
             resolved = None
             prompt_override = None
             prompt_kwargs = None
-            if robustness == "standard":
+            if robustness in {"standard", "robust"}:
                 resolved = resolve_agent_mode("review", args)
                 if _supports_prompt_kwargs(worker_module.run_step_with_worker):
                     prompt_kwargs = {"pre_check_flags": pre_check_flags}
@@ -1365,7 +1476,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
                 prompt_override=prompt_override,
                 prompt_kwargs=prompt_kwargs,
             )
-            if robustness == "standard":
+            if robustness in {"standard", "robust"}:
                 worker.payload["pre_check_flags"] = pre_check_flags
                 update_flags_after_review(plan_dir, worker.payload, iteration=state["iteration"])
             atomic_write_json(plan_dir / "review.json", worker.payload)
@@ -1441,19 +1552,22 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
                     "step": "review",
                     "summary": summary,
                     "artifacts": ["review.json", "finalize.json", "final.md"],
+                    "monitor_hint": build_monitor_hint(plan_dir),
                     "next_step": next_step,
                     "state": next_state,
                     "issues": issues,
                     "rework_items": list(worker.payload.get("rework_items", [])),
                 }
+                _attach_next_step_runtime(response)
                 attach_agent_fallback(response, args)
                 return response
 
             run_id = None
             try:
                 run_id = set_active_step(state, step="review", agent=agent_type, mode=mode, model=model)
+                _emit_phase_notice("review")
                 save_state(plan_dir, state)
-                checks = review_checks.checks_for_robustness("heavy")
+                checks = review_checks.checks_for_robustness("superrobust")
                 parallel_result = run_parallel_review(
                     state,
                     plan_dir,
@@ -1567,11 +1681,13 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
             "step": "review",
             "summary": summary,
             "artifacts": ["review.json", "finalize.json", "final.md"],
+            "monitor_hint": build_monitor_hint(plan_dir),
             "next_step": next_step,
             "state": next_state,
             "issues": issues,
             "rework_items": list(worker.payload.get("rework_items", [])),
         }
+        _attach_next_step_runtime(response)
         attach_agent_fallback(response, args)
         return response
 
@@ -1586,13 +1702,15 @@ def _override_add_note(root: Path, plan_dir: Path, state: PlanState, args: argpa
     _append_to_meta(state, "overrides", {"action": "add-note", "timestamp": now_utc(), "note": note})
     save_state(plan_dir, state)
     next_steps = infer_next_steps(state)
-    return {
+    response: StepResponse = {
         "success": True,
         "step": "override",
         "summary": "Attached note to the plan.",
         "next_step": next_steps[0] if next_steps else None,
         "state": state["current_state"],
     }
+    _attach_next_step_runtime(response)
+    return response
 
 
 def _override_abort(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
@@ -1668,7 +1786,7 @@ def _override_force_proceed(root: Path, plan_dir: Path, state: PlanState, args: 
     state["last_gate"] = {}
     _append_to_meta(state, "overrides", {"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
-    return {
+    response: StepResponse = {
         "success": True,
         "step": "override",
         "summary": "Force-proceeded past gate judgment into gated state.",
@@ -1677,6 +1795,8 @@ def _override_force_proceed(root: Path, plan_dir: Path, state: PlanState, args: 
         "orchestrator_guidance": gate["orchestrator_guidance"],
         "debt_entries_added": len(unresolved_flags),
     }
+    _attach_next_step_runtime(response)
+    return response
 
 
 def _override_replan(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
@@ -1696,7 +1816,7 @@ def _override_replan(root: Path, plan_dir: Path, state: PlanState, args: argpars
         _append_to_meta(state, "notes", {"timestamp": now_utc(), "note": args.note})
     save_state(plan_dir, state)
     next_steps = workflow_next(state)
-    return {
+    response: StepResponse = {
         "success": True,
         "step": "override",
         "summary": f"Re-entered planning loop at iteration {state['iteration']}. Reason: {reason}",
@@ -1705,6 +1825,53 @@ def _override_replan(root: Path, plan_dir: Path, state: PlanState, args: argpars
         "plan_file": str(plan_file),
         "message": f"Edit {plan_file.name} to incorporate your changes, then run the next step.",
     }
+    _attach_next_step_runtime(response)
+    return response
+
+
+def _override_set_robustness(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+    new_level = getattr(args, "robustness", None)
+    if new_level not in ROBUSTNESS_LEVELS:
+        raise CliError(
+            "invalid_args",
+            f"override set-robustness requires --robustness {'|'.join(ROBUSTNESS_LEVELS)}",
+        )
+    if state["current_state"] in {STATE_DONE, STATE_ABORTED}:
+        raise CliError(
+            "invalid_transition",
+            f"set-robustness cannot be applied to a plan in terminal state '{state['current_state']}'",
+        )
+    previous_level = state["config"].get("robustness", "standard")
+    state["config"]["robustness"] = new_level
+    _append_to_meta(
+        state,
+        "overrides",
+        {
+            "action": "set-robustness",
+            "timestamp": now_utc(),
+            "from": previous_level,
+            "to": new_level,
+            "reason": args.reason,
+        },
+    )
+    save_state(plan_dir, state)
+    next_steps = infer_next_steps(state)
+    summary = (
+        f"Robustness unchanged at '{new_level}'."
+        if previous_level == new_level
+        else f"Robustness changed from '{previous_level}' to '{new_level}'. Takes effect on the next phase."
+    )
+    response: StepResponse = {
+        "success": True,
+        "step": "override",
+        "summary": summary,
+        "next_step": next_steps[0] if next_steps else None,
+        "state": state["current_state"],
+        "previous_robustness": previous_level,
+        "robustness": new_level,
+    }
+    _attach_next_step_runtime(response)
+    return response
 
 
 _OVERRIDE_ACTIONS: dict[str, Callable[[Path, Path, PlanState, argparse.Namespace], StepResponse]] = {
@@ -1712,6 +1879,7 @@ _OVERRIDE_ACTIONS: dict[str, Callable[[Path, Path, PlanState, argparse.Namespace
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
     "replan": _override_replan,
+    "set-robustness": _override_set_robustness,
 }
 
 

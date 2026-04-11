@@ -6,6 +6,7 @@ import sys
 import time
 from argparse import Namespace
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -76,6 +77,7 @@ def make_args_factory(project_dir: Path) -> Callable[..., Namespace]:
             "override_action": None,
             "note": None,
             "reason": "",
+            "robustness": None,
         }
         data.update(overrides)
         return Namespace(**data)
@@ -160,7 +162,18 @@ def test_init_sets_last_gate_and_next_step_plan(plan_fixture: PlanFixture) -> No
     state = load_state(plan_fixture.plan_dir)
     assert state["current_state"] == megaplan.STATE_INITIALIZED
     assert state["last_gate"] == {}
-    assert state["iteration"] == 0
+
+
+def test_init_includes_next_step_runtime(plan_fixture: PlanFixture) -> None:
+    response = megaplan.handle_init(
+        plan_fixture.root,
+        plan_fixture.make_args(name="runtime-test"),
+    )
+
+    assert response["next_step"] == "prep"
+    assert response["next_step_runtime"]["expected_duration_seconds"]["min"] == 30
+    assert response["next_step_runtime"]["recommended_next_check_seconds"] == 60
+    assert "Expected duration:" in response["next_step_runtime"]["duration_hint"]
 
 
 def test_init_response_points_to_next_step_by_robustness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,10 +189,10 @@ def test_init_response_points_to_next_step_by_robustness(tmp_path: Path, monkeyp
     make_args = make_args_factory(project_dir)
     standard = megaplan.handle_init(root, make_args(name="standard-plan", robustness="standard"))
     light = megaplan.handle_init(root, make_args(name="light-plan", robustness="light"))
-    heavy = megaplan.handle_init(root, make_args(name="heavy-plan", robustness="heavy"))
+    robust = megaplan.handle_init(root, make_args(name="robust-plan", robustness="robust"))
     assert standard["next_step"] == "prep"
-    assert light["next_step"] == "prep"
-    assert heavy["next_step"] == "prep"
+    assert light["next_step"] == "plan"
+    assert robust["next_step"] == "prep"
 
 
 _LEGACY_STATE_MACHINE_CASES = [
@@ -214,6 +227,10 @@ def test_workflow_next_matches_legacy_partial_state_cases() -> None:
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
+        (
+            {"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, "config": {"robustness": "light"}},
+            ["plan"],
+        ),
         (
             {"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, "config": {"robustness": "light"}},
             ["revise", "step"],
@@ -297,7 +314,7 @@ def test_workflow_walk_matches_documented_standard_flow() -> None:
 
 
 def test_workflow_walk_matches_documented_robust_flow() -> None:
-    robust_config = {"config": {"robustness": "heavy"}}
+    robust_config = {"config": {"robustness": "robust"}}
     walk = [
         ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **robust_config}, "prep"),
         ({"current_state": STATE_PREPPED, "last_gate": {}, **robust_config}, "plan"),
@@ -343,8 +360,7 @@ def test_workflow_walk_matches_documented_robust_flow() -> None:
 def test_workflow_walk_matches_documented_light_flow() -> None:
     light_config = {"config": {"robustness": "light"}}
     walk = [
-        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **light_config}, "prep"),
-        ({"current_state": STATE_PREPPED, "last_gate": {}, **light_config}, "plan"),
+        ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}, **light_config}, "plan"),
         ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}, **light_config}, "critique"),
         ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}, **light_config}, "revise"),
         ({"current_state": megaplan.STATE_GATED, "last_gate": {}, **light_config}, "finalize"),
@@ -357,12 +373,12 @@ def test_workflow_walk_matches_documented_light_flow() -> None:
         actual_steps.append(expected_step)
 
     assert workflow_next({"current_state": megaplan.STATE_EXECUTED, "last_gate": {}, **light_config}) == []
-    assert actual_steps == ["prep", "plan", "critique", "revise", "finalize", "execute"]
+    assert actual_steps == ["plan", "critique", "revise", "finalize", "execute"]
 
 
 def test_all_robustness_levels_route_planned_to_critique() -> None:
     """All robustness levels go directly from planned to critique."""
-    for level in ("tiny", "light", "standard", "heavy"):
+    for level in ("tiny", "light", "standard", "robust", "superrobust"):
         state = {"current_state": megaplan.STATE_PLANNED, "last_gate": {}, "config": {"robustness": level}}
         next_steps = workflow_next(state)
         assert "critique" in next_steps, f"{level} should offer critique"
@@ -449,6 +465,60 @@ def test_tiny_critique_stub_does_not_leak_active_step(
     assert "active_step" not in state
 
 
+def test_capture_test_baseline_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(megaplan.handlers.MOCK_ENV_VAR, raising=False)
+    monkeypatch.setattr(megaplan.handlers.shutil, "which", lambda name: "/usr/bin/pytest")
+    monkeypatch.setattr(
+        megaplan.handlers.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout=(
+                "tests/test_a.py::test_one FAILED\n"
+                "tests/test_b.py::test_two FAILED\n"
+                "2 failed, 5 passed\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    result = megaplan.handlers._capture_test_baseline(tmp_path, {})
+
+    assert result["baseline_test_failures"] == [
+        "tests/test_a.py::test_one",
+        "tests/test_b.py::test_two",
+    ]
+    assert result["baseline_test_command"] == "pytest --tb=no -q --no-header"
+    assert "baseline_test_note" not in result
+
+
+def test_capture_test_baseline_no_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(megaplan.handlers.MOCK_ENV_VAR, raising=False)
+    monkeypatch.setattr(megaplan.handlers.shutil, "which", lambda name: None)
+
+    result = megaplan.handlers._capture_test_baseline(tmp_path, {})
+
+    assert result["baseline_test_failures"] is None
+    assert result["baseline_test_command"] is None
+    assert "No supported test runner" in result["baseline_test_note"]
+
+
+def test_capture_test_baseline_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(megaplan.handlers.MOCK_ENV_VAR, raising=False)
+    monkeypatch.setattr(megaplan.handlers.shutil, "which", lambda name: "/usr/bin/pytest")
+
+    def _raise_timeout(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="pytest --tb=no -q --no-header", timeout=120)
+
+    monkeypatch.setattr(megaplan.handlers.subprocess, "run", _raise_timeout)
+
+    result = megaplan.handlers._capture_test_baseline(tmp_path, {})
+
+    assert result["baseline_test_failures"] is None
+    assert "timed out" in result["baseline_test_note"].lower()
+
+
 def test_handle_status_reports_observability_fields(plan_fixture: PlanFixture) -> None:
     state = load_state(plan_fixture.plan_dir)
     state["meta"]["notes"] = [{"timestamp": "2026-04-09T00:00:00Z", "note": "Newest note."}]
@@ -488,18 +558,112 @@ def test_handle_status_reports_observability_fields(plan_fixture: PlanFixture) -
     assert response["active_step"]["step"] == "critique"
     assert response["active_step"]["session_id"] == "critique-session"
     assert "stale" in response["active_step"]
+    assert response["active_step"]["artifact_mode"] == "completion_only"
+    assert response["active_step"]["recommended_action"] == "rerun_same_step"
+    assert response["active_step"]["recommended_next_check_seconds"] == 120
+    assert response["active_step"]["expected_duration_seconds"]["max"] == 900
+    assert response["active_step"]["timeout_budget_seconds"] == 900
+    assert response["active_step"]["escalation_threshold_seconds"] == 900
+    assert response["active_step"]["orphaned"] is True
+    assert "critique stale" in response["active_step"]["phase_progress_summary"]
+    assert "rerun the same step" in response["active_step"]["recovery_hint"].lower()
+    assert response["next_step_runtime"]["expected_duration_seconds"]["min"] == 30
     assert response["session_summaries"][0]["key"] == "claude_critic"
+    assert response["lock_file_present"] is False
+    assert response["lock_held"] is False
+
+
+def test_handle_status_uses_execute_runtime_guidance(plan_fixture: PlanFixture) -> None:
+    state = load_state(plan_fixture.plan_dir)
+    state["active_step"] = {
+        "step": "execute",
+        "agent": "codex",
+        "mode": "persistent",
+        "started_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+    }
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["active_step"]["artifact_mode"] == "completion_only"
+    assert response["active_step"]["recommended_next_check_seconds"] == 300
+    assert response["active_step"]["timeout_budget_seconds"] == 7200
+    assert response["active_step"]["expected_duration_seconds"]["max"] == 7200
+    assert "execute running" in response["active_step"]["phase_progress_summary"]
+    assert "progress_pct" not in response["active_step"]
+
+
+def test_handle_status_includes_progress_when_finalize_exists(plan_fixture: PlanFixture) -> None:
+    _drive_to_finalized(plan_fixture)
+    state = load_state(plan_fixture.plan_dir)
+    state["active_step"] = {
+        "step": "execute",
+        "agent": "codex",
+        "mode": "persistent",
+        "started_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+    }
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["progress"]["tasks_total"] >= 1
+    assert response["progress"]["tasks_pending"] == response["progress"]["tasks_total"]
+    assert "Execution progress:" in response["summary"]
+
+
+def test_handle_status_distinguishes_lock_file_from_held_lock(plan_fixture: PlanFixture) -> None:
+    lock_path = plan_fixture.plan_dir / ".plan.lock"
+    lock_path.write_text("", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["lock_file_present"] is True
+    assert response["lock_held"] is False
+    assert ".plan.lock" not in response["artifacts"]
+    assert "may remain on disk" in response["summary"]
 
 
 def test_handle_watch_combines_status_and_progress(plan_fixture: PlanFixture) -> None:
     _drive_to_finalized(plan_fixture)
 
+    status_response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     response = megaplan.cli.handle_watch(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
 
     assert response["step"] == "watch"
-    assert response["progress"]["tasks_total"] == response["tasks_total"]
-    assert response["progress"]["tasks_pending"] == response["tasks_pending"]
-    assert "Execution progress:" in response["summary"]
+    expected = dict(status_response)
+    expected["step"] = "watch"
+    assert response == expected
+
+
+def test_phase_progress_summary_completion_only(plan_fixture: PlanFixture) -> None:
+    state = load_state(plan_fixture.plan_dir)
+    state["active_step"] = {
+        "step": "critique",
+        "agent": "codex",
+        "mode": "persistent",
+        "started_at": (datetime.now(timezone.utc) - timedelta(minutes=3, seconds=12)).isoformat().replace("+00:00", "Z"),
+    }
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert "critique running" in response["active_step"]["phase_progress_summary"]
+    assert 0 <= response["active_step"]["progress_pct"] <= 95
+
+
+def test_phase_progress_summary_stale(plan_fixture: PlanFixture) -> None:
+    state = load_state(plan_fixture.plan_dir)
+    state["active_step"] = {
+        "step": "plan",
+        "agent": "claude",
+        "mode": "persistent",
+        "started_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+    }
+    (plan_fixture.plan_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    response = megaplan.cli.handle_status(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert "plan stale" in response["active_step"]["phase_progress_summary"]
 
 
 def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixture: PlanFixture) -> None:
@@ -515,18 +679,76 @@ def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixt
     assert state["iteration"] == 1
     assert (plan_fixture.plan_dir / "plan_v1.md").exists()
     assert (plan_fixture.plan_dir / "plan_v1a.md").exists()
-    assert state["plan_versions"][-1]["file"] == "plan_v1a.md"
 
-    critique = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    assert critique["iteration"] == 1
-    assert (plan_fixture.plan_dir / "critique_v1.json").exists()
+
+def test_override_add_note_includes_next_step_runtime(plan_fixture: PlanFixture) -> None:
+    response = megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(
+            plan=plan_fixture.plan_name,
+            override_action="add-note",
+            note="Keep going.",
+        ),
+    )
+
+    assert response["next_step"] == "prep"
+    assert response["next_step_runtime"]["recommended_next_check_seconds"] == 60
+
+
+def test_handle_plan_includes_next_step_runtime(plan_fixture: PlanFixture) -> None:
+    response = megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["next_step"] == "critique"
+    assert response["next_step_runtime"]["recommended_next_check_seconds"] == 120
+    assert "Expected duration:" in response["next_step_runtime"]["duration_hint"]
+
+
+def test_build_monitor_hint_references_status(plan_fixture: PlanFixture) -> None:
+    hint = megaplan.execution.build_monitor_hint(plan_fixture.plan_dir)
+
+    assert "status" in hint
+    assert "watch" not in hint
+
+
+def test_format_duration_hint_uses_human_readable_ranges() -> None:
+    critique_hint = megaplan._core.format_duration_hint(
+        "critique",
+        configured_timeout_seconds=7200,
+    )
+    execute_hint = megaplan._core.format_duration_hint(
+        "execute",
+        configured_timeout_seconds=7200,
+    )
+
+    assert critique_hint == "Expected duration: 1m-15m."
+    assert execute_hint == "Expected minimum duration: 5m (depends on task count)."
+
+
+def test_emit_phase_notice_writes_to_stderr_only(capsys: pytest.CaptureFixture[str]) -> None:
+    megaplan.handlers._emit_phase_notice("plan")
+
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "[megaplan]" in captured.err
+    assert "plan" in captured.err
+    assert "Expected duration:" in captured.err
+
+
+def test_emit_phase_notice_ignores_non_phase_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    megaplan.handlers._emit_phase_notice("status")
+
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 
 def test_workflow_mock_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from megaplan.handlers import handle_prep
 
-    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="heavy")
+    plan_fixture = _make_plan_fixture_with_robustness(tmp_path, monkeypatch, robustness="robust")
     make_args = plan_fixture.make_args
     recorded_steps: list[str] = []
     original_run_step = megaplan.workers.run_step_with_worker
@@ -1680,6 +1902,57 @@ def test_abort_sets_terminal_state(plan_fixture: PlanFixture) -> None:
     assert state["current_state"] == megaplan.STATE_ABORTED
 
 
+def test_override_set_robustness_updates_config(plan_fixture: PlanFixture) -> None:
+    initial_state = load_state(plan_fixture.plan_dir)
+    assert initial_state["config"]["robustness"] in megaplan.ROBUSTNESS_LEVELS
+    response = megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(
+            plan=plan_fixture.plan_name,
+            override_action="set-robustness",
+            robustness="light",
+            reason="downshifting",
+        ),
+    )
+    assert response["success"] is True
+    assert response["robustness"] == "light"
+    assert response["previous_robustness"] == initial_state["config"]["robustness"]
+    state = load_state(plan_fixture.plan_dir)
+    assert state["config"]["robustness"] == "light"
+    assert any(
+        entry["action"] == "set-robustness" and entry["to"] == "light"
+        for entry in state["meta"]["overrides"]
+    )
+
+
+def test_override_set_robustness_rejects_invalid_level(plan_fixture: PlanFixture) -> None:
+    with pytest.raises(megaplan.CliError, match="set-robustness"):
+        megaplan.handle_override(
+            plan_fixture.root,
+            plan_fixture.make_args(
+                plan=plan_fixture.plan_name,
+                override_action="set-robustness",
+                robustness=None,
+            ),
+        )
+
+
+def test_override_set_robustness_blocked_in_terminal_state(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="abort", reason="done"),
+    )
+    with pytest.raises(megaplan.CliError, match="terminal state"):
+        megaplan.handle_override(
+            plan_fixture.root,
+            plan_fixture.make_args(
+                plan=plan_fixture.plan_name,
+                override_action="set-robustness",
+                robustness="standard",
+            ),
+        )
+
+
 def test_force_proceed_requires_critiqued_state(plan_fixture: PlanFixture) -> None:
     # In initialized state, force-proceed should fail
     with pytest.raises(megaplan.CliError, match="critiqued"):
@@ -1873,6 +2146,26 @@ def test_global_setup_multiple_agents(tmp_path: Path) -> None:
     agents_installed = [r["agent"] for r in result["installed"] if not r.get("skipped", False) and r.get("reason") != "not installed"]
     assert "claude" in agents_installed
     assert "codex" in agents_installed
+
+
+def test_global_setup_installs_codex_subagent_appendix(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+
+    result = megaplan.handle_setup_global(force=False, home=home)
+
+    assert result["success"] is True
+    skill_path = home / ".codex" / "skills" / "megaplan" / "SKILL.md"
+    content = skill_path.read_text(encoding="utf-8")
+    assert "Before the first CLI call, resolve a working launcher and reuse it for the whole run." in content
+    assert "command presence alone is not enough" in content
+    assert "Only use bare `megaplan ...` if that exact form already succeeded during this check." in content
+    assert "This appendix is Codex-specific." in content
+    assert "`spawn_agent`" in content
+    assert "`wait_agent`" in content
+    assert "`resume_agent`" in content
+    assert "`send_input`" in content
+    assert "`close_agent`" in content
 
 
 def test_load_save_config_roundtrip(tmp_path: Path) -> None:

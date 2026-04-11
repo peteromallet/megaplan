@@ -1,4 +1,4 @@
-"""Cheap advisory pre-checks for heavy review."""
+"""Cheap advisory pre-checks for robust/superrobust review."""
 
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def _source_touch_flags(metadata: _DiffMetadata) -> list[dict[str, str]]:
         return [
             _pre_check_flag(
                 "source_touch",
-                "No changed files were detected in the git diff, so heavy review cannot confirm that package source changed.",
+                "No changed files were detected in the git diff, so review cannot confirm that package source changed.",
                 severity="significant",
             )
         ]

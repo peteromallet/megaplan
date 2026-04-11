@@ -22,7 +22,7 @@ from megaplan.hermes_worker import _toolsets_for_phase, clean_parsed_payload, pa
 from megaplan.prompts.review import (
     _write_criteria_verdict_review_template,
     _write_single_check_review_template,
-    heavy_criteria_review_prompt,
+    parallel_criteria_review_prompt,
     single_check_review_prompt,
 )
 from megaplan.types import CliError, PlanState
@@ -210,7 +210,7 @@ def _run_criteria_verdict(
     from run_agent import AIAgent
 
     output_path = _write_criteria_verdict_review_template(plan_dir, state, "review_criteria_verdict.json")
-    prompt = heavy_criteria_review_prompt(state, plan_dir, root, output_path)
+    prompt = parallel_criteria_review_prompt(state, plan_dir, root, output_path)
     resolved_model, agent_kwargs = _resolve_model(model)
 
     _model_lower = (resolved_model or "").lower()

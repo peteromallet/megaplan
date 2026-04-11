@@ -38,7 +38,7 @@ def test_tiny_robustness_matches_light_artifacts_and_stub_payloads(
     standard_fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="standard")
 
     _plan_dir, tiny_initial_state = load_plan(tiny_fixture.root, tiny_fixture.plan_name)
-    assert "prep" in megaplan.infer_next_steps(tiny_initial_state)
+    assert "plan" in megaplan.infer_next_steps(tiny_initial_state)
 
     tiny_critique, tiny_post_critique_state, tiny_result = _advance_tiny_to_executed(tiny_fixture)
     _advance_to_executed(light_fixture)

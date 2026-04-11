@@ -28,7 +28,7 @@ def _state(project_dir: Path, *, iteration: int = 1) -> PlanState:
         "config": {
             "project_dir": str(project_dir),
             "auto_approve": False,
-            "robustness": "heavy",
+            "robustness": "superrobust",
         },
         "sessions": {},
         "plan_versions": [
@@ -100,7 +100,7 @@ def test_run_parallel_review_merges_check_results_in_original_order(
     tmp_path: Path,
 ) -> None:
     plan_dir, _project_dir, state = _scaffold(tmp_path)
-    checks = checks_for_robustness("heavy")
+    checks = checks_for_robustness("superrobust")
     criteria_payload = _build_mock_payload("review", state, plan_dir, review_verdict="approved")
     call_counts = {"criteria": 0, "checks": 0}
 
@@ -248,7 +248,7 @@ def test_run_check_uses_single_check_prompt_and_review_toolset(
     assert tt == 0
 
 
-def test_run_criteria_verdict_uses_heavy_review_prompt_and_review_toolset(
+def test_run_criteria_verdict_uses_parallel_review_prompt_and_review_toolset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -284,7 +284,7 @@ def test_run_criteria_verdict_uses_heavy_review_prompt_and_review_toolset(
     sys.modules["hermes_state"].SessionDB = FakeSessionDB
     monkeypatch.setattr("megaplan.parallel_review._resolve_model", lambda model: ("mock-model", {}))
     monkeypatch.setattr(
-        "megaplan.parallel_review.heavy_criteria_review_prompt",
+        "megaplan.parallel_review.parallel_criteria_review_prompt",
         lambda state, plan_dir, root, output_path: prompt_calls.append(output_path.name) or "criteria-review-prompt",
     )
     monkeypatch.setattr(

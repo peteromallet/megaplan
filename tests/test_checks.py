@@ -27,12 +27,14 @@ def _payload_for(checks: tuple[dict[str, str], ...]) -> dict[str, object]:
 
 
 def test_checks_for_robustness_returns_expected_check_sets() -> None:
-    heavy_checks = checks_for_robustness("heavy")
+    robust_checks = checks_for_robustness("robust")
+    superrobust_checks = checks_for_robustness("superrobust")
     standard_checks = checks_for_robustness("standard")
     light_checks = checks_for_robustness("light")
     tiny_checks = checks_for_robustness("tiny")
 
-    assert len(heavy_checks) == 8
+    assert len(robust_checks) == 8
+    assert len(superrobust_checks) == 8
     assert [check["id"] for check in standard_checks] == [
         "issue_hints",
         "correctness",

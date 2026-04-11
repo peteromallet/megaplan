@@ -1,5 +1,12 @@
 # Megaplan
 Route every step through the `megaplan` CLI. Never call agents directly.
+Before the first CLI call, resolve a working launcher and reuse it for the whole run. Do not assume `megaplan` itself is on `PATH`; command presence alone is not enough. Prove the launcher works by successfully running a harmless CLI call with it first. In the instructions below, treat `<launcher>` as that verified command.
+Launcher resolution order:
+1. Try `python -m megaplan config show`.
+2. If that fails, try `./.venv/bin/python -m megaplan config show`.
+3. If that fails, try `uv run python -m megaplan config show`.
+4. If that fails, try a version-selected shim such as `PYENV_VERSION=3.11.11 megaplan config show`.
+5. Only use bare `megaplan ...` if that exact form already succeeded during this check.
 ## Triage
 Pick the right level based on the task:
 - **Skip megaplan**: single-file fixes, bug fixes with clear cause, simple refactors, config changes, adding tests for existing code. Just do it.
@@ -9,9 +16,9 @@ Pick the right level based on the task:
 
 Default to standard unless the task is clearly simple enough for light. Do not ask the user to choose robustness — pick it yourself based on the above. Only ask execution mode (auto-approve or review) when using megaplan.
 ## Start
-Run `megaplan config show` before `init`. If `raw_config.execution.auto_approve` is explicitly present, do not ask the execution-mode question and honor that configured override, including configured `false`. If that raw key is absent, ask execution mode (auto-approve or review) before `init`. In the same config check, respect `execution.robustness` as a settable override when it is configured; otherwise pick robustness yourself per the triage guidance above.
+Run `<launcher> config show` before `init`. If `raw_config.execution.auto_approve` is explicitly present, do not ask the execution-mode question and honor that configured override, including configured `false`. If that raw key is absent, ask execution mode (auto-approve or review) before `init`. In the same config check, respect `execution.robustness` as a settable override when it is configured; otherwise pick robustness yourself per the triage guidance above.
 ```bash
-megaplan init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|standard|heavy] "$IDEA"
+<launcher> init --project-dir "$PROJECT_DIR" [--auto-approve] [--robustness light|standard|robust|superrobust] "$IDEA"
 ```
 Report the plan name, execution mode, robustness, current state, and next step.
 ## Workflow
@@ -24,10 +31,11 @@ Run the loop in this order:
 6. `finalize`
 7. `execute`
 8. `review`
-Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
-At `--robustness light`, the loop is: `prep` → `plan` → `critique` → `revise` → `finalize` → `execute`. `prep` can still return `skip: true` for trivial work, so this adds visibility without forcing a long investigation. There is no gate and no review.
+Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals. When a response includes `next_step_runtime`, use its `duration_hint` and `recommended_next_check_seconds` to calibrate timing.
+At `--robustness light`, the loop is: `plan` → `critique` → `revise` → `finalize` → `execute`. There is no prep, no gate, and no review.
 At `--robustness standard`, the loop is: `prep` → `plan` → `critique` → `gate` → ...
-At `--robustness heavy`, the loop is also `prep` → `plan` → `critique` → `gate` → ... but uses 8 critique checks instead of 4.
+At `--robustness robust`, the loop is also `prep` → `plan` → `critique` → `gate` → ... but uses 8 critique checks instead of 4 and enables parallel critique.
+At `--robustness superrobust`, the loop is the same as robust but also enables parallel review.
 ## Step Rules
 - `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`. Each criterion is `{"criterion": "...", "priority": "must|should|info"}`. `must` = hard gate (reviewer blocks), `should` = quality target (reviewer flags but doesn't block), `info` = human reference (reviewer skips).
 - `prep`: make repository investigation explicit before planning. Respect `skip: true` when the task is already concrete enough.
@@ -57,6 +65,7 @@ Between batches, poll progress:
 ```bash
 megaplan progress --plan <name>
 ```
+Use `megaplan status --plan <name>` for the full plan state, including active-step timing and any `next_step_runtime` guidance from the latest response.
 Per-batch mode uses global batch numbering (1-indexed, computed from ALL tasks). Each `--batch N` call:
 - Validates that batches 1..N-1 are complete
 - Executes only batch N's tasks
@@ -99,7 +108,6 @@ Settable execution keys: `execution.auto_approve`, `execution.robustness`.
 ```bash
 megaplan status --plan <name>
 megaplan progress --plan <name>
-megaplan watch --plan <name>
 megaplan audit --plan <name>
 megaplan list
 megaplan prep --plan <name>

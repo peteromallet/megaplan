@@ -4,7 +4,7 @@ from megaplan.types import (
     PlanState, PlanConfig, PlanMeta, FlagRecord, StepResponse,
     STATE_INITIALIZED, STATE_PLANNED, STATE_CRITIQUED,
     STATE_GATED, STATE_FINALIZED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
-    TERMINAL_STATES, MOCK_ENV_VAR,
+    TERMINAL_STATES, MOCK_ENV_VAR, ROBUSTNESS_LEVELS,
     CliError,
 )
 from megaplan._core import (
@@ -50,7 +50,7 @@ __all__ = [
     # State constants
     "STATE_INITIALIZED", "STATE_PLANNED", "STATE_CRITIQUED",
     "STATE_GATED", "STATE_FINALIZED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
-    "TERMINAL_STATES", "MOCK_ENV_VAR",
+    "TERMINAL_STATES", "MOCK_ENV_VAR", "ROBUSTNESS_LEVELS",
     # Error and result types
     "CliError", "CommandResult", "WorkerResult",
     # Handlers

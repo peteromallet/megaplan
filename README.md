@@ -83,21 +83,21 @@ GEMINI_API_KEY=...         # for google: prefix
 
 - **light** — visible `prep` + one critique/revise pass, no gate or review
 - **standard** — visible `prep` + 4 critique checks (default)
-- **heavy** — visible `prep` + 8 critique checks
+- **robust** — visible `prep` + 8 critique checks + parallel critique
+- **superrobust** — same as robust + parallel review
 
 ## Observability
 
 ```bash
 megaplan status --plan <name>
-megaplan watch --plan <name>
 ```
 
-`status` exposes additive lifecycle fields such as `active_step`, `last_step`, notes, cost, and session summaries.
-`watch` adds the current execution-progress snapshot in the same machine-readable response.
+`status` is the single monitoring command. It exposes lifecycle fields such as `active_step`, `last_step`, notes, cost, execute progress, and next-step runtime guidance.
+`watch` remains as a backward-compatible alias to `status`.
 
-## Subagent mode (Claude Code)
+## Subagent mode (Claude Code / Codex)
 
-Subagent mode delegates the full workflow to an autonomous Claude Code agent, returning control only at defined breakpoints. It is the default orchestration mode for Claude Code. Codex and Cursor continue to run inline.
+Subagent mode delegates the full workflow to an autonomous agent, returning control only at defined breakpoints. It is the default orchestration mode for Claude Code and Codex. Cursor continues to run inline.
 
 ```bash
 megaplan config set orchestration.mode subagent   # default
@@ -110,7 +110,7 @@ View all settings with `megaplan config show`. Override with `megaplan config se
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `orchestration.mode` | `subagent` | `inline` or `subagent` (Claude Code only) |
+| `orchestration.mode` | `subagent` | `inline` or `subagent` (Claude Code and Codex) |
 | `orchestration.max_critique_concurrency` | `2` | Max parallel critique checks |
 | `execution.worker_timeout_seconds` | `7200` | Worker process timeout (seconds) |
 | `execution.max_execute_no_progress` | `3` | No-progress execute attempts before escalation |

@@ -174,7 +174,13 @@ def test_finalize_schema_tracks_structured_execution_fields() -> None:
     assert "tasks" in finalize["properties"]
     assert "sense_checks" in finalize["properties"]
     assert "validation" in finalize["properties"]
+    assert "baseline_test_failures" in finalize["properties"]
+    assert "baseline_test_command" in finalize["properties"]
+    assert "baseline_test_note" in finalize["properties"]
     assert "validation" in finalize["required"]
+    assert "baseline_test_failures" not in finalize["required"]
+    assert "baseline_test_command" not in finalize["required"]
+    assert "baseline_test_note" not in finalize["required"]
     assert "final_plan" not in finalize["properties"]
     assert "task_count" not in finalize["properties"]
     task_schema = finalize["properties"]["tasks"]["items"]
@@ -240,7 +246,7 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     assert rework_item["properties"]["source"]["type"] == ["string", "null"]
 
 
-def test_review_schema_accepts_heavy_mode_extensions_in_both_copies() -> None:
+def test_review_schema_accepts_parallel_mode_extensions_in_both_copies() -> None:
     payload = {
         "review_verdict": "needs_rework",
         "checks": [

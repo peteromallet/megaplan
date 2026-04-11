@@ -75,7 +75,7 @@ def _review_template_payload(plan_dir: Path) -> dict[str, object]:
     }
 
 
-def _heavy_review_context(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+def _parallel_review_context(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     project_dir = Path(state["config"]["project_dir"])
     gate = read_json(plan_dir / "gate.json")
     settled_decisions = gate.get("settled_decisions", [])
@@ -196,7 +196,7 @@ def single_check_review_prompt(
     pre_check_flags: list[dict[str, Any]],
 ) -> str:
     del root
-    context = _heavy_review_context(state, plan_dir)
+    context = _parallel_review_context(state, plan_dir)
     check_id = _check_field(check, "id")
     question = _check_field(check, "question")
     guidance = _check_field(check, "guidance") or ""
@@ -209,7 +209,7 @@ def single_check_review_prompt(
         ).format(iteration=iteration)
     return textwrap.dedent(
         f"""
-        You are an independent heavy-review checker. Review one focused dimension of the executed patch against the original issue text.
+        You are an independent parallel-review checker. Review one focused dimension of the executed patch against the original issue text.
 
         Project directory:
         {context["project_dir"]}
@@ -254,21 +254,21 @@ def single_check_review_prompt(
     ).strip()
 
 
-def heavy_criteria_review_prompt(
+def parallel_criteria_review_prompt(
     state: PlanState,
     plan_dir: Path,
     root: Path | None,
     output_path: Path,
 ) -> str:
-    """Build the heavy-mode criteria review prompt.
+    """Build the parallel-mode criteria review prompt.
 
     This intentionally does not wrap `_review_prompt()`. The brief literally
-    asked to keep `_review_prompt()` as the heavy criteria check, but that would
+    asked to keep `_review_prompt()` as the parallel criteria check, but that would
     leak plan/gate/execution context that conflicts with the stronger
     issue-anchored review contract. This divergence is deliberate.
     """
     del root
-    context = _heavy_review_context(state, plan_dir)
+    context = _parallel_review_context(state, plan_dir)
     return textwrap.dedent(
         f"""
         Review the execution against the original issue text and the finalized execution criteria.
@@ -300,6 +300,7 @@ def heavy_criteria_review_prompt(
           - If a criterion cannot be verified in this context, mark it `waived` with an explanation.
         - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
         - The settled decisions above are already approved. Verify implementation against them, but do not re-litigate them.
+        - baseline_test_failures in finalize.json lists tests that were already failing before execution. Do not flag these as rework items unless the executor introduced new failures in those same tests.
         - `rework_items` must be structured and directly actionable. Populate `issues` as one-line summaries derived from `rework_items`.
         - When approved, keep both `issues` and `rework_items` empty arrays.
         """
@@ -502,6 +503,7 @@ def _review_prompt(
           - If a criterion (any priority) cannot be verified in this context (e.g., requires manual testing or runtime observation), mark it `waived` with an explanation.
         - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
         {settled_decisions_instruction}
+        - baseline_test_failures in finalize.json lists tests that were already failing before execution. Do not flag these as rework items unless the executor introduced new failures in those same tests.
         - {task_guidance}
         - {sense_check_guidance}
         - Follow this JSON shape exactly:

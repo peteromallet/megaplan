@@ -70,11 +70,13 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         - Update the plan to address the significant issues.
         - Keep the plan readable and executable.
         - Return flags_addressed with the exact flag IDs you addressed.
+        - Include `changes_summary` as a short plain-English summary of what changed in the revision. If there were no concrete flags, say that explicitly (for example: `No critique flags were raised; refined wording and kept the plan aligned for execution.`).
         - Preserve or improve success criteria quality. Each criterion must have a `priority` of `must`, `should`, or `info`. Promote or demote priorities if critique feedback reveals a criterion was over- or under-weighted.
         - Verify that the plan remains aligned with the user's original intent, not just internal plan quality.
         - Remove unjustified scope growth. If critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
         - Maintain the structural template: H1 title, ## Overview, phase sections with numbered step sections, ## Execution Order or ## Validation Order.
         - CRITICAL: Your entire revised plan markdown (all sections) must be output as the `plan` field in the structured output. The prose response must not contain the plan text.
+        - CRITICAL: Return only the structured JSON object for the schema fields `plan`, `changes_summary`, `flags_addressed`, `assumptions`, `success_criteria`, and `questions`. Do not add commentary before or after the JSON object.
 
         {PLAN_TEMPLATE}
         """
@@ -276,6 +278,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
             Each finding needs:
             - "detail": what you specifically checked and what you found (at least a full sentence)
             - "flagged": true if this describes a difference, risk, or tension — even if you think it's justified. false only if purely informational with no possible downside.
+            - Every check must end with at least one finding. Never leave a `findings` array empty. If you found no issue, add one detailed `flagged: false` finding explaining what you checked and why it appears clear.
 
             When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees.
 
@@ -337,6 +340,7 @@ def single_check_critique_prompt(
         Each finding needs:
         - "detail": what you specifically checked and what you found (at least a full sentence)
         - "flagged": true if this describes a difference, risk, or tension — even if you think it's justified. false only if purely informational with no possible downside.
+        - This check must end with at least one finding. Never leave its `findings` array empty. If you found no issue, add one detailed `flagged: false` finding explaining what you checked and why it appears clear.
 
         When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees.
 

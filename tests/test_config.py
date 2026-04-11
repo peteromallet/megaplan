@@ -107,7 +107,7 @@ def test_config_set_execution_auto_approve_invalid_token(isolated_config_dir: Pa
         )
 
 
-@pytest.mark.parametrize("value", ["tiny", "light", "standard", "heavy"])
+@pytest.mark.parametrize("value", ["tiny", "light", "standard", "robust", "superrobust"])
 def test_config_set_execution_robustness_enum(
     isolated_config_dir: Path,
     value: str,
@@ -129,7 +129,7 @@ def test_config_set_execution_robustness_enum(
 def test_config_set_execution_robustness_invalid_value(isolated_config_dir: Path) -> None:
     with pytest.raises(
         megaplan.CliError,
-        match=r"execution\.robustness must be one of: tiny, light, standard, heavy",
+        match=r"execution\.robustness must be one of: tiny, light, standard, robust, superrobust",
     ):
         megaplan.handle_config(
             Namespace(
@@ -201,19 +201,19 @@ def test_build_parser_init_flags_are_tristate() -> None:
 
     parsed = parser.parse_args(["init", "--project-dir", "/tmp", "idea"])
     explicit = parser.parse_args(
-        ["init", "--project-dir", "/tmp", "--auto-approve", "--robustness", "heavy", "idea"]
+        ["init", "--project-dir", "/tmp", "--auto-approve", "--robustness", "robust", "idea"]
     )
 
     assert parsed.auto_approve is None
     assert parsed.robustness is None
     assert explicit.auto_approve is True
-    assert explicit.robustness == "heavy"
+    assert explicit.robustness == "robust"
 
 
 def test_handle_init_uses_config_defaults_when_flags_omitted(isolated_config_dir: Path, tmp_path: Path) -> None:
     isolated_config_dir.mkdir(parents=True, exist_ok=True)
     (isolated_config_dir / "config.json").write_text(
-        json.dumps({"execution": {"auto_approve": True, "robustness": "heavy"}}),
+        json.dumps({"execution": {"auto_approve": True, "robustness": "robust"}}),
         encoding="utf-8",
     )
     root = tmp_path / "root"
@@ -236,9 +236,9 @@ def test_handle_init_uses_config_defaults_when_flags_omitted(isolated_config_dir
     state = json.loads((root / ".megaplan" / "plans" / response["plan"] / "state.json").read_text(encoding="utf-8"))
 
     assert response["auto_approve"] is True
-    assert response["robustness"] == "heavy"
+    assert response["robustness"] == "robust"
     assert state["config"]["auto_approve"] is True
-    assert state["config"]["robustness"] == "heavy"
+    assert state["config"]["robustness"] == "robust"
 
 
 def test_handle_init_explicit_robustness_beats_config_default(
@@ -247,7 +247,7 @@ def test_handle_init_explicit_robustness_beats_config_default(
 ) -> None:
     isolated_config_dir.mkdir(parents=True, exist_ok=True)
     (isolated_config_dir / "config.json").write_text(
-        json.dumps({"execution": {"auto_approve": True, "robustness": "heavy"}}),
+        json.dumps({"execution": {"auto_approve": True, "robustness": "robust"}}),
         encoding="utf-8",
     )
     root = tmp_path / "root"

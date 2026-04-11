@@ -137,7 +137,7 @@ def build_check_category_map() -> dict[str, str]:
 
 
 def checks_for_robustness(robustness: str) -> tuple[CritiqueCheckSpec, ...]:
-    if robustness == "heavy":
+    if robustness in {"robust", "superrobust"}:
         return CRITIQUE_CHECKS
     if robustness in {"light", "tiny"}:
         return ()

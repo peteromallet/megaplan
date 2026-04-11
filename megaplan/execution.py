@@ -12,8 +12,10 @@ from megaplan._core import (
     atomic_write_json,
     atomic_write_text,
     batch_artifact_path,
+    build_next_step_runtime,
     compute_global_batches,
     compute_task_batches,
+    get_effective,
     list_batch_artifacts,
     load_config,
     make_history_entry,
@@ -65,6 +67,19 @@ class BatchResult:
     missing_task_evidence: list[str]
     execution_audit: dict[str, Any]
     finalize_hash: str
+
+
+def build_monitor_hint(plan_dir: Path) -> str:
+    return f"Use `megaplan status --plan {plan_dir.name}` for updates."
+
+
+def _attach_next_step_runtime(response: StepResponse) -> None:
+    runtime = build_next_step_runtime(
+        response.get("next_step"),
+        configured_timeout_seconds=int(get_effective("execution", "worker_timeout_seconds")),
+    )
+    if runtime is not None:
+        response["next_step_runtime"] = runtime
 
 
 def _format_execute_tracking_note(
@@ -638,6 +653,7 @@ def handle_execute_one_batch(
         "step": "execute",
         "summary": summary,
         "artifacts": artifacts,
+        "monitor_hint": build_monitor_hint(plan_dir),
         "next_step": next_step,
         "state": response_state,
         "batch": batch_number,
@@ -651,6 +667,7 @@ def handle_execute_one_batch(
     }
     if next_step == "execute" and not blocked:
         response["guidance"] = f"Run --batch {batch_number + 1}"
+    _attach_next_step_runtime(response)
     return response
 
 
@@ -975,6 +992,7 @@ def handle_execute_auto_loop(
         "step": "execute",
         "summary": summary,
         "artifacts": artifacts,
+        "monitor_hint": build_monitor_hint(plan_dir),
         "next_step": "execute" if blocked or timeout_error is not None else "review",
         "state": (
             STATE_FINALIZED if blocked or timeout_error is not None else STATE_EXECUTED
@@ -985,4 +1003,5 @@ def handle_execute_auto_loop(
         "auto_approve": auto_approve,
         "user_approved_gate": user_approved_gate,
     }
+    _attach_next_step_runtime(response)
     return response

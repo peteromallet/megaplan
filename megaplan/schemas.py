@@ -303,6 +303,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "coverage_complete",
                 ],
             },
+            "baseline_test_failures": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+            },
+            "baseline_test_command": {"type": ["string", "null"]},
+            "baseline_test_note": {"type": "string"},
         },
         "required": ["tasks", "watch_items", "sense_checks", "meta_commentary", "validation"],
     },

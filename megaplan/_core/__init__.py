@@ -41,6 +41,20 @@ from .io import (
     slugify,
 )
 
+# -- phase_runtime.py: centralized runtime policy ----------------------------
+from .phase_runtime import (
+    DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS,
+    PHASE_RUNTIME_POLICY,
+    build_next_step_runtime,
+    build_phase_observability,
+    format_duration_hint,
+    humanize_seconds,
+    phase_runtime_policy,
+    phase_stale_seconds,
+    phase_timeout_seconds,
+    resolve_phase_runtime,
+)
+
 # -- state.py: plan state, history, sessions ---------------------------------
 from .state import (
     active_plan_dirs,
@@ -56,6 +70,7 @@ from .state import (
     load_plan_locked,
     make_history_entry,
     plan_lock,
+    plan_lock_is_held,
     plan_lock_path,
     record_step_failure,
     resolve_plan_dir,
@@ -132,6 +147,17 @@ __all__ = [
     "sha256_file",
     "sha256_text",
     "slugify",
+    # phase_runtime
+    "DEFAULT_NON_EXECUTE_TIMEOUT_CAP_SECONDS",
+    "PHASE_RUNTIME_POLICY",
+    "build_next_step_runtime",
+    "build_phase_observability",
+    "format_duration_hint",
+    "humanize_seconds",
+    "phase_runtime_policy",
+    "phase_stale_seconds",
+    "phase_timeout_seconds",
+    "resolve_phase_runtime",
     # state
     "active_plan_dirs",
     "active_step_is_stale",
@@ -146,6 +172,7 @@ __all__ = [
     "load_plan_locked",
     "make_history_entry",
     "plan_lock",
+    "plan_lock_is_held",
     "plan_lock_path",
     "record_step_failure",
     "resolve_plan_dir",

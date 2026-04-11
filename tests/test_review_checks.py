@@ -30,7 +30,8 @@ def test_review_checks_registry_has_expected_ids_and_no_criteria_verdict() -> No
 
 
 def test_checks_for_robustness_matches_expected_tiers() -> None:
-    assert [check.id for check in checks_for_robustness("heavy")] == [check.id for check in REVIEW_CHECKS]
+    assert [check.id for check in checks_for_robustness("robust")] == [check.id for check in REVIEW_CHECKS]
+    assert [check.id for check in checks_for_robustness("superrobust")] == [check.id for check in REVIEW_CHECKS]
     # All 4 remaining checks are core-tier, so standard mode would return the
     # same set — but standard mode is gated out of parallel_review entirely in
     # handlers.py, so this value is unused in practice. Retained for parity

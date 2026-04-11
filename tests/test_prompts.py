@@ -26,7 +26,7 @@ from megaplan.prompts.review import (
     _review_prompt,
     _settled_decisions_block,
     _settled_decisions_instruction,
-    heavy_criteria_review_prompt,
+    parallel_criteria_review_prompt,
 )
 from megaplan.prompts import (
     _execute_batch_prompt,
@@ -312,6 +312,7 @@ def _baseline_codex_review_prompt_snapshot(state: PlanState, plan_dir: Path) -> 
           - If a criterion (any priority) cannot be verified in this context (e.g., requires manual testing or runtime observation), mark it `waived` with an explanation.
         - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
         {settled_decisions_instruction}
+        - baseline_test_failures in finalize.json lists tests that were already failing before execution. Do not flag these as rework items unless the executor introduced new failures in those same tests.
         - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
         - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
         - Follow this JSON shape exactly:
@@ -863,6 +864,18 @@ def test_execute_prompt_includes_previous_review_when_present(tmp_path: Path) ->
     assert "Need another execute pass." in prompt
 
 
+def test_execute_prompt_forbids_pending_task_updates_and_explains_manual_skip(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+
+    prompt = create_claude_prompt("execute", state, plan_dir)
+
+    assert '`task_updates[].status` must be either `done` or `skipped`.' in prompt
+    assert 'Never return `pending` in execute output.' in prompt
+    assert 'missing devices' in prompt
+    assert 'manual-only validation' in prompt
+    assert 'return `status: "skipped"`' in prompt
+
+
 def test_execute_batch_prompt_scopes_tasks_and_sense_checks(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     atomic_write_json(
@@ -1011,7 +1024,7 @@ def test_review_prompt_omits_settled_decisions_when_empty(tmp_path: Path) -> Non
     assert "Settled decisions (verify the executor implemented these correctly)" not in prompt
 
 
-def test_heavy_criteria_review_prompt_uses_issue_anchored_context_only(
+def test_parallel_criteria_review_prompt_uses_issue_anchored_context_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1033,7 +1046,7 @@ def test_heavy_criteria_review_prompt_uses_issue_anchored_context_only(
         lambda project_dir: "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n+print('patched')\n",
     )
 
-    prompt = heavy_criteria_review_prompt(state, plan_dir, tmp_path, plan_dir / "review_criteria_verdict.json")
+    prompt = parallel_criteria_review_prompt(state, plan_dir, tmp_path, plan_dir / "review_criteria_verdict.json")
 
     assert "Approved plan:" not in prompt
     assert "Plan metadata:" not in prompt

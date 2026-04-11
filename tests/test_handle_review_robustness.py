@@ -159,7 +159,7 @@ def test_handle_review_standard_branch_attaches_prechecks_and_updates_flags(
 
     def _fail_parallel(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise AssertionError("standard review should not invoke heavy review helpers")
+        raise AssertionError("standard review should not invoke parallel review helpers")
 
     monkeypatch.setattr(megaplan.handlers, "run_parallel_review", _fail_parallel)
 
@@ -247,7 +247,7 @@ def test_handle_review_light_branch_skips_prechecks_and_keeps_payload_byte_ident
     assert (fixture.plan_dir / "review.json").read_bytes() == golden_path.read_bytes()
 
 
-def test_resolve_review_outcome_uses_standard_and_heavy_caps_separately() -> None:
+def test_resolve_review_outcome_uses_standard_and_robust_caps_separately() -> None:
     state = {
         "history": [
             {"step": "review", "result": "needs_rework"},
@@ -256,7 +256,7 @@ def test_resolve_review_outcome_uses_standard_and_heavy_caps_separately() -> Non
     }
 
     standard_issues: list[str] = []
-    heavy_issues: list[str] = []
+    robust_issues: list[str] = []
 
     standard_result = megaplan.handlers._resolve_review_outcome(
         "needs_rework",
@@ -269,28 +269,28 @@ def test_resolve_review_outcome_uses_standard_and_heavy_caps_separately() -> Non
         state,
         standard_issues,
     )
-    heavy_result = megaplan.handlers._resolve_review_outcome(
+    robust_result = megaplan.handlers._resolve_review_outcome(
         "needs_rework",
         2,
         2,
         2,
         2,
         [],
-        "heavy",
+        "robust",
         state,
-        heavy_issues,
+        robust_issues,
     )
 
     assert standard_result == ("needs_rework", megaplan.STATE_FINALIZED, "execute")
-    assert heavy_result == ("success", megaplan.STATE_DONE, None)
-    assert any("Max review rework cycles (2) reached" in issue for issue in heavy_issues)
+    assert robust_result == ("success", megaplan.STATE_DONE, None)
+    assert any("Max review rework cycles (2) reached" in issue for issue in robust_issues)
 
 
-def test_handle_review_heavy_path_merges_parallel_review_and_creates_review_rework(
+def test_handle_review_superrobust_path_merges_parallel_review_and_creates_review_rework(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="heavy")
+    fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="superrobust")
     _advance_to_executed(fixture)
     _plan_dir, state = load_plan(fixture.root, fixture.plan_name)
     coverage = megaplan.review_checks.get_check_by_id("coverage")
@@ -345,7 +345,7 @@ def test_handle_review_heavy_path_merges_parallel_review_and_creates_review_rewo
     monkeypatch.setattr(
         megaplan.handlers.worker_module,
         "run_step_with_worker",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("heavy Hermes review should not use the legacy worker")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("superrobust Hermes review should not use the legacy worker")),
     )
 
     response = megaplan.handle_review(fixture.root, fixture.make_args(plan=fixture.plan_name))
@@ -466,11 +466,11 @@ def test_rework_item_task_id_is_scoped_by_check_id() -> None:
         assert item["task_id"] != "REVIEW"
 
 
-def test_handle_review_heavy_iteration_two_marks_verified_review_flags(
+def test_handle_review_superrobust_iteration_two_marks_verified_review_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="heavy")
+    fixture = _make_plan_fixture(tmp_path, monkeypatch, robustness="superrobust")
     _advance_to_executed(fixture)
     _plan_dir, state = load_plan(fixture.root, fixture.plan_name)
     state["iteration"] = 2
@@ -536,7 +536,7 @@ def test_handle_review_heavy_iteration_two_marks_verified_review_flags(
     monkeypatch.setattr(
         megaplan.handlers.worker_module,
         "run_step_with_worker",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("heavy Hermes review should not use the legacy worker")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("superrobust Hermes review should not use the legacy worker")),
     )
 
     response = megaplan.handle_review(fixture.root, fixture.make_args(plan=fixture.plan_name))

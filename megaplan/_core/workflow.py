@@ -68,12 +68,17 @@ WORKFLOW: dict[str, list[Transition]] = {
 
 # Each level's *own* overrides (not inherited).  Levels inherit from the
 # level below them via _ROBUSTNESS_HIERARCHY so shared transitions are
-# declared once: heavy has none, standard keeps the planned->critique
-# routing documented explicitly, and light adds gate/review skips.
+# declared once: robust/superrobust have none, standard keeps the
+# planned->critique routing documented explicitly, and light skips
+# prep plus gate/review.
 _ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
-    "heavy": {},
+    "superrobust": {},
+    "robust": {},
     "standard": {},
     "light": {
+        STATE_INITIALIZED: [
+            Transition("plan", STATE_PLANNED),
+        ],
         STATE_CRITIQUED: [
             Transition("revise", STATE_GATED),
         ],
@@ -83,7 +88,8 @@ _ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
 }
 
 _ROBUSTNESS_WORKFLOW_LEVELS: dict[str, tuple[str, ...]] = {
-    "heavy": ("heavy",),
+    "superrobust": ("superrobust",),
+    "robust": ("robust",),
     "standard": ("standard",),
     "light": ("standard", "light"),
     "tiny": ("standard", "light", "tiny"),

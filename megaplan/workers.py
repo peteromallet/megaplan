@@ -28,8 +28,10 @@ from megaplan.types import (
     parse_agent_spec,
 )
 from megaplan._core import (
+    apply_session_update,
     configured_robustness,
     detect_available_agents,
+    phase_timeout_seconds,
     get_effective,
     json_dump,
     latest_plan_meta_path,
@@ -41,9 +43,8 @@ from megaplan._core import (
 from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
-WORKER_TIMEOUT_SECONDS = 7200
 _EXECUTE_STEPS = {"execute", "loop_execute"}
-_CODEX_NON_EXECUTE_TIMEOUT_SECONDS = 300
+_CODEX_TEMPLATE_WRITE_STEPS = {"critique", "review"}
 
 # Shared mapping from step name to schema filename, used by both
 # run_claude_step and run_codex_step.
@@ -168,33 +169,46 @@ _CODEX_ERROR_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 
+def _codex_retry_guidance(step: str | None = None) -> str:
+    if step in _EXECUTE_STEPS:
+        return (
+            "Re-run the same execute step on Codex once before changing agent; "
+            "preserve the existing session path unless a fresh retry is explicitly needed."
+        )
+    return "Re-run the same step on Codex once before changing agent."
+
+
 def _diagnose_codex_failure(raw: str, returncode: int) -> tuple[str, str]:
     """Parse Codex stderr/stdout for known error patterns. Returns (error_code, message)."""
     lower = raw.lower()
     for pattern, code, message in _CODEX_ERROR_PATTERNS:
         if pattern in lower:
-            return code, f"{message}. Try --agent claude to use a different backend."
+            return code, f"{message}. {_codex_retry_guidance()}"
     if re.search(r"\bhttp\s*429\b", lower) or re.search(r"\b429\b", lower):
-        return "rate_limit", "Codex hit a rate limit (HTTP 429). Try --agent claude to use a different backend."
+        return "rate_limit", f"Codex hit a rate limit (HTTP 429). {_codex_retry_guidance()}"
     if re.search(r"\bhttp\s*400\b", lower) or re.search(r"\b400\b", lower):
-        return "schema_error", "Codex API rejected request (HTTP 400). Try --agent claude to use a different backend."
+        return "schema_error", f"Codex API rejected request (HTTP 400). {_codex_retry_guidance()}"
     if re.search(r"\bhttp\s*500\b", lower) or re.search(r"\b500\b", lower):
-        return "api_error", "Codex API returned an internal error (HTTP 500). Try --agent claude to use a different backend."
+        return "api_error", f"Codex API returned an internal error (HTTP 500). {_codex_retry_guidance()}"
     if re.search(r"\bhttp\s*502\b", lower) or re.search(r"\b502\b", lower):
-        return "api_error", "Codex API returned a gateway error (HTTP 502). Try --agent claude to use a different backend."
+        return "api_error", f"Codex API returned a gateway error (HTTP 502). {_codex_retry_guidance()}"
     if re.search(r"\bhttp\s*503\b", lower) or re.search(r"\b503\b", lower):
-        return "api_error", "Codex API service unavailable (HTTP 503). Try --agent claude to use a different backend."
+        return "api_error", f"Codex API service unavailable (HTTP 503). {_codex_retry_guidance()}"
     return "worker_error", (
         f"Codex step failed with exit code {returncode} (no recognized error pattern in output). "
-        "Try --agent claude to use a different backend."
+        + _codex_retry_guidance()
     )
 
 
 def _codex_timeout_for_step(step: str) -> int:
     configured_timeout = int(get_effective("execution", "worker_timeout_seconds"))
-    if step in _EXECUTE_STEPS:
-        return configured_timeout
-    return min(configured_timeout, _CODEX_NON_EXECUTE_TIMEOUT_SECONDS)
+    return phase_timeout_seconds(step, configured_timeout_seconds=configured_timeout)
+
+
+def _codex_exec_mode_flags(step: str) -> list[str]:
+    if step in _EXECUTE_STEPS or step in _CODEX_TEMPLATE_WRITE_STEPS:
+        return ["--full-auto"]
+    return []
 
 
 def _codex_child_env() -> dict[str, str]:
@@ -218,16 +232,6 @@ def _merge_partial_output(raw_output: str, output_path: Path) -> str:
             merged += "\n"
         merged += "[partial_output_file]\n" + partial
     return merged
-
-
-def _critique_payload_has_content(payload: dict[str, Any]) -> bool:
-    checks = payload.get("checks", [])
-    findings = 0
-    if isinstance(checks, list):
-        findings = sum(len(check.get("findings", [])) for check in checks if isinstance(check, dict))
-    if findings > 0:
-        return True
-    return any(bool(payload.get(key)) for key in ("flags", "verified_flag_ids", "disputed_flag_ids"))
 
 
 def extract_session_id(raw: str) -> str | None:
@@ -254,7 +258,11 @@ def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
         raise CliError("parse_error", f"Claude output was not valid JSON: {exc}", extra={"raw_output": raw}) from exc
     if isinstance(envelope, dict) and envelope.get("is_error"):
         message = envelope.get("result") or envelope.get("message") or "Claude returned an error"
-        raise CliError("worker_error", f"Claude step failed: {message}", extra={"raw_output": raw})
+        lower = str(message).lower()
+        error_code = "worker_error"
+        if any(pattern in lower for pattern in ("not logged in", "/login", "unauthorized", "authentication")):
+            error_code = "auth_error"
+        raise CliError(error_code, f"Claude step failed: {message}", extra={"raw_output": raw})
     # When using --json-schema, structured output lives in "structured_output"
     # rather than "result" (which may be empty).
     payload: Any = envelope
@@ -275,22 +283,63 @@ def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return envelope, payload
 
 
-def _extract_json_from_raw(raw: str) -> dict[str, Any] | None:
-    """Try to extract a JSON object from raw agent output.
+def _extract_json_candidates_from_raw(raw: str) -> list[dict[str, Any]]:
+    """Extract plausible JSON payload objects from raw agent output."""
 
-    Handles the common case where a sandbox blocks file writes and the agent
-    dumps the JSON into stdout/stderr wrapped in error text or markdown fences.
-    """
+    def _iter_nested_json_dicts(value: Any) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            candidates.append(value)
+            prioritized_keys = (
+                "structured_output",
+                "result",
+                "payload",
+                "text",
+                "message",
+            )
+            for key in prioritized_keys:
+                if key not in value:
+                    continue
+                nested = value.get(key)
+                candidates.extend(_iter_nested_json_dicts(nested))
+            for nested in value.values():
+                candidates.extend(_iter_nested_json_dicts(nested))
+            return candidates
+        if isinstance(value, list):
+            for item in value:
+                candidates.extend(_iter_nested_json_dicts(item))
+            return candidates
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    return []
+                return _iter_nested_json_dicts(parsed)
+        return []
+
+    candidates: list[dict[str, Any]] = []
+
     # Strategy 1: look for ```json ... ``` fenced blocks
     fenced = re.findall(r"```json\s*\n(.*?)```", raw, re.DOTALL)
     for block in fenced:
         try:
             obj = json.loads(block.strip())
-            if isinstance(obj, dict):
-                return obj
+            candidates.extend(_iter_nested_json_dicts(obj))
         except json.JSONDecodeError:
             continue
-    # Strategy 2: scan for the first decodable JSON object, even when
+    # Strategy 2: parse JSONL/event-stream lines and inspect nested message fields.
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        candidates.extend(_iter_nested_json_dicts(obj))
+    # Strategy 3: scan for the first decodable JSON object, even when
     # additional logs/traces are appended after it.
     decoder = json.JSONDecoder()
     search_start = 0
@@ -303,10 +352,40 @@ def _extract_json_from_raw(raw: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             search_start = brace_start + 1
             continue
-        if isinstance(obj, dict):
-            return obj
+        candidates.extend(_iter_nested_json_dicts(obj))
         search_start = brace_start + 1
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            marker = json_dump(candidate)
+        except Exception:
+            marker = repr(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(candidate)
+    return deduped
+
+
+def _extract_json_from_raw(raw: str) -> dict[str, Any] | None:
+    """Return the first plausible JSON object extracted from raw agent output."""
+    candidates = _extract_json_candidates_from_raw(raw)
+    if candidates:
+        return candidates[0]
     return None
+
+
+def _normalize_codex_payload(step: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if step == "revise" and "changes_summary" not in payload:
+        normalized = dict(payload)
+        flags_addressed = normalized.get("flags_addressed", [])
+        if isinstance(flags_addressed, list) and flags_addressed:
+            normalized["changes_summary"] = "Updated the plan to address the critique and gate feedback."
+        else:
+            normalized["changes_summary"] = "No critique flags were raised; refined the plan for execution."
+        return normalized
+    return payload
 
 
 def parse_json_file(path: Path) -> dict[str, Any]:
@@ -344,28 +423,49 @@ def _recover_codex_payload(
                 payload = parse_json_file(fallback_path)
             except CliError:
                 pass
-    raw_payload = _extract_json_from_raw(raw)
-    if payload is None:
-        payload = raw_payload
-    if payload is not None and step == "critique" and raw_payload is not None:
-        raw_checks = raw_payload.get("checks", [])
-        file_checks = payload.get("checks", [])
-        raw_findings = sum(len(check.get("findings", [])) for check in raw_checks if isinstance(check, dict))
-        file_findings = sum(len(check.get("findings", [])) for check in file_checks if isinstance(check, dict))
-        if raw_findings > file_findings:
-            payload = raw_payload
-    if payload is None:
+    raw_candidates = _extract_json_candidates_from_raw(raw)
+    candidate_payloads: list[dict[str, Any]] = []
+    if payload is not None:
+        candidate_payloads.append(payload)
+    candidate_payloads.extend(raw_candidates)
+    valid_payloads: list[dict[str, Any]] = []
+    for candidate in candidate_payloads:
+        normalized = _normalize_codex_payload(step, candidate)
+        try:
+            validate_payload(step, normalized)
+        except CliError:
+            continue
+        valid_payloads.append(normalized)
+    if not valid_payloads:
         return None
-    try:
-        validate_payload(step, payload)
-    except CliError:
-        return None
-    if step == "critique" and not _critique_payload_has_content(payload):
-        return None
-    return payload
+    if step == "critique" and len(valid_payloads) > 1:
+        def _findings_count(item: dict[str, Any]) -> int:
+            checks = item.get("checks", [])
+            return sum(len(check.get("findings", [])) for check in checks if isinstance(check, dict))
+
+        return max(valid_payloads, key=_findings_count)
+    return valid_payloads[0]
 
 
 def validate_payload(step: str, payload: dict[str, Any]) -> None:
+    if step == "execute":
+        full_required = _STEP_REQUIRED_KEYS.get(step, [])
+        missing_full = [key for key in full_required if key not in payload]
+        if not missing_full:
+            return
+        batch_required = ["task_updates", "sense_check_acknowledgments"]
+        missing_batch = [key for key in batch_required if key not in payload]
+        if not missing_batch:
+            return
+        raise CliError(
+            "parse_error",
+            (
+                "execute output missing required keys: "
+                + ", ".join(missing_full)
+                + ". Batch execute payloads may omit aggregate fields, "
+                + "but must include task_updates and sense_check_acknowledgments."
+            ),
+        )
     required = _STEP_REQUIRED_KEYS.get(step)
     if required is None:
         return
@@ -1019,10 +1119,11 @@ def run_codex_step(
 
     if persistent and session.get("id") and not fresh:
         # codex exec resume does not support --output-schema; we rely on
-        # validate_payload() after parsing the output file instead.
+        # validate_payload() after parsing the output file instead. It also
+        # does not accept --add-dir; resumed sessions keep the workspace that
+        # was granted when the session was created.
         command = ["codex", "exec", "resume"]
-        if step in _EXECUTE_STEPS:
-            command.append("--full-auto")
+        command.extend(_codex_exec_mode_flags(step))
         if json_trace:
             command.append("--json")
         command.extend([
@@ -1031,11 +1132,20 @@ def run_codex_step(
             str(session["id"]), "-",
         ])
     else:
-        command = ["codex", "exec", "--skip-git-repo-check", "-C", str(project_dir), "-o", str(output_path)]
+        command = [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "-C",
+            str(project_dir),
+            "--add-dir",
+            str(plan_dir),
+            "-o",
+            str(output_path),
+        ]
         if not persistent:
             command.append("--ephemeral")
-        if step in _EXECUTE_STEPS:
-            command.append("--full-auto")
+        command.extend(_codex_exec_mode_flags(step))
         if json_trace:
             command.append("--json")
         command.extend(["--output-schema", str(schema_file), "-"])
@@ -1093,7 +1203,7 @@ def run_codex_step(
                 "worker_timeout",
                 (
                     f"Codex {step} step timed out after {timeout_seconds}s before producing structured output. "
-                    "Try re-running later or using --agent claude."
+                    + _codex_retry_guidance(step)
                 ),
                 extra=error.extra,
                 valid_next=error.valid_next,
@@ -1141,6 +1251,24 @@ def _is_agent_available(agent: str) -> bool:
         except ImportError:
             return False
     return bool(shutil.which(agent))
+
+
+def _agent_requested_explicitly(step: str, args: argparse.Namespace) -> bool:
+    if getattr(args, "hermes", None) is not None:
+        return True
+    if getattr(args, "agent", None):
+        return True
+    for phase_model in getattr(args, "phase_model", None) or []:
+        if "=" not in phase_model:
+            continue
+        phase_step, _phase_spec = phase_model.split("=", 1)
+        if phase_step == step:
+            return True
+    return False
+
+
+def _runtime_fallback_candidates(current_agent: str) -> list[str]:
+    return [agent for agent in detect_available_agents() if agent != current_agent]
 
 
 def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None = None) -> tuple[str, str, bool, str | None]:
@@ -1243,38 +1371,87 @@ def run_step_with_worker(
     prompt_kwargs: dict[str, Any] | None = None,
 ) -> tuple[WorkerResult, str, str, bool]:
     agent, mode, refreshed, model = resolved or resolve_agent_mode(step, args)
-    if agent == "hermes":
-        # Deferred import to avoid circular import (hermes_worker imports from workers)
-        from megaplan.hermes_worker import run_hermes_step
-        worker = run_hermes_step(
-            step,
-            state,
-            plan_dir,
-            root=root,
-            fresh=refreshed,
-            model=model,
-            prompt_override=prompt_override,
-        )
-    elif agent == "claude":
-        worker = run_claude_step(
-            step,
-            state,
-            plan_dir,
-            root=root,
-            fresh=refreshed,
-            prompt_override=prompt_override,
-            prompt_kwargs=prompt_kwargs,
-        )
-    else:
-        worker = run_codex_step(
-            step,
-            state,
-            plan_dir,
-            root=root,
-            persistent=(mode == "persistent"),
-            fresh=refreshed,
-            json_trace=(step == "execute"),
-            prompt_override=prompt_override,
-            prompt_kwargs=prompt_kwargs,
-        )
-    return worker, agent, mode, refreshed
+    effective_refreshed = refreshed
+    explicit_agent = _agent_requested_explicitly(step, args)
+    attempted_agents: set[str] = set()
+    while True:
+        attempted_agents.add(agent)
+        try:
+            if agent == "hermes":
+                # Deferred import to avoid circular import (hermes_worker imports from workers)
+                from megaplan.hermes_worker import run_hermes_step
+                worker = run_hermes_step(
+                    step,
+                    state,
+                    plan_dir,
+                    root=root,
+                    fresh=effective_refreshed,
+                    model=model,
+                    prompt_override=prompt_override,
+                )
+            elif agent == "claude":
+                worker = run_claude_step(
+                    step,
+                    state,
+                    plan_dir,
+                    root=root,
+                    fresh=effective_refreshed,
+                    prompt_override=prompt_override,
+                    prompt_kwargs=prompt_kwargs,
+                )
+            else:
+                attempted_retry = False
+                while True:
+                    try:
+                        worker = run_codex_step(
+                            step,
+                            state,
+                            plan_dir,
+                            root=root,
+                            persistent=(mode == "persistent"),
+                            fresh=effective_refreshed,
+                            json_trace=(step == "execute"),
+                            prompt_override=prompt_override,
+                            prompt_kwargs=prompt_kwargs,
+                        )
+                        break
+                    except CliError as error:
+                        session_id = error.extra.get("session_id")
+                        if (
+                            attempted_retry
+                            or step in _EXECUTE_STEPS
+                            or error.code not in {"worker_timeout", "connection_error"}
+                        ):
+                            raise
+                        attempted_retry = True
+                        if mode == "persistent" and isinstance(session_id, str) and session_id:
+                            apply_session_update(
+                                state,
+                                step,
+                                agent,
+                                session_id,
+                                mode=mode,
+                                refreshed=effective_refreshed,
+                            )
+                            effective_refreshed = False
+                        continue
+            return worker, agent, mode, effective_refreshed
+        except CliError as error:
+            if explicit_agent or error.code not in {"auth_error", "connection_error"}:
+                raise
+            fallback_candidates = [
+                candidate
+                for candidate in _runtime_fallback_candidates(agent)
+                if candidate not in attempted_agents
+            ]
+            if not fallback_candidates:
+                raise
+            fallback_agent = fallback_candidates[0]
+            args._agent_fallback = {
+                "requested": agent,
+                "resolved": fallback_agent,
+                "reason": f"{agent} runtime unhealthy: {error.code}",
+            }
+            agent = fallback_agent
+            model = None
+            effective_refreshed = True
